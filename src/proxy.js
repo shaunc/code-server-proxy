@@ -25,7 +25,12 @@ const PROXY_HOST = '127.0.0.1';
 const MAIN_PORT = 8100;
 const WORKSPACE_PORT_MIN = 8101;
 const WORKSPACE_PORT_MAX = 8199;
-const BASE_DIR = path.join(process.env.HOME, '.code-workspaces', 'instances');
+const MAX_CONCURRENT_INSTANCES = 30;
+const MAX_PROBE_ATTEMPTS = 20;
+const WORKSPACES_DIR = path.join(process.env.HOME, '.code-workspaces');
+const BASE_DIR = path.join(WORKSPACES_DIR, 'instances');
+const REGISTRY_PATH = path.join(WORKSPACES_DIR, 'port-registry.json');
+const SHARED_SETTINGS_DIR = path.join(WORKSPACES_DIR, 'shared');
 const BACKEND_READY_TIMEOUT = 30000; // 30 seconds
 const BACKEND_READY_POLL_INTERVAL = 500; // 500ms
 
@@ -110,25 +115,153 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
 });
 
 /**
- * Compute deterministic port number from workspace/folder path
+ * Compute full SHA256 instance ID from workspace/folder path
  * @param {string} workspacePath - The workspace or folder path
- * @returns {number} Port number between 8101-8199
+ * @returns {string} Full SHA256 hash
  */
-function computePort(workspacePath) {
-  const hash = crypto.createHash('sha256').update(workspacePath).digest('hex');
-  const numericHash = parseInt(hash.substring(0, 8), 16);
-  const portRange = WORKSPACE_PORT_MAX - WORKSPACE_PORT_MIN + 1;
-  return WORKSPACE_PORT_MIN + (numericHash % portRange);
+function computeInstanceId(workspacePath) {
+  return crypto.createHash('sha256').update(workspacePath).digest('hex');
 }
 
 /**
- * Compute instance name from workspace/folder path
- * @param {string} workspacePath - The workspace or folder path
- * @returns {string} Instance name (e.g., "workspace-a1b2c3d4")
+ * Load port registry from disk with file locking
+ * @returns {Object} Registry object with workspaces and ports mappings
  */
-function computeInstanceName(workspacePath) {
+function loadRegistry() {
+  try {
+    if (fs.existsSync(REGISTRY_PATH)) {
+      const data = fs.readFileSync(REGISTRY_PATH, 'utf8');
+      const registry = JSON.parse(data);
+      return {
+        workspaces: registry.workspaces || {},
+        ports: registry.ports || {},
+      };
+    }
+  } catch (error) {
+    console.error('Error loading registry, creating new one:', error.message);
+  }
+  return { workspaces: {}, ports: {} };
+}
+
+/**
+ * Save port registry to disk with file locking
+ * @param {Object} registry - Registry object to save
+ */
+function saveRegistry(registry) {
+  ensureDir(WORKSPACES_DIR);
+  const data = JSON.stringify(registry, null, 2);
+  fs.writeFileSync(REGISTRY_PATH, data, 'utf8');
+}
+
+/**
+ * Validate port is actually listening
+ * @param {number} port - Port number to check
+ * @returns {Promise<boolean>} True if port is listening
+ */
+async function validatePortAvailability(port) {
+  return await isPortListening(port);
+}
+
+/**
+ * Clean up stale entries in registry
+ * @param {Object} registry - Registry object
+ * @returns {Promise<Object>} Cleaned registry
+ */
+async function cleanupStaleEntries(registry) {
+  const cleaned = { workspaces: {}, ports: {} };
+
+  for (const [workspacePath, entry] of Object.entries(registry.workspaces)) {
+    const port = entry.currentPort;
+    if (await validatePortAvailability(port)) {
+      cleaned.workspaces[workspacePath] = entry;
+      cleaned.ports[port] = registry.ports[port];
+    } else {
+      console.log(
+        `Removing stale registry entry for ${workspacePath} (port ${port} not listening)`
+      );
+    }
+  }
+
+  return cleaned;
+}
+
+/**
+ * Allocate port for workspace with linear probing collision resolution
+ * @param {string} workspacePath - The workspace or folder path
+ * @param {Object} registry - Current registry state
+ * @returns {number} Allocated port number
+ * @throws {Error} If no ports available after MAX_PROBE_ATTEMPTS
+ */
+function allocatePort(workspacePath, registry) {
   const hash = crypto.createHash('sha256').update(workspacePath).digest('hex');
-  return `workspace-${hash.substring(0, 8)}`;
+  const numericHash = parseInt(hash.substring(0, 8), 16);
+  const portRange = WORKSPACE_PORT_MAX - WORKSPACE_PORT_MIN + 1;
+  const basePort = WORKSPACE_PORT_MIN + (numericHash % portRange);
+
+  for (let attempt = 0; attempt < MAX_PROBE_ATTEMPTS; attempt++) {
+    const candidatePort =
+      WORKSPACE_PORT_MIN +
+      ((basePort - WORKSPACE_PORT_MIN + attempt) % portRange);
+
+    if (!registry.ports[candidatePort]) {
+      return candidatePort;
+    }
+
+    console.log(
+      `Port ${candidatePort} collision detected (attempt ${attempt + 1}/${MAX_PROBE_ATTEMPTS})`
+    );
+  }
+
+  throw new Error(
+    `All available ports exhausted after ${MAX_PROBE_ATTEMPTS} attempts. ` +
+      'Please stop unused workspace instances.'
+  );
+}
+
+/**
+ * Get or allocate port for workspace from registry
+ * @param {string} workspacePath - The workspace or folder path
+ * @returns {Promise<{port: number, instanceId: string}>} Port and instance ID
+ */
+async function getOrAllocatePort(workspacePath) {
+  let registry = loadRegistry();
+
+  registry = await cleanupStaleEntries(registry);
+
+  if (registry.workspaces[workspacePath]) {
+    const entry = registry.workspaces[workspacePath];
+    return {
+      port: entry.currentPort,
+      instanceId: entry.instanceId,
+    };
+  }
+
+  const instanceId = computeInstanceId(workspacePath);
+  const port = allocatePort(workspacePath, registry);
+
+  registry.workspaces[workspacePath] = {
+    instanceId,
+    currentPort: port,
+    allocatedAt: new Date().toISOString(),
+  };
+
+  registry.ports[port] = {
+    workspacePath,
+    instanceId,
+  };
+
+  saveRegistry(registry);
+
+  return { port, instanceId };
+}
+
+/**
+ * Count active workspace instances (excluding main instance)
+ * @returns {Promise<number>} Number of active workspace instances
+ */
+async function countActiveInstances() {
+  const registry = loadRegistry();
+  return Object.keys(registry.workspaces).length;
 }
 
 /**
@@ -143,12 +276,12 @@ function ensureDir(dirPath) {
 
 /**
  * Create instance directory structure and metadata
- * @param {string} instanceName - Instance name
+ * @param {string} instanceId - Full SHA256 instance ID
  * @param {string} workspacePath - Workspace or folder path
  * @param {number} port - Assigned port number
  */
-function createInstanceDirectory(instanceName, workspacePath, port) {
-  const instanceDir = path.join(BASE_DIR, instanceName);
+function createInstanceDirectory(instanceId, workspacePath, port) {
+  const instanceDir = path.join(BASE_DIR, instanceId);
   ensureDir(instanceDir);
   ensureDir(path.join(instanceDir, 'data'));
   ensureDir(path.join(instanceDir, 'extensions'));
@@ -158,7 +291,7 @@ function createInstanceDirectory(instanceName, workspacePath, port) {
     workspacePath,
     port,
     created: new Date().toISOString(),
-    instanceName,
+    instanceId,
   };
 
   const metadataPath = path.join(instanceDir, 'metadata.json');
@@ -170,10 +303,10 @@ function createInstanceDirectory(instanceName, workspacePath, port) {
 
 /**
  * Update last-access timestamp for instance
- * @param {string} instanceName - Instance name
+ * @param {string} instanceId - Instance ID
  */
-function updateLastAccess(instanceName) {
-  const instanceDir = path.join(BASE_DIR, instanceName);
+function updateLastAccess(instanceId) {
+  const instanceDir = path.join(BASE_DIR, instanceId);
   const lastAccessPath = path.join(instanceDir, 'last-access');
   const timestamp = new Date().toISOString();
   fs.writeFileSync(lastAccessPath, timestamp);
@@ -233,11 +366,11 @@ async function waitForBackend(port, timeout = BACKEND_READY_TIMEOUT) {
 
 /**
  * Launch code-server instance via systemd
- * @param {string} instanceName - Instance name
+ * @param {string} instanceId - Instance ID
  * @returns {Promise<void>}
  */
-async function launchInstance(instanceName) {
-  const serviceName = `code-server-workspace@${instanceName}.service`;
+async function launchInstance(instanceId) {
+  const serviceName = `code-server-workspace@${instanceId}.service`;
   console.log(`Launching instance via systemd: ${serviceName}`);
 
   try {
@@ -288,18 +421,18 @@ async function handleRequest(req, res) {
 
     // Determine target port and instance
     let targetPort = MAIN_PORT;
-    let instanceName = 'main';
+    let instanceId = 'main';
 
     // Bare mode (empty window)
     if (params.ew) {
       console.log('[ROUTING] Bare mode request (ew=true) -> main instance');
       targetPort = MAIN_PORT;
-      instanceName = 'main';
+      instanceId = 'main';
 
       // Check if main instance is running, launch if needed
       if (!(await isPortListening(targetPort))) {
-        console.log(`Main instance not running, launching ${instanceName}...`);
-        await launchInstance(instanceName);
+        console.log(`Main instance not running, launching ${instanceId}...`);
+        await launchInstance(instanceId);
 
         console.log(
           `Waiting for main instance on port ${targetPort} to be ready...`
@@ -324,22 +457,39 @@ async function handleRequest(req, res) {
         return;
       }
 
-      targetPort = computePort(workspacePath);
-      instanceName = computeInstanceName(workspacePath);
+      // Check instance limit
+      const activeCount = await countActiveInstances();
+      const registry = loadRegistry();
+      const isExisting = !!registry.workspaces[workspacePath];
+
+      if (!isExisting && activeCount >= MAX_CONCURRENT_INSTANCES) {
+        res.writeHead(503, { 'Content-Type': 'text/plain' });
+        res.end(
+          `Service Unavailable: Maximum concurrent instances (${MAX_CONCURRENT_INSTANCES}) reached. ` +
+            'Please stop unused workspace instances before opening new ones.'
+        );
+        return;
+      }
+
+      const { port, instanceId: allocatedId } =
+        await getOrAllocatePort(workspacePath);
+      targetPort = port;
+      instanceId = allocatedId;
+
       console.log(
-        `[ROUTING] Computed port ${targetPort} for instance ${instanceName}`
+        `[ROUTING] Allocated port ${targetPort} for instance ${instanceId}`
       );
 
       // Ensure instance exists
-      const instanceDir = path.join(BASE_DIR, instanceName);
+      const instanceDir = path.join(BASE_DIR, instanceId);
       if (!fs.existsSync(instanceDir)) {
-        createInstanceDirectory(instanceName, workspacePath, targetPort);
+        createInstanceDirectory(instanceId, workspacePath, targetPort);
       }
 
       // Check if instance is running, launch if needed
       if (!(await isPortListening(targetPort))) {
-        console.log(`Instance not running, launching ${instanceName}...`);
-        await launchInstance(instanceName);
+        console.log(`Instance not running, launching ${instanceId}...`);
+        await launchInstance(instanceId);
 
         console.log(`Waiting for backend on port ${targetPort} to be ready...`);
         const ready = await waitForBackend(targetPort);
@@ -364,22 +514,39 @@ async function handleRequest(req, res) {
         return;
       }
 
-      targetPort = computePort(folderPath);
-      instanceName = computeInstanceName(folderPath);
+      // Check instance limit
+      const activeCount = await countActiveInstances();
+      const registry = loadRegistry();
+      const isExisting = !!registry.workspaces[folderPath];
+
+      if (!isExisting && activeCount >= MAX_CONCURRENT_INSTANCES) {
+        res.writeHead(503, { 'Content-Type': 'text/plain' });
+        res.end(
+          `Service Unavailable: Maximum concurrent instances (${MAX_CONCURRENT_INSTANCES}) reached. ` +
+            'Please stop unused workspace instances before opening new ones.'
+        );
+        return;
+      }
+
+      const { port, instanceId: allocatedId } =
+        await getOrAllocatePort(folderPath);
+      targetPort = port;
+      instanceId = allocatedId;
+
       console.log(
-        `[ROUTING] Computed port ${targetPort} for instance ${instanceName}`
+        `[ROUTING] Allocated port ${targetPort} for instance ${instanceId}`
       );
 
       // Ensure instance exists
-      const instanceDir = path.join(BASE_DIR, instanceName);
+      const instanceDir = path.join(BASE_DIR, instanceId);
       if (!fs.existsSync(instanceDir)) {
-        createInstanceDirectory(instanceName, folderPath, targetPort);
+        createInstanceDirectory(instanceId, folderPath, targetPort);
       }
 
       // Check if instance is running, launch if needed
       if (!(await isPortListening(targetPort))) {
-        console.log(`Instance not running, launching ${instanceName}...`);
-        await launchInstance(instanceName);
+        console.log(`Instance not running, launching ${instanceId}...`);
+        await launchInstance(instanceId);
 
         console.log(`Waiting for backend on port ${targetPort} to be ready...`);
         const ready = await waitForBackend(targetPort);
@@ -399,12 +566,12 @@ async function handleRequest(req, res) {
         '[ROUTING] Default request (no workspace/folder) -> main instance'
       );
       targetPort = MAIN_PORT;
-      instanceName = 'main';
+      instanceId = 'main';
 
       // Check if main instance is running, launch if needed
       if (!(await isPortListening(targetPort))) {
-        console.log(`Main instance not running, launching ${instanceName}...`);
-        await launchInstance(instanceName);
+        console.log(`Main instance not running, launching ${instanceId}...`);
+        await launchInstance(instanceId);
 
         console.log(
           `Waiting for main instance on port ${targetPort} to be ready...`
@@ -420,7 +587,7 @@ async function handleRequest(req, res) {
     }
 
     // Update last-access timestamp
-    updateLastAccess(instanceName);
+    updateLastAccess(instanceId);
 
     // Store original URL for redirect handler to access
     req._originalUrl = req.url;
@@ -432,7 +599,7 @@ async function handleRequest(req, res) {
     // Proxy the request
     const target = `http://127.0.0.1:${targetPort}`;
     console.log(`[PROXY] Proxying ${req.method} ${req.url} -> ${target}`);
-    console.log(`[PROXY] Instance: ${instanceName}, Port: ${targetPort}`);
+    console.log(`[PROXY] Instance: ${instanceId}, Port: ${targetPort}`);
     console.log('='.repeat(80));
     proxy.web(req, res, { target });
   } catch (error) {
@@ -463,21 +630,27 @@ async function handleUpgrade(req, socket, head) {
 
     // Determine target port
     let targetPort = MAIN_PORT;
-    let instanceName = 'main';
+    let instanceId = 'main';
 
     if (params.ew) {
       targetPort = MAIN_PORT;
-      instanceName = 'main';
+      instanceId = 'main';
     } else if (params.workspace) {
-      targetPort = computePort(params.workspace);
-      instanceName = computeInstanceName(params.workspace);
+      const { port, instanceId: allocatedId } = await getOrAllocatePort(
+        params.workspace
+      );
+      targetPort = port;
+      instanceId = allocatedId;
     } else if (params.folder) {
-      targetPort = computePort(params.folder);
-      instanceName = computeInstanceName(params.folder);
+      const { port, instanceId: allocatedId } = await getOrAllocatePort(
+        params.folder
+      );
+      targetPort = port;
+      instanceId = allocatedId;
     }
 
     // Update last-access timestamp
-    updateLastAccess(instanceName);
+    updateLastAccess(instanceId);
 
     // Store original URL for potential redirect handling
     req._originalUrl = req.url;
@@ -488,7 +661,7 @@ async function handleUpgrade(req, socket, head) {
     // Proxy the WebSocket
     const target = `http://127.0.0.1:${targetPort}`;
     console.log(`[WEBSOCKET] Proxying WebSocket upgrade -> ${target}`);
-    console.log(`[WEBSOCKET] Instance: ${instanceName}, Port: ${targetPort}`);
+    console.log(`[WEBSOCKET] Instance: ${instanceId}, Port: ${targetPort}`);
     console.log('='.repeat(80));
     proxy.ws(req, socket, head, { target });
   } catch (error) {
@@ -498,7 +671,12 @@ async function handleUpgrade(req, socket, head) {
 }
 
 // Initialize base directory structure
+ensureDir(WORKSPACES_DIR);
 ensureDir(BASE_DIR);
+ensureDir(SHARED_SETTINGS_DIR);
+ensureDir(path.join(SHARED_SETTINGS_DIR, 'extensions'));
+ensureDir(path.join(SHARED_SETTINGS_DIR, 'User'));
+
 const mainDir = path.join(BASE_DIR, 'main');
 ensureDir(mainDir);
 ensureDir(path.join(mainDir, 'data'));
@@ -512,7 +690,7 @@ if (!fs.existsSync(mainMetadataPath)) {
     workspacePath: null,
     port: MAIN_PORT,
     created: new Date().toISOString(),
-    instanceName: 'main',
+    instanceId: 'main',
   };
   fs.writeFileSync(mainMetadataPath, JSON.stringify(mainMetadata, null, 2));
 }

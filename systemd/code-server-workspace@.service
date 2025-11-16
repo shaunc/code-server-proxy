@@ -10,8 +10,8 @@ Restart=on-failure
 RestartSec=10s
 StandardOutput=append:/home/shauncutts/.code-workspaces/instances/%i/logs/stdout.log
 StandardError=append:/home/shauncutts/.code-workspaces/instances/%i/logs/stderr.log
-MemoryMax=2G
-CPUQuota=200%
+MemoryMax=4G
+CPUQuota=300%
 
 [Install]
 WantedBy=default.target
