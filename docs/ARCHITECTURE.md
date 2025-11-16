@@ -49,7 +49,7 @@ The code-server workspace isolation proxy is a reverse proxy that provides works
     ┌──▼────────▼────────▼──────────────▼────────────▼───┐
     │           Systemd User Instance                     │
     │  • Manages code-server processes                    │
-    │  • Applies resource limits (2GB RAM, 200% CPU)      │
+    │  • Applies resource limits (4GB RAM, 300% CPU)      │
     │  • Handles automatic restarts                       │
     │  • Captures logs                                    │
     └────────────────────────────────────────────────────┘
@@ -88,6 +88,10 @@ Scripts
 Storage
   │
   └─── ~/.code-workspaces/
+       ├─── port-registry.json (Port allocation registry)
+       ├─── shared/ (Shared extensions and settings)
+       │    ├─── extensions/
+       │    └─── User/
        ├─── instances/ (Active instances)
        └─── archives/ (Archived instances)
 ```
@@ -125,21 +129,21 @@ numericHash = parseInt(hash[0:8], 16)  // First 8 hex chars
 port = 8101 + (numericHash % 99)       // Range: 8101-8199
 ```
 
-**`computeInstanceName(workspacePath)`** (lines 132-138)
+**`computeInstanceId(workspacePath)`** (lines 132-138)
 
 - Computes instance directory name from workspace path
-- Uses first 8 characters of SHA-256 hash
-- Format: `workspace-<hash8>`
-- Example: `workspace-a1b2c3d4`
+- Uses full SHA-256 hash (64 characters)
+- Format: `workspace-<full-hash>`
+- Example: `workspace-abc123def456...` (64 hex chars)
 
-**`createInstanceDirectory(instanceName, workspacePath, port)`** (lines 156-175)
+**`createInstanceDirectory(instanceId, workspacePath, port)`** (lines 156-175)
 
 - Creates instance directory structure
 - Creates subdirectories: `data/`, `extensions/`, `logs/`
 - Writes `metadata.json` with instance configuration
 - Called automatically on first access to new workspace
 
-**`updateLastAccess(instanceName)`** (lines 181-186)
+**`updateLastAccess(instanceId)`** (lines 181-186)
 
 - Writes ISO 8601 timestamp to `last-access` file
 - Called on every HTTP request and WebSocket upgrade
@@ -159,10 +163,10 @@ port = 8101 + (numericHash % 99)       // Range: 8101-8199
 - Poll interval: 500ms
 - Returns true if backend becomes ready
 
-**`launchInstance(instanceName)`** (lines 245-256)
+**`launchInstance(instanceId)`** (lines 245-256)
 
 - Starts systemd service for instance
-- Service name: `code-server-workspace@<instanceName>.service`
+- Service name: `code-server-workspace@<instanceId>.service`
 - Uses `systemctl --user start`
 - Throws error if systemd command fails
 
@@ -262,8 +266,8 @@ Restart=on-failure
 RestartSec=10s
 StandardOutput=append:/home/user/.code-workspaces/instances/%i/logs/stdout.log
 StandardError=append:/home/user/.code-workspaces/instances/%i/logs/stderr.log
-MemoryMax=2G
-CPUQuota=200%
+MemoryMax=4G
+CPUQuota=300%
 
 [Install]
 WantedBy=default.target
@@ -271,12 +275,12 @@ WantedBy=default.target
 
 Template variables:
 
-- `%i`: Instance name (e.g., `main`, `workspace-a1b2c3d4`)
+- `%i`: Instance ID (e.g., `main`, `workspace-abc123def456...`)
 
 Resource limits:
 
-- `MemoryMax=2G`: Maximum 2GB RAM per instance
-- `CPUQuota=200%`: Maximum 2 CPU cores (200%)
+- `MemoryMax=4G`: Maximum 4GB RAM per instance
+- `CPUQuota=300%`: Maximum 3 CPU cores (300%)
 
 Log management:
 
@@ -338,12 +342,13 @@ Launched by systemd to start code-server instances.
 3. Launch code-server with appropriate arguments
 4. For main instance (null workspace): Launch without path
 5. For workspace instances: Launch with workspace path
+6. Create symlinks to shared extensions and User settings directories
 
 **Code-server arguments**:
 
 - `--bind-addr 127.0.0.1:$PORT`: Listen on specific port
 - `--user-data-dir $INSTANCE_DIR/data`: Isolated user data
-- `--extensions-dir $INSTANCE_DIR/extensions`: Isolated extensions
+- `--extensions-dir ~/.code-workspaces/shared/extensions`: Shared extensions (via symlink)
 - `$WORKSPACE_PATH`: Workspace/folder to open (if not main)
 
 **JSON parsing**: Uses `jq` if available, falls back to `grep` regex
@@ -387,13 +392,13 @@ Cleans up idle workspace instances.
    ▼
 3. Proxy: computePort() & computeInstanceName()
    workspace_path = "/path/to/workspace"
-   hash = SHA256(workspace_path) = "a1b2c3d4..."
-   instance_name = "workspace-a1b2c3d4"
+   hash = SHA256(workspace_path) = "abc123def456..." (64 chars)
+   instance_id = "workspace-abc123def456..." (full hash)
    port = 8101 + (hash % 99) = 8142
    │
    ▼
 4. Proxy: Check instance exists
-   ls ~/.code-workspaces/instances/workspace-a1b2c3d4
+   ls ~/.code-workspaces/instances/workspace-abc123def456...
    │
    ├─── Not exists → createInstanceDirectory()
    │    Creates: data/, extensions/, logs/, metadata.json
@@ -405,15 +410,15 @@ Cleans up idle workspace instances.
    isPortListening(8142)
    │
    ├─── Not listening → launchInstance()
-   │    systemctl --user start code-server-workspace@workspace-a1b2c3d4.service
+   │    systemctl --user start code-server-workspace@workspace-abc123def456...service
    │    │
    │    ▼
-   │    Systemd: launch-workspace-instance.sh workspace-a1b2c3d4
+   │    Systemd: launch-workspace-instance.sh workspace-abc123def456...
    │    │
    │    ▼
    │    code-server --bind-addr 127.0.0.1:8142 \
-   │                --user-data-dir ~/.code-workspaces/instances/workspace-a1b2c3d4/data \
-   │                --extensions-dir ~/.code-workspaces/instances/workspace-a1b2c3d4/extensions \
+   │                --user-data-dir ~/.code-workspaces/instances/workspace-abc123def456.../data \
+   │                --extensions-dir ~/.code-workspaces/shared/extensions \
    │                /path/to/workspace
    │    │
    │    ▼
@@ -424,7 +429,7 @@ Cleans up idle workspace instances.
    │
    ▼
 6. Proxy: updateLastAccess()
-   echo "2024-11-16T15:30:00.000Z" > ~/.code-workspaces/instances/workspace-a1b2c3d4/last-access
+   echo "2024-11-16T15:30:00.000Z" > ~/.code-workspaces/instances/workspace-abc123def456.../last-access
    │
    ▼
 7. Proxy: Forward request
@@ -461,7 +466,7 @@ Cleans up idle workspace instances.
 
 ### Redirect Handling Flow
 
-```
+````
 1. Backend issues redirect
    HTTP/1.1 302 Found
    Location: /?workspace=/path/to/workspace&other=param
@@ -487,10 +492,198 @@ Cleans up idle workspace instances.
 6. Proxy: Rewrite Location header
    Location: /?other=param
    │
-   ▼
-7. Browser receives modified redirect
-   Prevents redirect loop
+## Port Registry
+
+The port registry provides persistent, bidirectional mapping between ports and instance IDs, enabling collision resolution and instance discovery.
+
+### Registry Structure
+
+Location: `~/.code-workspaces/port-registry.json`
+
+```json
+{
+  "portToInstance": {
+    "8100": "main",
+    "8142": "workspace-abc123def456...",
+    "8167": "workspace-789abc012def..."
+  },
+  "instanceToPort": {
+    "main": 8100,
+    "workspace-abc123def456...": 8142,
+    "workspace-789abc012def...": 8167
+  }
+}
+````
+
+### Collision Resolution Algorithm
+
+When the preferred port (computed via hash) is unavailable:
+
+1. **Check registry**: Is preferred port allocated to this instance?
+   - Yes → Use that port (instance already registered)
+   - No → Port collision detected
+
+2. **Linear probing**: Try ports sequentially
+   - Start: preferred port
+   - Increment: +1 each attempt
+   - Wrap: After 8199, continue at 8101
+   - Max attempts: 20 (MAX_PROBE_ATTEMPTS)
+
+3. **Allocation**: First available port found
+   - Update registry with bidirectional mapping
+   - Write registry to disk
+   - Return allocated port
+
+4. **Failure**: No port available after 20 attempts
+   - Either: All ports occupied
+   - Or: Maximum concurrent instances (30) reached
+   - Throw error, refuse to launch
+
+### Self-Healing Registry
+
+On proxy startup, registry is validated and repaired:
+
+1. **Load registry**: Read from disk (or create if missing)
+2. **Check consistency**: Verify bidirectional mappings match
+3. **Validate instances**: Check if instance directories still exist
+4. **Remove stale entries**: Clean up mappings for deleted instances
+5. **Save if modified**: Write repaired registry back to disk
+
+This ensures registry stays synchronized with actual instance state.
+
+### Registry Operations
+
+**Allocate port**:
+
+```javascript
+const port = allocatePort(instanceId, workspacePath);
+// Returns port number, updates registry
 ```
+
+**Release port**:
+
+```javascript
+releasePort(instanceId);
+// Removes mappings from registry
+```
+
+**Lookup port by instance**:
+
+```javascript
+const port = portRegistry.instanceToPort[instanceId];
+```
+
+**Lookup instance by port**:
+
+```javascript
+const instanceId = portRegistry.portToInstance[port];
+```
+
+## Shared Settings Architecture
+
+Extensions and User settings are shared across all instances via symlinks, reducing disk usage and providing consistent environment.
+
+### Shared Directory Structure
+
+```
+~/.code-workspaces/shared/
+├── extensions/              # Shared extension storage
+│   ├── ms-python.python-*/
+│   ├── esbenp.prettier-vscode-*/
+│   └── ...
+└── User/                    # Shared user settings
+    ├── settings.json        # Global settings
+    ├── keybindings.json     # Keyboard shortcuts
+    ├── snippets/            # Code snippets
+    └── ...
+```
+
+### Symlink Creation
+
+During instance launch (`launch-workspace-instance.sh`):
+
+1. **Create shared directories** (if not exist):
+
+   ```bash
+   mkdir -p ~/.code-workspaces/shared/extensions
+   mkdir -p ~/.code-workspaces/shared/User
+   ```
+
+2. **Create instance data directory**:
+
+   ```bash
+   mkdir -p ~/.code-workspaces/instances/<instance-id>/data
+   ```
+
+3. **Create symlinks inside instance data**:
+
+   ```bash
+   ln -s ~/.code-workspaces/shared/User \
+         ~/.code-workspaces/instances/<instance-id>/data/User
+   ```
+
+4. **Launch code-server** with:
+   ```bash
+   code-server --user-data-dir <instance-dir>/data \
+               --extensions-dir ~/.code-workspaces/shared/extensions
+   ```
+
+### What Gets Shared
+
+**Extensions** (`--extensions-dir`):
+
+- All installed extensions
+- Extension data and storage
+- One installation serves all instances
+
+**User Settings** (via `data/User` symlink):
+
+- `settings.json`: Global preferences
+- `keybindings.json`: Keyboard shortcuts
+- `snippets/`: User code snippets
+- Other User-level configuration
+
+### What Stays Isolated
+
+**Workspace State** (inside `data/`, not symlinked):
+
+- Workspace storage (open files, layout)
+- Debug configurations (per-workspace)
+- Terminal sessions
+- Git state and history
+
+**Logs** (instance-specific):
+
+- `logs/stdout.log`
+- `logs/stderr.log`
+
+**Workspace Settings** (in project directory):
+
+- `.vscode/settings.json`: Project-specific settings
+- `.vscode/launch.json`: Debug configurations
+- These are not in instance directory at all
+
+### Benefits
+
+1. **Disk savings**: Single extension installation vs per-instance
+2. **Consistency**: Same extensions, settings, keybindings everywhere
+3. **Convenience**: Configure once, applies to all workspaces
+4. **Faster startup**: No need to re-install extensions per instance
+
+### Trade-offs
+
+1. **Extension conflicts**: All instances share extension state
+2. **Settings inheritance**: Cannot have instance-specific User settings
+   - Workaround: Use workspace settings in `.vscode/settings.json`
+3. **Circular symlink risk**: Must ensure data/User doesn't already exist
+   - Launch script handles this safely
+
+   ▼
+
+4. Browser receives modified redirect
+   Prevents redirect loop
+
+````
 
 ## Port Assignment
 
@@ -510,7 +703,7 @@ function computePort(workspacePath) {
   const portRange = WORKSPACE_PORT_MAX - WORKSPACE_PORT_MIN + 1; // 99
   return WORKSPACE_PORT_MIN + (numericHash % portRange);
 }
-```
+````
 
 ### Properties
 
@@ -526,19 +719,23 @@ function computePort(workspacePath) {
 - Low collision probability with typical workload
 - Uniform distribution via cryptographic hash
 
-**Collision Handling**: Not implemented (acceptable trade-off)
+**Collision Handling**: Linear probing with port registry
 
-- With 99 ports and typical <20 active workspaces, collision probability is low
-- If collision occurs, workspaces share port (last one wins)
-- Could be enhanced with linear probing if needed
+- Port registry maintains bidirectional mapping (port ↔ instance ID)
+- On collision, uses linear probing to find next available port (max 20 attempts)
+- Registry persisted to `~/.code-workspaces/port-registry.json`
+- Self-healing: validates and repairs registry on startup
+- Maximum concurrent instances: 30 (enforced limit)
 
 ### Example Port Assignments
 
 ```
-/home/user/projects/app1                    → SHA256 → a1b2c3d4... → 8142
-/home/user/projects/app2                    → SHA256 → e5f6g7h8... → 8167
-/home/user/Documents/notes                  → SHA256 → x9y8z7w6... → 8123
-/home/user/projects/app1.code-workspace     → SHA256 → m3n4o5p6... → 8189
+/home/user/projects/app1                    → SHA256 → abc123... → 8142 (if available)
+/home/user/projects/app2                    → SHA256 → def456... → 8167 (if available)
+/home/user/Documents/notes                  → SHA256 → 789abc... → 8123 (if available)
+/home/user/projects/app1.code-workspace     → SHA256 → 012def... → 8189 (if available)
+
+If preferred port is taken, linear probing finds next available port.
 ```
 
 Note: Workspace file and folder with same base path get different ports.
@@ -550,34 +747,38 @@ Note: Workspace file and folder with same base path get different ports.
 Each instance has separate directories:
 
 ```
-~/.code-workspaces/instances/workspace-a1b2c3d4/
+~/.code-workspaces/instances/workspace-abc123def456.../
 ├── data/              # User data directory (settings, state, etc.)
-├── extensions/        # Installed extensions
+│   └── User/          # → symlink to ~/.code-workspaces/shared/User/
+├── extensions/        # → symlink to ~/.code-workspaces/shared/extensions/
 ├── logs/              # stdout/stderr logs
 ├── metadata.json      # Instance configuration
 └── last-access        # Last access timestamp
 ```
 
-**Implications**:
+**Shared vs Isolated**:
 
-- Settings don't transfer between instances
-- Extensions must be installed per-instance
-- Each instance has separate editor state
-- Logs are per-instance
+- **Shared** (via symlinks):
+  - Extensions: Installed once, available to all instances
+  - User settings: Settings, keybindings, snippets shared across instances
+- **Isolated** (per-instance):
+  - Workspace state: Open files, editor layout, debug configs
+  - Logs: Per-instance stdout/stderr
+  - Workspace settings: Project-specific `.vscode/settings.json`
 
 ### Resource Isolation
 
 Systemd applies resource limits per-instance:
 
 ```ini
-MemoryMax=2G      # Max 2GB RAM
-CPUQuota=200%     # Max 2 CPU cores
+MemoryMax=4G      # Max 4GB RAM
+CPUQuota=300%     # Max 3 CPU cores
 ```
 
 **Implications**:
 
 - One instance cannot consume all system resources
-- Default config supports ~8 instances on 16GB system
+- Default config supports ~3-4 instances on 16GB system
 - Limits can be adjusted per deployment
 
 ### Browser Storage Isolation
@@ -735,14 +936,14 @@ This allows:
 - http-proxy library
 - Minimal state (no caching)
 
-**Per instance**: ~200MB - 2GB
+**Per instance**: ~200MB - 4GB
 
 - code-server baseline: ~200MB
-- Extensions: 50-500MB depending on installed extensions
+- Extensions: 50-500MB (shared across instances)
 - Open files/projects: Varies
-- Limit enforced: 2GB via systemd
+- Limit enforced: 4GB via systemd
 
-**Total for 5 instances**: ~1.5GB typical, ~10GB max
+**Total for 5 instances**: ~2GB typical, ~20GB max
 
 ### CPU
 
@@ -756,7 +957,7 @@ This allows:
 - Idle: <1%
 - Active editing: 5-15%
 - Language servers: 10-50% (TypeScript, etc.)
-- Limit enforced: 200% (2 cores) via systemd
+- Limit enforced: 300% (3 cores) via systemd
 
 ### Disk I/O
 
@@ -781,7 +982,7 @@ This allows:
 
 ### Hard Limits
 
-- **Maximum concurrent instances**: 99 (port range)
+- **Maximum concurrent instances**: 30 (enforced), 99 (port range)
 - **Maximum total instances**: Unlimited (limited by disk)
 - **Proxy connections**: ~10,000 (Node.js default)
 
@@ -789,8 +990,8 @@ This allows:
 
 Assuming 16GB RAM, 8 CPU cores:
 
-- **Recommended concurrent instances**: 5-8
-  - 2GB RAM each = 10-16GB total
+- **Recommended concurrent instances**: 3-4
+  - 4GB RAM each = 12-16GB total
   - Leaves headroom for OS and other processes
 
 - **Idle instances**: Unlimited
@@ -799,7 +1000,7 @@ Assuming 16GB RAM, 8 CPU cores:
 
 ### Bottlenecks
 
-1. **Memory**: Most likely bottleneck with default 2GB per instance
+1. **Memory**: Most likely bottleneck with default 4GB per instance
 2. **CPU**: Language servers can be CPU-intensive
 3. **Disk I/O**: Many extensions write frequently to user data
 4. **Port exhaustion**: 99 ports sufficient for single-user, may need expansion for multi-user

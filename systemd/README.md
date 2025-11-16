@@ -10,7 +10,7 @@ The main proxy server that handles routing requests to isolated workspace instan
 
 ### 2. code-server-workspace@.service
 
-A systemd template service for launching isolated code-server instances. The `@` symbol makes this a template - instances are started with names like `code-server-workspace@workspace-a1b2c3d4.service`.
+A systemd template service for launching isolated code-server instances. The `@` symbol makes this a template - instances are started with names like `code-server-workspace@workspace-abc123def456...service`.
 
 ## Installation
 
@@ -90,20 +90,20 @@ You can also manually manage workspace instances:
 
 ```bash
 # Start a specific workspace instance
-systemctl --user start code-server-workspace@workspace-a1b2c3d4.service
+systemctl --user start code-server-workspace@workspace-abc123def456...service
 
 # Check instance status
-systemctl --user status code-server-workspace@workspace-a1b2c3d4.service
+systemctl --user status code-server-workspace@workspace-abc123def456...service
 
 # View instance logs (from journal)
-journalctl --user -u code-server-workspace@workspace-a1b2c3d4.service -f
+journalctl --user -u code-server-workspace@workspace-abc123def456...service -f
 
 # View instance logs (from file)
-tail -f ~/.code-workspaces/instances/workspace-a1b2c3d4/logs/stdout.log
-tail -f ~/.code-workspaces/instances/workspace-a1b2c3d4/logs/stderr.log
+tail -f ~/.code-workspaces/instances/workspace-abc123def456.../logs/stdout.log
+tail -f ~/.code-workspaces/instances/workspace-abc123def456.../logs/stderr.log
 
 # Stop an instance
-systemctl --user stop code-server-workspace@workspace-a1b2c3d4.service
+systemctl --user stop code-server-workspace@workspace-abc123def456...service
 
 # List all running workspace instances
 systemctl --user list-units 'code-server-workspace@*'
@@ -113,8 +113,8 @@ systemctl --user list-units 'code-server-workspace@*'
 
 Each workspace instance has the following resource limits configured:
 
-- **Memory**: Maximum 2GB (`MemoryMax=2G`)
-- **CPU**: Maximum 200% (2 cores, `CPUQuota=200%`)
+- **Memory**: Maximum 4GB (`MemoryMax=4G`)
+- **CPU**: Maximum 300% (3 cores, `CPUQuota=300%`)
 
 These limits can be adjusted in the `code-server-workspace@.service` file if needed.
 
@@ -134,9 +134,9 @@ These limits can be adjusted in the `code-server-workspace@.service` file if nee
    which node
    ```
 
-3. Check if the port (default 8080) is already in use:
+3. Check if the port (default 8083) is already in use:
    ```bash
-   ss -tlnp | grep 8080
+   ss -tlnp | grep 8083
    ```
 
 ### Workspace instance won't start
@@ -297,15 +297,15 @@ ls -lh ~/.code-workspaces/archives/
 
 # Restore an archived workspace
 cd ~/.code-workspaces/instances/
-tar -xzf ~/.code-workspaces/archives/workspace-name-20250115-120000.tar.gz
+tar -xzf ~/.code-workspaces/archives/workspace-abc123def456...-20250115-120000.tar.gz
 
 # Restart the workspace instance
-systemctl --user start code-server-workspace@workspace-name.service
+systemctl --user start code-server-workspace@workspace-abc123def456...service
 ```
 
 ## Notes
 
-- The proxy listens on `http://localhost:8080` by default
+- The proxy listens on `http://localhost:8083` by default
 - Workspace instances bind to `127.0.0.1:<port>` where port is defined in each instance's metadata.json
 - All workspace instances run under your user account
 - Logs are stored both in systemd journal and in instance-specific log files

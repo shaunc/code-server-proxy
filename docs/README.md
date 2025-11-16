@@ -7,7 +7,7 @@ The code-server workspace isolation proxy is a reverse proxy that provides compl
 - **Isolated browser storage** (localStorage, cookies, IndexedDB)
 - **Separate user data** (settings, state, UI layout)
 - **Independent extensions** (install once per workspace)
-- **Dedicated resources** (2GB RAM, 2 CPU cores per instance)
+- **Dedicated resources** (4GB RAM, 3 CPU cores per instance)
 - **Automatic lifecycle management** (cleanup after 3 days idle)
 
 ### Problem Solved
@@ -26,8 +26,13 @@ This proxy solves these issues by routing each workspace to a separate port, giv
 - **Transparent routing**: URL parameters determine instance routing
 - **Automatic instance management**: Instances launch on-demand via systemd
 - **Deterministic port assignment**: Same workspace always gets same port
+- **Port registry**: Persistent bidirectional mapping between ports and instances
+- **Collision resolution**: Linear probing handles port conflicts (max 20 attempts)
+- **Shared settings**: Extensions and User settings symlinked across instances
+- **Helper scripts**: Convenient tools for restart and migration operations
 - **Idle cleanup**: Automatic archival of unused instances after 3 days
-- **Resource limits**: Per-instance memory and CPU quotas
+- **Resource limits**: Per-instance memory and CPU quotas (4GB/300%)
+- **Instance limits**: Maximum 30 concurrent workspace instances
 - **Zero configuration**: Instances created automatically on first access
 
 ## Documentation Structure
@@ -130,8 +135,8 @@ journalctl --user -u code-server-proxy.service -f
 ### Manage Instances
 
 ```bash
-# Stop a specific instance
-systemctl --user stop code-server-workspace@workspace-a1b2c3d4.service
+# Stop a specific instance (use full instance ID)
+systemctl --user stop code-server-workspace@workspace-abc123def456...service
 
 # Restart proxy
 systemctl --user restart code-server-proxy.service
@@ -171,10 +176,15 @@ Proxy Server (port 8083)
     ↓
 Code-Server Instances (managed by systemd)
     ↓
-~/.code-workspaces/instances/
-    ├─ main/
-    ├─ workspace-a1b2c3d4/
-    └─ workspace-e5f6g7h8/
+~/.code-workspaces/
+    ├─ port-registry.json          # Port allocation registry
+    ├─ shared/                     # Shared extensions and settings
+    │   ├─ extensions/
+    │   └─ User/
+    └─ instances/
+        ├─ main/
+        ├─ workspace-abc123def456.../  # Full SHA256 hash
+        └─ workspace-789abc012def.../  # Full SHA256 hash
 ```
 
 ### Key Components
@@ -205,17 +215,20 @@ For complete architecture details, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ### Default Configuration
 
-| Setting            | Default Value                   | Location                                 |
-| ------------------ | ------------------------------- | ---------------------------------------- |
-| Proxy Port         | 8083                            | `src/proxy.js`                           |
-| Main Instance Port | 8100                            | `src/proxy.js`                           |
-| Workspace Ports    | 8101-8199                       | `src/proxy.js`                           |
-| Memory Limit       | 2GB per instance                | `systemd/code-server-workspace@.service` |
-| CPU Limit          | 200% per instance               | `systemd/code-server-workspace@.service` |
-| Idle Timeout       | 3 days                          | `scripts/workspace-idle-monitor.sh`      |
-| Cleanup Schedule   | Daily                           | `systemd/workspace-idle-monitor.timer`   |
-| Instance Directory | `~/.code-workspaces/instances/` | `src/proxy.js`                           |
-| Archive Directory  | `~/.code-workspaces/archives/`  | `scripts/workspace-idle-monitor.sh`      |
+| Setting            | Default Value                           | Location                                 |
+| ------------------ | --------------------------------------- | ---------------------------------------- |
+| Proxy Port         | 8083                                    | `src/proxy.js`                           |
+| Main Instance Port | 8100                                    | `src/proxy.js`                           |
+| Workspace Ports    | 8101-8199                               | `src/proxy.js`                           |
+| Memory Limit       | 4GB per instance                        | `systemd/code-server-workspace@.service` |
+| CPU Limit          | 300% per instance                       | `systemd/code-server-workspace@.service` |
+| Max Instances      | 30 concurrent                           | `src/proxy.js`                           |
+| Port Registry      | `~/.code-workspaces/port-registry.json` | `src/proxy.js`                           |
+| Shared Settings    | `~/.code-workspaces/shared/`            | `scripts/launch-workspace-instance.sh`   |
+| Idle Timeout       | 3 days                                  | `scripts/workspace-idle-monitor.sh`      |
+| Cleanup Schedule   | Daily                                   | `systemd/workspace-idle-monitor.timer`   |
+| Instance Directory | `~/.code-workspaces/instances/`         | `src/proxy.js`                           |
+| Archive Directory  | `~/.code-workspaces/archives/`          | `scripts/workspace-idle-monitor.sh`      |
 
 ### Customization
 
@@ -247,8 +260,8 @@ journalctl --user -u code-server-proxy.service -n 50
 ### Instance Won't Launch
 
 ```bash
-# Check specific instance
-systemctl --user status code-server-workspace@workspace-a1b2c3d4.service
+# Check specific instance (use full instance ID)
+systemctl --user status code-server-workspace@workspace-abc123def456...service
 
 # Common fixes
 - Verify launch script path in template service
@@ -260,10 +273,12 @@ systemctl --user status code-server-workspace@workspace-a1b2c3d4.service
 
 ```bash
 # Instance failed to start or crashed
-journalctl --user -u code-server-workspace@workspace-a1b2c3d4.service
+journalctl --user -u code-server-workspace@workspace-abc123def456...service
 
-# Try manual restart
-systemctl --user restart code-server-workspace@workspace-a1b2c3d4.service
+# Try manual restart (or use helper script)
+scripts/restart-instance.sh /path/to/workspace
+# Or with instance ID:
+systemctl --user restart code-server-workspace@workspace-abc123def456...service
 ```
 
 For comprehensive troubleshooting, see [DEPLOYMENT.md](DEPLOYMENT.md#troubleshooting).
@@ -273,7 +288,7 @@ For comprehensive troubleshooting, see [DEPLOYMENT.md](DEPLOYMENT.md#troubleshoo
 - **Operating System**: Linux with systemd
 - **Node.js**: Version 18.0.0 or higher
 - **code-server**: Any recent version
-- **Memory**: 4GB minimum (2GB per instance + system overhead)
+- **Memory**: 8GB minimum (4GB per instance + system overhead)
 - **CPU**: Multi-core recommended
 - **Disk**: Space for instance data in `~/.code-workspaces/`
 
@@ -292,9 +307,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md#security-considerations) for details.
 
 - **Proxy Overhead**: <5ms per request
 - **Instance Startup**: 3-10 seconds (first access to workspace)
-- **Memory Usage**: ~50MB proxy + ~200MB-2GB per instance
+- **Memory Usage**: ~50MB proxy + ~200MB-4GB per instance
 - **Concurrent Instances**: Recommended 5-8 on typical system
-- **Maximum Instances**: 99 (port range limit)
+- **Maximum Instances**: 30 (enforced limit), 99 theoretical (port range)
 
 ## Getting Help
 
@@ -317,11 +332,11 @@ See [ARCHITECTURE.md](ARCHITECTURE.md#security-considerations) for details.
 # Proxy logs
 journalctl --user -u code-server-proxy.service -f
 
-# Instance logs
-journalctl --user -u code-server-workspace@<instance-name>.service -f
+# Instance logs (use full instance ID)
+journalctl --user -u code-server-workspace@<instance-id>.service -f
 
-# Or view log files directly
-tail -f ~/.code-workspaces/instances/workspace-a1b2c3d4/logs/stdout.log
+# Or view log files directly (use full hash directory name)
+tail -f ~/.code-workspaces/instances/workspace-abc123def456.../logs/stdout.log
 ```
 
 ## Examples
@@ -386,10 +401,10 @@ Bookmarks:
 This is a single-user utility focused on workspace isolation. Key areas for contribution:
 
 - Cross-platform support (currently Linux/systemd only)
-- Collision handling for hash-based port assignment
 - Log rotation for instance logs
 - Web UI for instance management
 - Enhanced monitoring and metrics
+- Alternative shared settings strategies
 
 ## License
 

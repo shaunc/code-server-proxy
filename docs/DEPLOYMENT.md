@@ -33,8 +33,8 @@ This guide covers installation and configuration of the code-server workspace is
 
 ### System Requirements
 
-- **Memory**: Minimum 4GB RAM (each instance can use up to 2GB)
-- **CPU**: Multi-core recommended (each instance can use up to 200% CPU)
+- **Memory**: Minimum 8GB RAM (each instance can use up to 4GB)
+- **CPU**: Multi-core recommended (each instance can use up to 300% CPU)
 - **Disk**: Sufficient space for workspace instances in `~/.code-workspaces/`
 - **Network**: Ports 8083, 8100-8199 available on localhost
 
@@ -284,22 +284,27 @@ Instances are stored in `~/.code-workspaces/instances/`:
 │   │   ├── logs/                      # stdout/stderr logs
 │   │   ├── metadata.json              # Instance configuration
 │   │   └── last-access                # Last access timestamp
-│   └── workspace-a1b2c3d4/           # Workspace-specific instance
-│       ├── data/
-│       ├── extensions/
-│       ├── logs/
-│       ├── metadata.json
-│       └── last-access
+│   ├── workspace-abc123def456.../    # Workspace-specific instance (full hash)
+│   │   ├── data/
+│   │   │   └── User/                 # → symlink to shared/User/
+│   │   ├── extensions/               # → symlink to shared/extensions/
+│   │   ├── logs/
+│   │   ├── metadata.json
+│   │   └── last-access
+│   ├── shared/                       # Shared across all instances
+│   │   ├── extensions/               # Shared extension storage
+│   │   └── User/                     # Shared user settings
+│   └── port-registry.json            # Port allocation registry
 └── archives/                          # Archived idle instances
-    └── workspace-a1b2c3d4-20241116-120000.tar.gz
+    └── workspace-abc123def456...-20241116-120000.tar.gz
 ```
 
 ### Resource Limits
 
 Each workspace instance has the following systemd resource limits:
 
-- **Memory**: 2GB maximum (`MemoryMax=2G`)
-- **CPU**: 200% maximum (2 full cores, `CPUQuota=200%`)
+- **Memory**: 4GB maximum (`MemoryMax=4G`)
+- **CPU**: 300% maximum (3 full cores, `CPUQuota=300%`)
 
 To adjust these limits, edit `~/.config/systemd/user/code-server-workspace@.service`:
 
@@ -449,8 +454,8 @@ Expected output:
 
 ```
 code-server-workspace@main.service           loaded active running
-code-server-workspace@workspace-a1b2c3d4.service loaded active running
-code-server-workspace@workspace-e5f6g7h8.service loaded active running
+code-server-workspace@workspace-abc123def456...service loaded active running
+code-server-workspace@workspace-789abc012def...service loaded active running
 ```
 
 ### Verify Instance Creation
@@ -465,14 +470,14 @@ Expected output:
 
 ```
 drwxr-xr-x  main
-drwxr-xr-x  workspace-a1b2c3d4
-drwxr-xr-x  workspace-e5f6g7h8
+drwxr-xr-x  workspace-abc123def456...
+drwxr-xr-x  workspace-789abc012def...
 ```
 
 Check instance metadata:
 
 ```bash
-cat ~/.code-workspaces/instances/workspace-a1b2c3d4/metadata.json
+cat ~/.code-workspaces/instances/workspace-abc123def456.../metadata.json
 ```
 
 Expected output:
@@ -482,7 +487,7 @@ Expected output:
   "workspacePath": "/home/user/project1",
   "port": 8142,
   "created": "2024-11-16T03:30:00.000Z",
-  "instanceName": "workspace-a1b2c3d4"
+  "instanceId": "workspace-abc123def456..."
 }
 ```
 
@@ -648,7 +653,7 @@ systemctl --user restart code-server-proxy.service
 systemctl --user list-units 'code-server-workspace@*'
 
 # Check specific instance logs
-journalctl --user -u code-server-workspace@workspace-a1b2c3d4.service
+journalctl --user -u code-server-workspace@workspace-abc123def456...service
 ```
 
 **Common issues**:

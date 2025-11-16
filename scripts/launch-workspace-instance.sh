@@ -58,13 +58,16 @@ if [[ ! -L "$USER_DATA_DIR/User/keybindings.json" ]]; then
     ln -sf "$SHARED_DIR/User/keybindings.json" "$USER_DATA_DIR/User/keybindings.json"
 fi
 
+# Use full path to avoid picking up wrong code-server from PATH
+CODE_SERVER_BIN="/usr/lib/code-server/bin/code-server"
+
 # For bare mode (main instance), workspacePath is null - don't pass a path argument
 if [[ -z "$WORKSPACE_PATH" ]] || [[ "$WORKSPACE_PATH" == "null" ]]; then
-    exec code-server \
+    exec "$CODE_SERVER_BIN" \
         --bind-addr "127.0.0.1:$PORT" \
         --user-data-dir "$USER_DATA_DIR"
 else
-    exec code-server \
+    exec "$CODE_SERVER_BIN" \
         --bind-addr "127.0.0.1:$PORT" \
         --user-data-dir "$USER_DATA_DIR" \
         "$WORKSPACE_PATH"

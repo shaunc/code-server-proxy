@@ -42,9 +42,13 @@ const proxy = httpProxy.createProxyServer({
 // Handle proxy errors
 proxy.on('error', (err, req, res) => {
   console.error('Proxy error:', err.message);
-  if (!res.headersSent) {
+  // Check if this is a WebSocket (socket object) or HTTP response
+  if (res && typeof res.writeHead === 'function' && !res.headersSent) {
     res.writeHead(502, { 'Content-Type': 'text/plain' });
     res.end('Bad Gateway: Unable to connect to backend code-server instance');
+  } else if (res && typeof res.destroy === 'function') {
+    // WebSocket - just destroy the socket
+    res.destroy();
   }
 });
 

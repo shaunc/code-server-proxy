@@ -126,8 +126,8 @@ Example output:
 ```
 UNIT                                          LOAD   ACTIVE SUB     DESCRIPTION
 code-server-workspace@main.service            loaded active running Code-Server Workspace Instance - main
-code-server-workspace@workspace-a1b2c3d4.service loaded active running Code-Server Workspace Instance - workspace-a1b2c3d4
-code-server-workspace@workspace-e5f6g7h8.service loaded active running Code-Server Workspace Instance - workspace-e5f6g7h8
+code-server-workspace@workspace-abc123def456...service loaded active running Code-Server Workspace Instance - workspace-abc123def456...
+code-server-workspace@workspace-789abc012def...service loaded active running Code-Server Workspace Instance - workspace-789abc012def...
 ```
 
 Count running instances:
@@ -168,17 +168,17 @@ Each instance writes logs to its directory:
 ls -la ~/.code-workspaces/instances/*/logs/
 
 # View specific instance stdout
-tail -f ~/.code-workspaces/instances/workspace-a1b2c3d4/logs/stdout.log
+tail -f ~/.code-workspaces/instances/workspace-abc123def456.../logs/stdout.log
 
 # View specific instance stderr
-tail -f ~/.code-workspaces/instances/workspace-a1b2c3d4/logs/stderr.log
+tail -f ~/.code-workspaces/instances/workspace-abc123def456.../logs/stderr.log
 ```
 
 Or via journalctl:
 
 ```bash
 # View specific instance logs
-journalctl --user -u code-server-workspace@workspace-a1b2c3d4.service -f
+journalctl --user -u code-server-workspace@workspace-abc123def456...service -f
 
 # View all instance logs together
 journalctl --user -u 'code-server-workspace@*' -f
@@ -212,13 +212,13 @@ Check instance details:
 
 ```bash
 # View instance metadata
-cat ~/.code-workspaces/instances/workspace-a1b2c3d4/metadata.json
+cat ~/.code-workspaces/instances/workspace-abc123def456.../metadata.json
 
 # Check last access time
-cat ~/.code-workspaces/instances/workspace-a1b2c3d4/last-access
+cat ~/.code-workspaces/instances/workspace-abc123def456.../last-access
 
 # View instance size
-du -sh ~/.code-workspaces/instances/workspace-a1b2c3d4
+du -sh ~/.code-workspaces/instances/workspace-abc123def456...
 ```
 
 ### Instance Metadata
@@ -226,7 +226,7 @@ du -sh ~/.code-workspaces/instances/workspace-a1b2c3d4
 Each instance has a `metadata.json` file:
 
 ```bash
-cat ~/.code-workspaces/instances/workspace-a1b2c3d4/metadata.json
+cat ~/.code-workspaces/instances/workspace-abc123def456.../metadata.json
 ```
 
 Example content:
@@ -236,7 +236,7 @@ Example content:
   "workspacePath": "/home/user/projects/my-app",
   "port": 8142,
   "created": "2024-11-16T15:30:00.000Z",
-  "instanceName": "workspace-a1b2c3d4"
+  "instanceId": "workspace-abc123def456..."
 }
 ```
 
@@ -245,7 +245,7 @@ Fields:
 - `workspacePath`: The workspace or folder path (null for main instance)
 - `port`: Assigned port number
 - `created`: ISO timestamp when instance was created
-- `instanceName`: Instance identifier
+- `instanceId`: Instance identifier (full SHA256 hash)
 
 ### Resource Usage
 
@@ -265,7 +265,7 @@ systemd-cgtop --user
 Check specific instance resources:
 
 ```bash
-systemctl --user show code-server-workspace@workspace-a1b2c3d4.service \
+systemctl --user show code-server-workspace@workspace-abc123def456...service \
   --property=MemoryCurrent,CPUUsageNSec
 ```
 
@@ -328,25 +328,29 @@ No manual intervention needed for normal operation.
 #### Start an Instance
 
 ```bash
-systemctl --user start code-server-workspace@workspace-a1b2c3d4.service
+systemctl --user start code-server-workspace@workspace-abc123def456...service
 ```
 
 #### Stop an Instance
 
 ```bash
-systemctl --user stop code-server-workspace@workspace-a1b2c3d4.service
+systemctl --user stop code-server-workspace@workspace-abc123def456...service
 ```
 
 #### Restart an Instance
 
 ```bash
-systemctl --user restart code-server-workspace@workspace-a1b2c3d4.service
+systemctl --user restart code-server-workspace@workspace-abc123def456...service
+# Or use helper script (can accept workspace path OR instance ID):
+scripts/restart-instance.sh /path/to/workspace
+# Or:
+scripts/restart-instance.sh workspace-abc123def456...
 ```
 
 #### Check Instance Status
 
 ```bash
-systemctl --user status code-server-workspace@workspace-a1b2c3d4.service
+systemctl --user status code-server-workspace@workspace-abc123def456...service
 ```
 
 #### View Instance Service File
@@ -371,8 +375,8 @@ Output shows instance names:
 
 ```
 main
-workspace-a1b2c3d4
-workspace-e5f6g7h8
+workspace-abc123def456...
+workspace-789abc012def...
 ```
 
 #### From Metadata
@@ -380,7 +384,7 @@ workspace-e5f6g7h8
 ```bash
 # Find instance for specific path
 grep -l "/home/user/projects/my-app" ~/.code-workspaces/instances/*/metadata.json
-# Output: /home/user/.code-workspaces/instances/workspace-a1b2c3d4/metadata.json
+# Output: /home/user/.code-workspaces/instances/workspace-abc123def456.../metadata.json
 ```
 
 #### Compute Hash (Advanced)
@@ -388,10 +392,10 @@ grep -l "/home/user/projects/my-app" ~/.code-workspaces/instances/*/metadata.jso
 If you know the path, compute the instance name:
 
 ```bash
-# Compute instance name from path
-echo -n "/home/user/projects/my-app" | sha256sum | cut -c1-8
-# Output: a1b2c3d4
-# Instance name: workspace-a1b2c3d4
+# Compute instance ID from path (full hash)
+echo -n "/home/user/projects/my-app" | sha256sum
+# Output: abc123def456... (64 characters)
+# Instance ID: workspace-abc123def456...
 ```
 
 ## Lifecycle Management
@@ -421,7 +425,7 @@ Last access time is updated on every request to an instance:
 Check when an instance was last accessed:
 
 ```bash
-cat ~/.code-workspaces/instances/workspace-a1b2c3d4/last-access
+cat ~/.code-workspaces/instances/workspace-abc123def456.../last-access
 ```
 
 #### Archive Location
@@ -435,8 +439,8 @@ ls -lh ~/.code-workspaces/archives/
 Example archives:
 
 ```
-workspace-a1b2c3d4-20241116-103000.tar.gz
-workspace-e5f6g7h8-20241115-083000.tar.gz
+workspace-abc123def456...-20241116-103000.tar.gz
+workspace-789abc012def...-20241115-083000.tar.gz
 ```
 
 Archive naming: `<instance-name>-<YYYYMMDD>-<HHMMSS>.tar.gz`
@@ -448,7 +452,7 @@ To restore an archived instance:
 ```bash
 # Extract archive
 cd ~/.code-workspaces/instances/
-tar -xzf ~/.code-workspaces/archives/workspace-a1b2c3d4-20241116-103000.tar.gz
+tar -xzf ~/.code-workspaces/archives/workspace-abc123def456...-20241116-103000.tar.gz
 
 # The instance will automatically start on next access via proxy
 ```
@@ -458,10 +462,10 @@ Or restore and start immediately:
 ```bash
 # Extract archive
 cd ~/.code-workspaces/instances/
-tar -xzf ~/.code-workspaces/archives/workspace-a1b2c3d4-20241116-103000.tar.gz
+tar -xzf ~/.code-workspaces/archives/workspace-abc123def456...-20241116-103000.tar.gz
 
 # Start instance
-systemctl --user start code-server-workspace@workspace-a1b2c3d4.service
+systemctl --user start code-server-workspace@workspace-abc123def456...service
 ```
 
 ### Manual Cleanup
@@ -470,15 +474,15 @@ To manually clean up an instance before it becomes idle:
 
 ```bash
 # Stop instance
-systemctl --user stop code-server-workspace@workspace-a1b2c3d4.service
+systemctl --user stop code-server-workspace@workspace-abc123def456...service
 
 # Archive it (optional)
 cd ~/.code-workspaces
-tar -czf archives/workspace-a1b2c3d4-manual-$(date +%Y%m%d-%H%M%S).tar.gz \
-  -C instances workspace-a1b2c3d4
+tar -czf archives/workspace-abc123def456...-manual-$(date +%Y%m%d-%H%M%S).tar.gz \
+  -C instances workspace-abc123def456...
 
 # Remove instance directory
-rm -rf instances/workspace-a1b2c3d4
+rm -rf instances/workspace-abc123def456...
 ```
 
 ### Cleaning Old Archives
@@ -495,6 +499,78 @@ find ~/.code-workspaces/archives/ -name "*.tar.gz" -mtime +30 -delete
 # Or remove all archives (careful!)
 rm ~/.code-workspaces/archives/*.tar.gz
 ```
+
+## Helper Scripts
+
+The system includes convenience scripts for common operations.
+
+### restart-instance.sh
+
+Restarts a code-server instance. Can accept either a workspace path or an instance ID.
+
+**Usage with workspace path:**
+
+```bash
+scripts/restart-instance.sh /path/to/workspace
+```
+
+The script will:
+
+1. Compute the instance ID from the workspace path
+2. Restart the corresponding systemd service
+
+**Usage with instance ID:**
+
+```bash
+scripts/restart-instance.sh workspace-abc123def456...
+```
+
+**Examples:**
+
+```bash
+# Restart by workspace path
+scripts/restart-instance.sh /home/user/projects/my-app
+
+# Restart by instance ID
+scripts/restart-instance.sh workspace-abc123def456...
+
+# Restart main instance
+scripts/restart-instance.sh main
+```
+
+### restart-proxy.sh
+
+Restarts the proxy service.
+
+**Usage:**
+
+```bash
+scripts/restart-proxy.sh
+```
+
+This is equivalent to:
+
+```bash
+systemctl --user restart code-server-proxy.service
+```
+
+### migrate-to-registry.sh
+
+Migrates existing installations to use the port registry system and full hash naming.
+
+**Usage:**
+
+```bash
+scripts/migrate-to-registry.sh
+```
+
+This script:
+
+1. Renames instance directories from 8-char to full hash format
+2. Creates the port registry with current allocations
+3. Updates metadata files with correct field names
+
+**Note:** This script should only be run once when upgrading from an older version.
 
 ## Maintenance
 
@@ -645,8 +721,8 @@ For troubleshooting, you can view more detailed logs:
 journalctl --user -u code-server-proxy.service -f
 
 # For instance logs, check the log files directly
-tail -f ~/.code-workspaces/instances/workspace-a1b2c3d4/logs/stdout.log
-tail -f ~/.code-workspaces/instances/workspace-a1b2c3d4/logs/stderr.log
+tail -f ~/.code-workspaces/instances/workspace-abc123def456.../logs/stdout.log
+tail -f ~/.code-workspaces/instances/workspace-abc123def456.../logs/stderr.log
 ```
 
 The proxy logs show:
@@ -791,17 +867,17 @@ To recover a single instance from backup:
 # Extract specific instance from backup
 tar -xzf ~/backups/instances.tar.gz \
   -C ~/.code-workspaces \
-  instances/workspace-a1b2c3d4
+  instances/workspace-abc123def456...
 
 # Start instance
-systemctl --user start code-server-workspace@workspace-a1b2c3d4.service
+systemctl --user start code-server-workspace@workspace-abc123def456...service
 ```
 
 ## Tips and Best Practices
 
 ### Performance Tips
 
-1. **Limit concurrent instances**: With default 2GB per instance, monitor total memory
+1. **Limit concurrent instances**: With default 4GB per instance, monitor total memory
 2. **Clean up unused instances**: Don't rely solely on idle monitor - manually stop instances you're done with
 3. **Adjust resource limits**: If instances are slow, increase `MemoryMax` and `CPUQuota`
 
