@@ -1,0 +1,8 @@
+[Unit]
+Description=Idle workspace monitor for code-server instances
+
+[Service]
+Type=oneshot
+ExecStart=/home/shauncutts/src/other/code-server-proxy/scripts/workspace-idle-monitor.sh
+StandardOutput=journal
+StandardError=journal

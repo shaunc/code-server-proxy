@@ -1,0 +1,11 @@
+# Shell scripts - these have their own formatting tools
+*.sh
+
+# Package lock files - auto-generated
+package-lock.json
+
+# Node modules
+node_modules/
+
+# Temporary files
+tmp/

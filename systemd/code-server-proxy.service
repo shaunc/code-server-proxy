@@ -1,0 +1,17 @@
+[Unit]
+Description=Code-Server Workspace Isolation Proxy
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/shauncutts/.nvm/versions/node/v22.17.1/bin/node /home/shauncutts/src/other/code-server-proxy/src/proxy.js
+WorkingDirectory=/home/shauncutts/src/other/code-server-proxy
+Restart=on-failure
+RestartSec=5s
+Environment=NODE_ENV=production
+Environment=XDG_RUNTIME_DIR=/run/user/1001
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
