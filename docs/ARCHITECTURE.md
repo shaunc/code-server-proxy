@@ -64,6 +64,396 @@ The code-server workspace isolation proxy is a reverse proxy that provides works
               ~/.code-workspaces/instances/
 ```
 
+## Docker-Based Architecture
+
+Starting with version 2.0, the system supports Docker-based isolation as an alternative to systemd. Docker mode provides complete IPC namespace isolation, solving the terminal stealing problem that affects systemd mode.
+
+### Docker Mode Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                          Browser                                 │
+│  http://127.0.0.1:8083/?workspace=/path/to/workspace            │
+└─────────────────┬───────────────────────────────────────────────┘
+                  │
+                  │ HTTP/WebSocket
+                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              Proxy Server (Port 8083)                            │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │ Request Handler                                           │  │
+│  │  • Parse URL parameters (workspace/folder/ew)            │  │
+│  │  • Compute instance name & port (SHA-256 hash)           │  │
+│  │  • Check if container exists/running                     │  │
+│  │  • Launch container if needed (via Docker API)           │  │
+│  │  • Wait for instance to be ready                         │  │
+│  │  • Update last-access timestamp                          │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │ Container Manager (src/container-manager.js)             │  │
+│  │  • Create/start/stop Docker containers                   │  │
+│  │  • Manage Docker volumes (config, extensions)            │  │
+│  │  • Volume migration from systemd                         │  │
+│  │  • Backup/restore operations                             │  │
+│  │  • Idle monitoring and cleanup                           │  │
+│  └──────────────────────────────────────────────────────────┘  │
+└─────────────────┬───────────────────────────────────────────────┘
+                  │
+                  │ Routes to appropriate port
+                  │
+        ┌─────────┼─────────┬─────────────┬─────────────┐
+        ▼         ▼         ▼             ▼             ▼
+    ┌──────┐ ┌──────┐ ┌──────┐       ┌──────┐     ┌──────┐
+    │ 8100 │ │ 8142 │ │ 8167 │  ...  │ 8199 │     │ ...  │
+    └──┬───┘ └──┬───┘ └──┬───┘       └──┬───┘     └──┬───┘
+       │        │        │              │            │
+  ┌────▼────┐┌─▼──────┐┌▼───────┐  ┌──▼──────┐ ┌──▼──────┐
+  │Container││Container││Container│ │Container│ │Container│
+  │  Main   ││Workspace││Workspace│ │Workspace│ │Workspace│
+  │         ││   A     ││   B     │ │   C     │ │   D     │
+  └────┬────┘└─┬──────┘└┬───────┘  └──┬──────┘ └──┬──────┘
+       │        │        │              │            │
+  ┌────▼────────▼────────▼──────────────▼────────────▼─────┐
+  │                  Docker Engine                          │
+  │  • IPC namespace isolation (solves terminal stealing)   │
+  │  • Resource limits (4GB RAM, 3.0 CPU cores)            │
+  │  • Automatic restarts                                   │
+  │  • Health monitoring                                    │
+  └────────────────────┬────────────────────────────────────┘
+                       │
+       ┌───────────────┼────────────────┬──────────────┐
+       │               │                │              │
+  ┌────▼───┐     ┌────▼───┐      ┌─────▼────┐   ┌────▼────┐
+  │Volume  │     │Volume  │      │Volume    │   │Volume   │
+  │ main   │     │ws-a1b2 │      │ws-e5f6   │   │ws-x9y8  │
+  │-config │     │-config │      │-config   │   │-config  │
+  └────────┘     └────────┘      └──────────┘   └─────────┘
+       │               │                │              │
+  ┌────▼───┐     ┌────▼───┐      Shared Extensions Volume
+  │Workspace     │Workspace       (bind mounted)
+  │ mount   │     │ mount  │      ~/.code-workspaces/shared/
+  └─────────┘    └─────────┘
+```
+
+### Docker Components
+
+#### Container Manager (`src/container-manager.js`)
+
+The Container Manager provides programmatic access to Docker operations:
+
+**Key Functions**:
+
+- `createContainer(instanceId, workspacePath, port)`: Creates and starts a new container
+- `startContainer(instanceId)`: Starts an existing stopped container
+- `stopContainer(instanceId)`: Gracefully stops a running container
+- `removeContainer(instanceId)`: Removes a stopped container
+- `isContainerRunning(instanceId)`: Checks if container is running
+- `getContainerInfo(instanceId)`: Retrieves container metadata
+- `migrateToVolume(instanceId)`: Migrates systemd user-data-dir to Docker volume
+- `backupVolume(instanceId, backupPath)`: Creates tar.gz backup of volume
+- `restoreVolume(instanceId, backupPath)`: Restores volume from backup
+- `stopIdleContainers(thresholdDays)`: Stops containers idle > threshold
+- `cleanupIdleContainers(gracePeriodDays)`: Removes containers stopped > grace period
+
+**Container Configuration**:
+
+```javascript
+{
+  Image: 'code-server-proxy:latest',
+  name: `code-server-${instanceId}`,
+  Hostname: `workspace-${instanceId.substring(0, 12)}`,
+  ExposedPorts: { [`${port}/tcp`]: {} },
+  HostConfig: {
+    PortBindings: {
+      [`${port}/tcp`]: [{ HostIp: '127.0.0.1', HostPort: String(port) }]
+    },
+    Binds: [
+      `${workspacePath}:/workspace:rw`,
+      `${SHARED_EXTENSIONS_VOLUME}:/config/extensions`,
+      `${HOST_SECRETS_PATH}:/host-secrets:ro`,
+      `${SHARED_SETTINGS_PATH}/settings.json:/config/data/User/settings.json:rw`,
+      `${SHARED_SETTINGS_PATH}/keybindings.json:/config/data/User/keybindings.json:rw`
+    ],
+    Mounts: [{
+      Type: 'volume',
+      Source: `code-server-${instanceId}-config`,
+      Target: '/config'
+    }],
+    Memory: 4 * 1024 * 1024 * 1024,  // 4GB
+    NanoCpus: 3 * 1000000000,         // 3.0 cores
+    CapAdd: ['IPC_LOCK'],             // For gnome-keyring
+    RestartPolicy: { Name: 'unless-stopped' }
+  },
+  Labels: {
+    'app': 'code-server-proxy',
+    'workspace': workspacePath,
+    'instance-id': instanceId
+  }
+}
+```
+
+#### Docker Image (`docker/code-server/Dockerfile`)
+
+Custom image based on `linuxserver/code-server` with:
+
+**Additional Packages**:
+
+- `gnome-keyring`: Secrets storage for extensions
+- `dbus`: IPC for keyring daemon
+- `libsecret-1-0`: Secret storage library
+
+**S6 Overlay Services**:
+
+- `50-gnome-keyring`: Initializes gnome-keyring daemon at startup
+- `51-sync-secrets`: One-time sync from host keyring (if available)
+- `gnome-keyring/run`: Keeps gnome-keyring daemon running
+
+**Environment Variables**:
+
+- `PUID=1000`, `PGID=1000`: User/group IDs
+- `DBUS_SESSION_BUS_ADDRESS`: D-Bus socket path
+- `GNOME_KEYRING_CONTROL`: Keyring control directory
+
+### Docker Volume Strategy
+
+#### Per-Instance Config Volumes
+
+Each instance has a dedicated Docker volume for user data:
+
+```
+code-server-<instance-id>-config/
+├── data/
+│   └── User/             # Contains settings.json and keybindings.json
+│                         # (mounted from host shared files)
+├── Machine/              # Machine-specific data
+├── logs/                 # code-server logs
+├── workspace-storage/    # Workspace state
+└── globalStorage/        # Extension storage
+```
+
+**Creation**: Automatically created on first container start
+**Lifecycle**: Persists across container removals
+**Backup**: Via `backupVolume()` to tar.gz
+**Cleanup**: Removed after grace period (7+ days stopped)
+
+#### Shared Extensions Volume
+
+All instances share a single extensions directory:
+
+```
+~/.code-workspaces/shared/extensions/
+├── ms-python.python-*/
+├── esbenp.prettier-vscode-*/
+└── ...
+```
+
+**Mount**: Bind mount at `/config/extensions` in all containers
+**Benefits**: Single installation serves all instances
+**Trade-off**: Extension conflicts possible
+
+#### Shared Settings Files
+
+Settings and keybindings are shared across all containers via individual file mounts:
+
+```
+~/.code-workspaces/shared/User/
+├── settings.json        # Global VSCode settings
+└── keybindings.json     # Keyboard shortcuts
+```
+
+**Mount**: Individual file bind mounts at `/config/data/User/` in containers
+**Benefits**:
+
+- Single source of truth for user preferences
+- Changes immediately visible in all containers
+- Read-write access allows updates from any container
+  **Trade-off**: Cannot have per-container user settings variations
+
+#### Workspace Bind Mounts
+
+Workspace directories mounted directly from host:
+
+```
+Host: /path/to/workspace
+Container: /workspace
+```
+
+**Permissions**: Read-write
+**Performance**: Native (no volume overhead)
+**Isolation**: None (intentional - same files across instances)
+
+### IPC Namespace Isolation
+
+Docker mode provides complete IPC namespace isolation, solving the terminal stealing problem:
+
+**Problem in Systemd Mode**:
+
+- All code-server instances share IPC namespace
+- Terminal reconnection uses shared IPC
+- Wrong instance can "steal" terminal connection
+- Causes confusing terminal behavior
+
+**Solution in Docker Mode**:
+
+- Each container has separate IPC namespace
+- Terminals isolated per container
+- No cross-instance communication
+- Safe to enable terminal persistence
+
+**Technical Details**:
+
+```bash
+# Each container has isolated:
+/dev/pts/*          # Pseudo-terminals
+/dev/shm/*          # Shared memory
+POSIX message queues
+Semaphores
+```
+
+### gnome-keyring Integration
+
+Docker containers run gnome-keyring daemon for secrets storage:
+
+**Initialization Flow**:
+
+1. Container starts → S6 runs `50-gnome-keyring`
+2. Start D-Bus session bus
+3. Initialize keyring: `gnome-keyring-daemon --start --components=secrets`
+4. Export control socket to `/run/user/1000/keyring/`
+5. Run `51-sync-secrets` if host secrets exist
+6. S6 service `gnome-keyring/run` keeps daemon alive
+
+**Secrets Sync** (one-time):
+
+On first container start, can copy secrets from host:
+
+```bash
+# Host keyring location:
+~/.local/share/keyrings/
+
+# Synced to container volume:
+/config/.local/share/keyrings/
+```
+
+**After sync**: Container keyring is independent, changes not synced back.
+
+**Capabilities**: Container needs `IPC_LOCK` for keyring memory locking.
+
+### Port Assignment (Docker Mode)
+
+Same deterministic port assignment as systemd mode:
+
+```javascript
+hash = SHA256(workspacePath);
+port = 8101 + (parseInt(hash.substring(0, 8), 16) % 99);
+```
+
+**Port mapping**: Container port → Host port (same number)
+**Example**: Container port 8142 → Host 127.0.0.1:8142
+
+### Dual-Mode Support
+
+The proxy supports both Docker and systemd backends:
+
+**Mode Selection**:
+
+```javascript
+const USE_DOCKER = process.env.USE_DOCKER === 'true';
+```
+
+**Mode Detection**:
+
+- Proxy: Reads `USE_DOCKER` environment variable
+- Idle monitor: Auto-detects based on running containers vs systemd units
+
+**Migration Path**:
+
+1. Start in systemd mode
+2. Migrate workspaces to Docker (via migration scripts)
+3. Enable Docker mode (`USE_DOCKER=true`)
+4. Existing workspaces continue in systemd, new ones use Docker
+5. Gradually migrate all workspaces
+6. Disable systemd mode
+
+### Container Lifecycle
+
+**Creation** (on first access):
+
+1. Proxy receives request for workspace
+2. Container Manager checks if container exists
+3. If not, creates container with volumes and mounts
+4. Starts container
+5. Waits for health check (code-server responding)
+6. Updates `last-access` timestamp
+7. Proxies request to container
+
+**Idle Monitoring**:
+
+1. Timer triggers idle monitor script
+2. Script detects Docker mode
+3. Calls `stopIdleContainers(3)` - stops containers idle >3 days
+4. Calls `cleanupIdleContainers(7)` - removes containers stopped >7 days
+5. Before removal, creates volume backup to `~/.code-workspaces/volumes/`
+
+**Restart** (container stopped):
+
+1. Proxy receives request for workspace
+2. Container exists but not running
+3. Container Manager starts existing container
+4. Waits for health check
+5. Proxies request
+
+### Resource Limits (Docker Mode)
+
+Per-container limits enforced by Docker:
+
+| Resource | Limit     | Setting                         |
+| -------- | --------- | ------------------------------- |
+| Memory   | 4GB       | `Memory: 4 * 1024^3`            |
+| CPU      | 3.0 cores | `NanoCpus: 3 * 10^9`            |
+| Swap     | 0 (none)  | `MemorySwap: 4 * 1024^3`        |
+| Restart  | Always    | `RestartPolicy: unless-stopped` |
+
+**Monitoring**:
+
+```bash
+docker stats --no-stream code-server-<instance-id>
+```
+
+**Advantages over systemd**:
+
+- Stricter enforcement
+- Better memory accounting
+- Network isolation options
+- Easier to adjust per-container
+
+### Volume Migration from Systemd
+
+The `migrateToVolume()` function handles migration:
+
+**Process**:
+
+1. Create new Docker volume for instance
+2. Start temporary container with volume mounted
+3. Copy systemd user-data-dir to volume
+4. Stop temporary container
+5. Archive original systemd directory
+6. Update metadata with `backend: "docker"`
+
+**Data Preserved**:
+
+- User settings and preferences
+- Extension data
+- Workspace state (open files, layout)
+- Editor UI state
+- Terminal history
+
+**Data Not Migrated**:
+
+- Logs (archived separately)
+- Temporary files
+- Cache directories
+
 ### Component Relationships
 
 ```
@@ -1089,7 +1479,11 @@ If deploying for multiple users or untrusted workspaces:
 
 ## Further Reading
 
-- [DEPLOYMENT.md](DEPLOYMENT.md) - Installation and configuration
+- [DEPLOYMENT.md](DEPLOYMENT.md) - Installation and configuration (systemd and Docker)
 - [OPERATIONS.md](OPERATIONS.md) - Daily operations and maintenance
+- [DOCKER-MIGRATION.md](DOCKER-MIGRATION.md) - Docker migration guide
+- [RUNBOOKS.md](RUNBOOKS.md) - Operational runbooks for Docker and systemd
 - [systemd/README.md](../systemd/README.md) - Systemd service details
 - [src/proxy.js](../src/proxy.js) - Proxy implementation source
+- [src/container-manager.js](../src/container-manager.js) - Docker container management
+- [docker/code-server/Dockerfile](../docker/code-server/Dockerfile) - Docker image definition

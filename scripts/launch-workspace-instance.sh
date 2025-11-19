@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+# NOTE: This script is used for systemd mode only.
+# When USE_DOCKER=true, instances are managed by src/container-manager.js
+
 INSTANCE_NAME="$1"
 
 if [[ -z "$INSTANCE_NAME" ]]; then

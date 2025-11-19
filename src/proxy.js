@@ -19,6 +19,10 @@ const { URL } = require('url');
 
 const execAsync = promisify(exec);
 
+// Docker support
+const USE_DOCKER = process.env.USE_DOCKER === 'true';
+const containerManager = USE_DOCKER ? require('./container-manager') : null;
+
 // Configuration
 const PROXY_PORT = 8083;
 const PROXY_HOST = '127.0.0.1';
@@ -296,6 +300,8 @@ function createInstanceDirectory(instanceId, workspacePath, port) {
     port,
     created: new Date().toISOString(),
     instanceId,
+    backend: USE_DOCKER ? 'docker' : 'systemd',
+    containerName: USE_DOCKER ? `code-server-${instanceId}` : null,
   };
 
   const metadataPath = path.join(instanceDir, 'metadata.json');
@@ -369,20 +375,55 @@ async function waitForBackend(port, timeout = BACKEND_READY_TIMEOUT) {
 }
 
 /**
- * Launch code-server instance via systemd
+ * Launch code-server instance (Docker or systemd)
  * @param {string} instanceId - Instance ID
+ * @param {string} workspacePath - Workspace path (required for Docker mode)
+ * @param {number} port - Port number (required for Docker mode)
  * @returns {Promise<void>}
  */
-async function launchInstance(instanceId) {
-  const serviceName = `code-server-workspace@${instanceId}.service`;
-  console.log(`Launching instance via systemd: ${serviceName}`);
+async function launchInstance(instanceId, workspacePath, port) {
+  if (USE_DOCKER) {
+    console.log(`Launching instance via Docker: ${instanceId}`);
 
-  try {
-    await execAsync(`systemctl --user start ${serviceName}`);
-    console.log(`Successfully started ${serviceName}`);
-  } catch (error) {
-    console.error(`Failed to start ${serviceName}:`, error.message);
-    throw new Error(`Failed to start systemd service: ${error.message}`);
+    try {
+      // Check if container exists
+      const containerExists =
+        await containerManager.inspectContainer(instanceId);
+
+      if (!containerExists) {
+        // Create new container
+        console.log(`Creating new Docker container for ${instanceId}...`);
+        await containerManager.createContainer(instanceId, workspacePath, port);
+      }
+
+      // Check if container is running
+      const isRunning = await containerManager.isContainerRunning(instanceId);
+      if (!isRunning) {
+        // Start the container
+        console.log(`Starting Docker container ${instanceId}...`);
+        await containerManager.startContainer(instanceId);
+      } else {
+        console.log(`Container ${instanceId} is already running`);
+      }
+    } catch (error) {
+      console.error(
+        `Failed to launch Docker container ${instanceId}:`,
+        error.message
+      );
+      throw new Error(`Failed to launch Docker container: ${error.message}`);
+    }
+  } else {
+    // Systemd mode (existing implementation)
+    const serviceName = `code-server-workspace@${instanceId}.service`;
+    console.log(`Launching instance via systemd: ${serviceName}`);
+
+    try {
+      await execAsync(`systemctl --user start ${serviceName}`);
+      console.log(`Successfully started ${serviceName}`);
+    } catch (error) {
+      console.error(`Failed to start ${serviceName}:`, error.message);
+      throw new Error(`Failed to start systemd service: ${error.message}`);
+    }
   }
 }
 
@@ -436,7 +477,7 @@ async function handleRequest(req, res) {
       // Check if main instance is running, launch if needed
       if (!(await isPortListening(targetPort))) {
         console.log(`Main instance not running, launching ${instanceId}...`);
-        await launchInstance(instanceId);
+        await launchInstance(instanceId, null, targetPort);
 
         console.log(
           `Waiting for main instance on port ${targetPort} to be ready...`
@@ -493,7 +534,7 @@ async function handleRequest(req, res) {
       // Check if instance is running, launch if needed
       if (!(await isPortListening(targetPort))) {
         console.log(`Instance not running, launching ${instanceId}...`);
-        await launchInstance(instanceId);
+        await launchInstance(instanceId, workspacePath, targetPort);
 
         console.log(`Waiting for backend on port ${targetPort} to be ready...`);
         const ready = await waitForBackend(targetPort);
@@ -550,7 +591,7 @@ async function handleRequest(req, res) {
       // Check if instance is running, launch if needed
       if (!(await isPortListening(targetPort))) {
         console.log(`Instance not running, launching ${instanceId}...`);
-        await launchInstance(instanceId);
+        await launchInstance(instanceId, folderPath, targetPort);
 
         console.log(`Waiting for backend on port ${targetPort} to be ready...`);
         const ready = await waitForBackend(targetPort);
@@ -575,7 +616,7 @@ async function handleRequest(req, res) {
       // Check if main instance is running, launch if needed
       if (!(await isPortListening(targetPort))) {
         console.log(`Main instance not running, launching ${instanceId}...`);
-        await launchInstance(instanceId);
+        await launchInstance(instanceId, null, targetPort);
 
         console.log(
           `Waiting for main instance on port ${targetPort} to be ready...`
@@ -706,13 +747,36 @@ const server = http.createServer(handleRequest);
 server.on('upgrade', handleUpgrade);
 
 // Start listening
-server.listen(PROXY_PORT, PROXY_HOST, () => {
+server.listen(PROXY_PORT, PROXY_HOST, async () => {
   console.log(`Code-Server Proxy listening on ${PROXY_HOST}:${PROXY_PORT}`);
+  console.log(`Backend mode: ${USE_DOCKER ? 'Docker' : 'systemd'}`);
   console.log(`Main instance port: ${MAIN_PORT}`);
   console.log(
     `Workspace instance ports: ${WORKSPACE_PORT_MIN}-${WORKSPACE_PORT_MAX}`
   );
   console.log(`Base directory: ${BASE_DIR}`);
+
+  // Verify Docker availability if Docker mode is enabled
+  if (USE_DOCKER) {
+    const dockerAvailable = await containerManager.isDockerAvailable();
+    if (!dockerAvailable) {
+      console.error('ERROR: Docker mode enabled but Docker is not available!');
+      console.error('Please ensure Docker is installed and running.');
+      process.exit(1);
+    }
+    console.log('Docker connection verified');
+
+    // Ensure shared extensions volume exists
+    try {
+      await containerManager.ensureSharedExtensionsVolume();
+      console.log('Shared extensions volume ready');
+    } catch (error) {
+      console.error(
+        'Failed to initialize shared extensions volume:',
+        error.message
+      );
+    }
+  }
 });
 
 // Handle graceful shutdown

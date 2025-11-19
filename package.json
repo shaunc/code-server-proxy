@@ -24,6 +24,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "dockerode": "^4.0.0",
     "http-proxy": "^1.18.1",
     "http-proxy-middleware": "^2.0.6"
   },

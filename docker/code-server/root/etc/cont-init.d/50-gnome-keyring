@@ -1,0 +1,31 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+
+# Initialize gnome-keyring directories and default keyring
+# Runs once on container initialization before services start
+
+echo "[init-keyring] Setting up gnome-keyring directories..."
+
+# Create directories for gnome-keyring with correct permissions
+mkdir -p /config/.local/share/keyrings
+mkdir -p /config/.cache/keyring-control
+
+# Set ownership
+chown -R abc:abc /config/.local/share/keyrings
+chown -R abc:abc /config/.cache/keyring-control
+
+# Set strict permissions (0700) for keyring control directory
+chmod 0700 /config/.cache/keyring-control
+
+# Initialize D-Bus machine ID if missing
+if [ ! -f /var/lib/dbus/machine-id ]; then
+    echo "[init-keyring] Generating D-Bus machine ID..."
+    dbus-uuidgen > /var/lib/dbus/machine-id
+fi
+
+# Ensure D-Bus user session directory exists
+mkdir -p /run/user/$(id -u abc)
+chown abc:abc /run/user/$(id -u abc)
+chmod 0700 /run/user/$(id -u abc)
+
+echo "[init-keyring] ✓ gnome-keyring setup complete"

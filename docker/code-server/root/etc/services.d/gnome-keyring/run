@@ -1,0 +1,33 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+
+# gnome-keyring service for code-server container
+# Provides Secret Service API for VSCode extension authentication
+
+# Ensure D-Bus user session directory exists
+mkdir -p /run/user/$(id -u abc)
+chown abc:abc /run/user/$(id -u abc)
+
+# Start D-Bus session bus for the abc user
+if [ -z "$DBUS_SESSION_BUS_ADDRESS" ]; then
+    # Launch D-Bus and capture the environment variables
+    eval "$(s6-setuidgid abc dbus-launch --sh-syntax)"
+    export DBUS_SESSION_BUS_ADDRESS
+    export DBUS_SESSION_BUS_PID
+fi
+
+# Ensure keyring control directory has correct permissions (0700)
+mkdir -p /config/.cache/keyring-control
+chown abc:abc /config/.cache/keyring-control
+chmod 0700 /config/.cache/keyring-control
+
+# Start gnome-keyring-daemon in foreground
+# --components=secrets: Only run the secrets component
+# --foreground: Run in foreground for s6 supervision
+# --control-directory: Store control socket in config volume
+exec s6-setuidgid abc \
+    /usr/bin/gnome-keyring-daemon \
+    --start \
+    --foreground \
+    --components=secrets \
+    --control-directory=/config/.cache/keyring-control
