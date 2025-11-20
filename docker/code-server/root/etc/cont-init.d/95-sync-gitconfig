@@ -1,0 +1,47 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+#
+# Sync Git Configuration and Terminal Settings
+#
+# This script copies the host user's .gitconfig and sets up git credential helper
+# and configures VS Code terminal profiles
+#
+
+echo "[git-config] Syncing git configuration and terminal settings..."
+
+HOST_GITCONFIG="/host-gitconfig"
+CONTAINER_GITCONFIG="/config/.gitconfig"
+
+# Check if host gitconfig is mounted
+if [ -f "$HOST_GITCONFIG" ]; then
+    echo "[git-config] Copying host .gitconfig"
+    s6-setuidgid abc cp "$HOST_GITCONFIG" "$CONTAINER_GITCONFIG"
+    chmod 644 "$CONTAINER_GITCONFIG"
+else
+    echo "[git-config] No host .gitconfig found, using defaults"
+fi
+
+# Ensure git credential helper is configured
+s6-setuidgid abc sh -c "
+    git config --global credential.helper /usr/local/bin/git-credential-keyring
+    git config --global user.email 'shauncutts@factfiber.com' 2>/dev/null || true
+    git config --global user.name 'Shaun Cutts' 2>/dev/null || true
+"
+
+# Create container shell profile with DBUS environment
+cat > /etc/profile.d/container-env.sh << 'ENVEOF'
+# Container environment for local shell
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus
+export GNOME_KEYRING_CONTROL=/config/.cache/keyring-control
+
+# Source bashrc if it exists
+if [ -f ~/.bashrc ]; then
+    source ~/.bashrc
+fi
+ENVEOF
+chmod 644 /etc/profile.d/container-env.sh
+
+echo "[git-config] ✓ Git and terminal configuration complete"
+echo "[git-config] Note: Configure terminal profiles in VS Code settings:"
+echo "[git-config]   - Host Shell (SSH): ssh host.docker.internal"
+echo "[git-config]   - Container Shell: bash --rcfile /etc/profile.d/container-env.sh"

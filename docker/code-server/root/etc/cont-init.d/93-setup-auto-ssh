@@ -1,0 +1,96 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+#
+# Auto-SSH Setup Initialization Script
+# 
+# This script sets up auto-SSH functionality for container terminals.
+# When enabled via ENABLE_AUTO_SSH=true, terminals will automatically
+# SSH to the host system, providing full GPU/CPU/memory access while
+# preserving terminal isolation.
+#
+# The container shell process remains isolated in the container namespace,
+# but all user commands execute on the host via SSH.
+
+echo "[auto-ssh-setup] Initializing auto-SSH configuration..."
+
+# Wait for /config to be writable by abc user
+for i in {1..30}; do
+    if s6-setuidgid abc test -w /config 2>/dev/null; then
+        echo "[auto-ssh-setup] /config is writable"
+        break
+    fi
+    echo "[auto-ssh-setup] Waiting for /config to be writable... ($i/30)"
+    sleep 0.5
+done
+
+# Create SSH configuration directory with correct permissions
+if [ ! -d /config/.ssh ]; then
+    echo "[auto-ssh-setup] Creating SSH directory..."
+    s6-setuidgid abc mkdir -p /config/.ssh
+    s6-setuidgid abc chmod 700 /config/.ssh
+fi
+
+# Create auto-SSH bashrc script
+echo "[auto-ssh-setup] Creating auto-SSH shell initialization script..."
+# Use s6-setuidgid to run as abc user for file creation
+cat << 'EOF' | s6-setuidgid abc tee /config/.auto-ssh-bashrc > /dev/null
+#!/bin/bash
+# Auto-SSH to host for terminal sessions
+# This script is sourced by bash/zsh shells during interactive initialization
+
+# Only for interactive terminals
+if [ ! -t 0 ]; then
+  return
+fi
+
+# Only if enabled
+if [ "$ENABLE_AUTO_SSH" != "true" ]; then
+  return
+fi
+
+# Only if required vars are set
+if [ -z "$HOST_USER" ] || [ -z "$WORKSPACE_PATH" ]; then
+  echo "Warning: AUTO_SSH enabled but HOST_USER or WORKSPACE_PATH not set"
+  return
+fi
+
+# Prevent recursive SSH (already in SSH session)
+if [ -n "$SSH_CONNECTION" ]; then
+  return
+fi
+
+# SSH to host, cd to workspace, exec bash
+# The 'exec' replaces the container shell process with SSH client,
+# so when SSH exits, the terminal closes cleanly
+exec ssh -o "StrictHostKeyChecking=no" \
+         -o "UserKnownHostsFile=/dev/null" \
+         -o "ServerAliveInterval=60" \
+         -o "ServerAliveCountMax=3" \
+         -t "${HOST_USER}@host.docker.internal" \
+         "cd '${WORKSPACE_PATH}' && exec bash -l"
+EOF
+
+s6-setuidgid abc chmod 644 /config/.auto-ssh-bashrc
+
+# Create host shell RC file that combines .bashrc and auto-ssh
+# This is used by the "Host Shell (SSH)" terminal profile
+s6-setuidgid abc bash -c 'cat > /config/.host-shell-bashrc << '\''EOF'\''
+# Host Shell RC - sources .bashrc then auto-SSH
+[ -f /config/.bashrc ] && source /config/.bashrc
+[ -f /config/.auto-ssh-bashrc ] && source /config/.auto-ssh-bashrc
+EOF'
+echo "[auto-ssh-setup] Created .host-shell-bashrc for terminal profile"
+
+# Hook into zsh profile if it exists
+if [ -f /config/.zshrc ]; then
+    if ! grep -q ".auto-ssh-bashrc" /config/.zshrc; then
+        echo "[auto-ssh-setup] Adding auto-SSH sourcing to .zshrc..."
+        s6-setuidgid abc bash -c 'cat >> /config/.zshrc << '\''EOF'\''
+
+# Source auto-SSH configuration
+[ -f /config/.auto-ssh-bashrc ] && . /config/.auto-ssh-bashrc
+EOF'
+    fi
+fi
+
+echo "[auto-ssh-setup] Auto-SSH configuration complete"

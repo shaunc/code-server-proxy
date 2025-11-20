@@ -23,6 +23,12 @@ const execAsync = promisify(exec);
 const USE_DOCKER = process.env.USE_DOCKER === 'true';
 const containerManager = USE_DOCKER ? require('./container-manager') : null;
 
+// Activity tracking for idle detection
+const activityTracker = require('./activity-tracker');
+
+// Settings sync service (only in Docker mode)
+const settingsSync = USE_DOCKER ? require('./settings-sync') : null;
+
 // Configuration
 const PROXY_PORT = 8083;
 const PROXY_HOST = '127.0.0.1';
@@ -37,6 +43,104 @@ const REGISTRY_PATH = path.join(WORKSPACES_DIR, 'port-registry.json');
 const SHARED_SETTINGS_DIR = path.join(WORKSPACES_DIR, 'shared');
 const BACKEND_READY_TIMEOUT = 30000; // 30 seconds
 const BACKEND_READY_POLL_INTERVAL = 500; // 500ms
+const SESSION_COOKIE_NAME = 'code-server-proxy-session';
+const SESSION_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+// Lock mechanism to prevent concurrent container operations
+// Maps instance ID to promise that resolves when operation completes
+const instanceLocks = new Map();
+
+// Session management for maintaining routing context
+// Maps session ID to workspace routing information
+const sessionMap = new Map();
+
+/**
+ * Generate a unique session ID
+ * @returns {string} UUID v4 session ID
+ */
+function generateSessionId() {
+  return crypto.randomUUID();
+}
+
+/**
+ * Extract session cookie from request
+ * @param {http.IncomingMessage} req - Request object
+ * @returns {string|null} Session ID or null
+ */
+function extractSessionCookie(req) {
+  const cookieHeader = req.headers.cookie;
+  if (!cookieHeader) {
+    return null;
+  }
+
+  const cookies = cookieHeader.split(';').map((c) => c.trim());
+  for (const cookie of cookies) {
+    const [name, value] = cookie.split('=');
+    if (name === SESSION_COOKIE_NAME) {
+      return value;
+    }
+  }
+  return null;
+}
+
+/**
+ * Create session for workspace routing
+ * @param {string} workspacePath - Workspace path
+ * @param {string} instanceId - Instance ID
+ * @param {number} port - Port number
+ * @returns {string} Session ID
+ */
+function createSession(workspacePath, instanceId, port) {
+  const sessionId = generateSessionId();
+  sessionMap.set(sessionId, {
+    workspacePath,
+    instanceId,
+    port,
+    created: Date.now(),
+    lastAccess: Date.now(),
+  });
+  return sessionId;
+}
+
+/**
+ * Get session information
+ * @param {string} sessionId - Session ID
+ * @returns {Object|null} Session info or null if expired/not found
+ */
+function getSession(sessionId) {
+  if (!sessionId || !sessionMap.has(sessionId)) {
+    return null;
+  }
+
+  const session = sessionMap.get(sessionId);
+  const now = Date.now();
+
+  // Check if session expired
+  if (now - session.lastAccess > SESSION_TTL) {
+    sessionMap.delete(sessionId);
+    return null;
+  }
+
+  // Update last access time
+  session.lastAccess = now;
+  return session;
+}
+
+/**
+ * Cleanup expired sessions (run periodically)
+ */
+function cleanupExpiredSessions() {
+  const now = Date.now();
+  for (const [sessionId, session] of sessionMap.entries()) {
+    if (now - session.lastAccess > SESSION_TTL) {
+      console.log(`[SESSION] Expired session ${sessionId}`);
+      sessionMap.delete(sessionId);
+    }
+  }
+}
+
+// Cleanup expired sessions every hour
+setInterval(cleanupExpiredSessions, 60 * 60 * 1000);
 
 // Create HTTP proxy
 const proxy = httpProxy.createProxyServer({
@@ -56,64 +160,54 @@ proxy.on('error', (err, req, res) => {
   }
 });
 
-// Intercept proxy responses to rewrite redirect Location headers
-// Only strip workspace/folder parameters that match the current routing
+// Intercept proxy responses to rewrite redirect Location headers and inject session cookies
 proxy.on('proxyRes', (proxyRes, req, res) => {
   const statusCode = proxyRes.statusCode;
+
+  // Inject session cookie if this is a new session
+  if (req._sessionId) {
+    const cookieValue = `${SESSION_COOKIE_NAME}=${req._sessionId}; HttpOnly; Path=/; Max-Age=${SESSION_TTL / 1000}; SameSite=Lax`;
+
+    // Add Set-Cookie header (preserve existing cookies if any)
+    const existingCookies = proxyRes.headers['set-cookie'] || [];
+    if (Array.isArray(existingCookies)) {
+      proxyRes.headers['set-cookie'] = [...existingCookies, cookieValue];
+    } else if (existingCookies) {
+      proxyRes.headers['set-cookie'] = [existingCookies, cookieValue];
+    } else {
+      proxyRes.headers['set-cookie'] = [cookieValue];
+    }
+
+    console.log(
+      `[SESSION] Set session cookie: ${req._sessionId.substring(0, 8)}`
+    );
+  }
 
   // Only intercept 3xx redirects
   if (statusCode >= 300 && statusCode < 400 && proxyRes.headers.location) {
     const location = proxyRes.headers.location;
 
     try {
-      // Parse the original request to get routing parameters
-      const originalParams = parseUrlParams(req._originalUrl || req.url);
-
       // Parse the redirect location
       const redirectUrl = new URL(
         location,
         `http://${PROXY_HOST}:${PROXY_PORT}${req.url}`
       );
 
-      // Only strip parameters if they match the ones we used for routing
-      // This prevents redirect loops while preserving cross-instance redirects
-      let stripped = false;
-
-      if (
-        originalParams.workspace &&
-        redirectUrl.searchParams.get('workspace') === originalParams.workspace
-      ) {
-        redirectUrl.searchParams.delete('workspace');
-        stripped = true;
-      }
-
-      if (
-        originalParams.folder &&
-        redirectUrl.searchParams.get('folder') === originalParams.folder
-      ) {
-        redirectUrl.searchParams.delete('folder');
-        stripped = true;
-      }
+      // No path rewriting needed with direct mounting
+      // Code-server uses actual host paths, which work in both proxy and container
 
       // Construct the new location (preserve relative vs absolute)
       let newLocation;
       if (location.startsWith('http://') || location.startsWith('https://')) {
-        // Absolute URL - use full URL without params
+        // Absolute URL
         newLocation = `${redirectUrl.pathname}${redirectUrl.search}`;
       } else {
-        // Relative URL - use pathname + search only
+        // Relative URL
         newLocation = `${redirectUrl.pathname}${redirectUrl.search}`;
       }
 
-      if (stripped) {
-        console.log(
-          `[REDIRECT] Stripped matching routing params: ${location} -> ${newLocation}`
-        );
-      } else {
-        console.log(
-          `[REDIRECT] Preserving redirect (no matching params): ${location}`
-        );
-      }
+      console.log(`[REDIRECT] ${location} -> ${newLocation}`);
 
       proxyRes.headers.location = newLocation;
     } catch (error) {
@@ -375,23 +469,37 @@ async function waitForBackend(port, timeout = BACKEND_READY_TIMEOUT) {
 }
 
 /**
- * Launch code-server instance (Docker or systemd)
+ * Launch code-server instance (Docker or systemd) - internal implementation
  * @param {string} instanceId - Instance ID
  * @param {string} workspacePath - Workspace path (required for Docker mode)
  * @param {number} port - Port number (required for Docker mode)
  * @returns {Promise<void>}
  */
-async function launchInstance(instanceId, workspacePath, port) {
+async function launchInstanceUnsafe(instanceId, workspacePath, port) {
   if (USE_DOCKER) {
     console.log(`Launching instance via Docker: ${instanceId}`);
 
     try {
       // Check if container exists
-      const containerExists =
-        await containerManager.inspectContainer(instanceId);
+      let containerExists = await containerManager.inspectContainer(instanceId);
 
+      // Check if container is using outdated image and needs recreation
+      if (containerExists) {
+        const isOutdated =
+          await containerManager.isContainerImageOutdated(instanceId);
+        if (isOutdated) {
+          console.log(
+            `Container ${instanceId} is using outdated image, recreating...`
+          );
+          await containerManager.stopContainer(instanceId);
+          await containerManager.removeContainer(instanceId);
+          // Container removed, will be recreated below
+          containerExists = false;
+        }
+      }
+
+      // Create container if it doesn't exist (or was just removed due to outdated image)
       if (!containerExists) {
-        // Create new container
         console.log(`Creating new Docker container for ${instanceId}...`);
         await containerManager.createContainer(instanceId, workspacePath, port);
       }
@@ -428,6 +536,55 @@ async function launchInstance(instanceId, workspacePath, port) {
 }
 
 /**
+ * Launch code-server instance with locking to prevent concurrent creation/recreation
+ * @param {string} instanceId - Instance ID
+ * @param {string} workspacePath - Workspace path (required for Docker mode)
+ * @param {number} port - Port number (required for Docker mode)
+ * @returns {Promise<void>}
+ */
+async function launchInstance(instanceId, workspacePath, port) {
+  if (!USE_DOCKER) {
+    // Systemd mode doesn't need locking
+    return launchInstanceUnsafe(instanceId, workspacePath, port);
+  }
+
+  // Check if there's already an operation in progress for this instance
+  if (instanceLocks.has(instanceId)) {
+    // Wait for the existing operation to complete
+    await instanceLocks.get(instanceId);
+    return;
+  }
+
+  // Check if container exists and is running
+  const containerExists = await containerManager.inspectContainer(instanceId);
+  const isRunning = await containerManager.isContainerRunning(instanceId);
+
+  // Fast path: if running and image is up-to-date, nothing to do
+  if (isRunning && containerExists) {
+    const isOutdated =
+      await containerManager.isContainerImageOutdated(instanceId);
+    if (!isOutdated) {
+      console.log(`Container ${instanceId} is already running`);
+      return;
+    }
+    // Image is outdated, need to recreate (fall through to lock acquisition)
+  }
+
+  // If not running or image outdated, acquire lock to prevent concurrent creation
+  const operationPromise = (async () => {
+    try {
+      await launchInstanceUnsafe(instanceId, workspacePath, port);
+    } finally {
+      // Clean up the lock when done
+      instanceLocks.delete(instanceId);
+    }
+  })();
+
+  instanceLocks.set(instanceId, operationPromise);
+  await operationPromise;
+}
+
+/**
  * Parse URL query parameters
  * @param {string} urlString - Full URL string
  * @returns {Object} Parsed parameters
@@ -449,6 +606,106 @@ function parseUrlParams(urlString) {
 }
 
 /**
+ * Extract workspace ID from request for activity tracking
+ * @param {http.IncomingMessage} req - Request object
+ * @returns {string|null} - Workspace instance ID or null
+ */
+function extractWorkspaceId(req) {
+  const params = parseUrlParams(req.url);
+
+  // Get workspace path (from workspace or folder parameter)
+  const workspacePath = params.workspace || params.folder;
+
+  if (!workspacePath) {
+    return null;
+  }
+
+  // Return the instance ID (SHA256 hash of workspace path)
+  return computeInstanceId(workspacePath);
+}
+
+/**
+ * Build hash-based redirect URL for external workspace/folder paths
+ * @param {string} url - Original URL
+ * @param {string} instanceId - Instance ID (SHA256 hash)
+ * @param {string} workspacePath - Workspace or folder path
+ * @param {Object} params - Parsed URL parameters
+ * @returns {string} - Hash-based URL for redirect
+ */
+function buildHashBasedUrl(url, instanceId, workspacePath, params) {
+  const urlObj = new URL(url, `http://${PROXY_HOST}:${PROXY_PORT}`);
+  const hash = instanceId.substring(0, 8);
+
+  if (params.workspace) {
+    // Extract workspace name for readable symlink
+    const isWorkspaceFile = workspacePath.endsWith('.code-workspace');
+
+    if (isWorkspaceFile) {
+      // Use workspace filename: ovid_a.code-workspace -> ovid_a-c9ab060f.code-workspace
+      const basename = path.basename(workspacePath);
+      const workspaceName = basename.replace('.code-workspace', '');
+      const hashPath = `/workspace/${workspaceName}-${hash}.code-workspace`;
+      urlObj.searchParams.set('workspace', hashPath);
+    } else {
+      // For folders, use directory name
+      const folderName = path.basename(workspacePath);
+      const hashPath = `/ws-${folderName}-${hash}`;
+      urlObj.searchParams.set('workspace', hashPath);
+    }
+  } else if (params.folder) {
+    // Extract directory name for readable symlink
+    const folderName = path.basename(workspacePath);
+    const hashPath = `/ws-${folderName}-${hash}`;
+    urlObj.searchParams.set('folder', hashPath);
+  }
+
+  return urlObj.pathname + urlObj.search;
+}
+
+/**
+ * Parse workspace hash from URL for hash-based routing
+ * @param {Object} params - Parsed URL parameters
+ * @returns {string|null} - Hash (8 chars) or null if not hash-based
+ */
+function parseWorkspaceHash(params) {
+  // Check workspace parameter
+  if (params.workspace) {
+    // Handle /workspace/<repo>-<hash>.code-workspace format
+    if (params.workspace.startsWith('/workspace/')) {
+      const filename = params.workspace.substring(11); // Remove '/workspace/'
+      const withoutExt = filename.replace('.code-workspace', '');
+      // Hash is last 8 chars after final dash
+      const lastDash = withoutExt.lastIndexOf('-');
+      if (lastDash !== -1) {
+        return withoutExt.substring(lastDash + 1);
+      }
+    }
+    // Handle /ws-<repo>-<hash> format for folders
+    else if (params.workspace.startsWith('/ws-')) {
+      const withoutPrefix = params.workspace.substring(4); // Remove '/ws-'
+      const withoutExt = withoutPrefix.replace('.code-workspace', '');
+      // Hash is last 8 chars after final dash
+      const lastDash = withoutExt.lastIndexOf('-');
+      if (lastDash !== -1) {
+        return withoutExt.substring(lastDash + 1);
+      }
+    }
+  }
+
+  // Check folder parameter
+  if (params.folder && params.folder.startsWith('/ws-')) {
+    const withoutPrefix = params.folder.substring(4); // Remove '/ws-'
+    // Hash is last 8 chars after final dash
+    const lastDash = withoutPrefix.lastIndexOf('-');
+    if (lastDash !== -1) {
+      return withoutPrefix.substring(lastDash + 1);
+    }
+  }
+
+  return null;
+}
+
+/**
  * Handle incoming request and route to appropriate backend
  * @param {http.IncomingMessage} req - Request object
  * @param {http.ServerResponse} res - Response object
@@ -467,9 +724,53 @@ async function handleRequest(req, res) {
     // Determine target port and instance
     let targetPort = MAIN_PORT;
     let instanceId = 'main';
+    let workspacePath = null;
 
-    // Bare mode (empty window)
-    if (params.ew) {
+    // Routing logic - check in order of priority
+    // 1. Check for session cookie first (for requests without workspace/folder params)
+    const sessionId = extractSessionCookie(req);
+    let sessionRouted = false;
+
+    if (sessionId && !params.workspace && !params.folder && !params.ew) {
+      const session = getSession(sessionId);
+      if (session) {
+        // Route based on session
+        instanceId = session.instanceId;
+        targetPort = session.port;
+        workspacePath = session.workspacePath;
+        sessionRouted = true;
+        console.log(
+          `[SESSION] Using session ${sessionId.substring(0, 8)} -> instance ${instanceId} on port ${targetPort}`
+        );
+
+        // Ensure instance is running with correct image (checks outdated, exists, running)
+        await launchInstance(instanceId, workspacePath, targetPort);
+
+        // Wait for backend if it was just started
+        if (!(await isPortListening(targetPort))) {
+          console.log(
+            `Waiting for backend on port ${targetPort} to be ready...`
+          );
+          const ready = await waitForBackend(targetPort);
+          if (!ready) {
+            res.writeHead(503, { 'Content-Type': 'text/plain' });
+            res.end(
+              'Service Unavailable: Backend instance failed to start in time'
+            );
+            return;
+          }
+          console.log(`Backend on port ${targetPort} is ready`);
+        }
+      } else {
+        console.log(
+          `[SESSION] Invalid or expired session ${sessionId.substring(0, 8)}`
+        );
+        // Fall through to default routing
+      }
+    }
+
+    // 2. Route based on URL parameters (skip if session routing succeeded)
+    if (!sessionRouted && params.ew) {
       console.log('[ROUTING] Bare mode request (ew=true) -> main instance');
       targetPort = MAIN_PORT;
       instanceId = 'main';
@@ -491,9 +792,9 @@ async function handleRequest(req, res) {
         console.log(`Main instance on port ${targetPort} is ready`);
       }
     }
-    // Workspace mode
-    else if (params.workspace) {
-      const workspacePath = params.workspace;
+    // 3. Workspace mode
+    else if (!sessionRouted && params.workspace) {
+      workspacePath = params.workspace;
       console.log(`[ROUTING] Workspace mode request: ${workspacePath}`);
 
       if (!path.isAbsolute(workspacePath)) {
@@ -547,13 +848,22 @@ async function handleRequest(req, res) {
         }
         console.log(`Backend on port ${targetPort} is ready`);
       }
-    }
-    // Folder mode
-    else if (params.folder) {
-      const folderPath = params.folder;
-      console.log(`[ROUTING] Folder mode request: ${folderPath}`);
 
-      if (!path.isAbsolute(folderPath)) {
+      // Create session for this workspace
+      const newSessionId = createSession(workspacePath, instanceId, targetPort);
+      console.log(
+        `[SESSION] Created session ${newSessionId.substring(0, 8)} for workspace ${workspacePath}`
+      );
+
+      // Attach session ID to request so we can set cookie in response
+      req._sessionId = newSessionId;
+    }
+    // 4. Folder mode
+    else if (!sessionRouted && params.folder) {
+      workspacePath = params.folder;
+      console.log(`[ROUTING] Folder mode request: ${workspacePath}`);
+
+      if (!path.isAbsolute(workspacePath)) {
         res.writeHead(400, { 'Content-Type': 'text/plain' });
         res.end('Bad Request: folder path must be absolute');
         return;
@@ -562,7 +872,7 @@ async function handleRequest(req, res) {
       // Check instance limit
       const activeCount = await countActiveInstances();
       const registry = loadRegistry();
-      const isExisting = !!registry.workspaces[folderPath];
+      const isExisting = !!registry.workspaces[workspacePath];
 
       if (!isExisting && activeCount >= MAX_CONCURRENT_INSTANCES) {
         res.writeHead(503, { 'Content-Type': 'text/plain' });
@@ -574,7 +884,7 @@ async function handleRequest(req, res) {
       }
 
       const { port, instanceId: allocatedId } =
-        await getOrAllocatePort(folderPath);
+        await getOrAllocatePort(workspacePath);
       targetPort = port;
       instanceId = allocatedId;
 
@@ -585,13 +895,13 @@ async function handleRequest(req, res) {
       // Ensure instance exists
       const instanceDir = path.join(BASE_DIR, instanceId);
       if (!fs.existsSync(instanceDir)) {
-        createInstanceDirectory(instanceId, folderPath, targetPort);
+        createInstanceDirectory(instanceId, workspacePath, targetPort);
       }
 
       // Check if instance is running, launch if needed
       if (!(await isPortListening(targetPort))) {
         console.log(`Instance not running, launching ${instanceId}...`);
-        await launchInstance(instanceId, folderPath, targetPort);
+        await launchInstance(instanceId, workspacePath, targetPort);
 
         console.log(`Waiting for backend on port ${targetPort} to be ready...`);
         const ready = await waitForBackend(targetPort);
@@ -604,9 +914,18 @@ async function handleRequest(req, res) {
         }
         console.log(`Backend on port ${targetPort} is ready`);
       }
+
+      // Create session for this folder
+      const newSessionId = createSession(workspacePath, instanceId, targetPort);
+      console.log(
+        `[SESSION] Created session ${newSessionId.substring(0, 8)} for folder ${workspacePath}`
+      );
+
+      // Attach session ID to request so we can set cookie in response
+      req._sessionId = newSessionId;
     }
-    // Default to main instance
-    else {
+    // 5. Default to main instance (if no session and no params)
+    else if (!sessionRouted) {
       console.log(
         '[ROUTING] Default request (no workspace/folder) -> main instance'
       );
@@ -634,12 +953,15 @@ async function handleRequest(req, res) {
     // Update last-access timestamp
     updateLastAccess(instanceId);
 
-    // Store original URL for redirect handler to access
-    req._originalUrl = req.url;
+    // Track activity for idle detection (WebSocket traffic monitoring)
+    const workspaceId = extractWorkspaceId(req);
+    if (workspaceId) {
+      activityTracker.recordActivity(workspaceId);
+    }
 
-    // DON'T strip workspace/folder parameters - let backend see them
-    // The backend code-server is already configured with the workspace,
-    // so it will handle the parameter correctly without redirecting
+    // Attach routing context to request (for redirect handler)
+    req._instanceId = instanceId;
+    req._workspacePath = workspacePath;
 
     // Proxy the request
     const target = `http://127.0.0.1:${targetPort}`;
@@ -673,35 +995,102 @@ async function handleUpgrade(req, socket, head) {
     console.log(`[WS-PARSED] folder: ${params.folder || 'none'}`);
     console.log(`[WS-PARSED] ew: ${params.ew || false}`);
 
+    // If WebSocket URL doesn't have workspace params, try to get them from referer
+    if (
+      !params.workspace &&
+      !params.folder &&
+      !params.ew &&
+      req.headers.referer
+    ) {
+      try {
+        const refererUrl = new URL(req.headers.referer);
+        const refererWorkspace = refererUrl.searchParams.get('workspace');
+        const refererFolder = refererUrl.searchParams.get('folder');
+
+        if (refererWorkspace || refererFolder) {
+          // Add workspace/folder param to WebSocket URL so backend knows the context
+          const wsUrl = new URL(req.url, `http://${PROXY_HOST}:${PROXY_PORT}`);
+          if (refererWorkspace) {
+            wsUrl.searchParams.set('workspace', refererWorkspace);
+            params.workspace = refererWorkspace;
+            console.log(
+              `[WS-REWRITE] Added workspace param from referer: ${refererWorkspace}`
+            );
+          } else if (refererFolder) {
+            wsUrl.searchParams.set('folder', refererFolder);
+            params.folder = refererFolder;
+            console.log(
+              `[WS-REWRITE] Added folder param from referer: ${refererFolder}`
+            );
+          }
+          req.url = `${wsUrl.pathname}${wsUrl.search}`;
+        }
+      } catch (e) {
+        // Invalid referer URL, ignore
+        console.log(`[WS-REWRITE] Failed to parse referer: ${e.message}`);
+      }
+    }
+
     // Determine target port
     let targetPort = MAIN_PORT;
     let instanceId = 'main';
+    let workspacePath = null;
 
-    if (params.ew) {
+    // Routing logic - check in order of priority
+    // 1. Check for session cookie first (WebSocket upgrades include cookies!)
+    const sessionId = extractSessionCookie(req);
+    let sessionRouted = false;
+
+    if (sessionId && !params.workspace && !params.folder && !params.ew) {
+      const session = getSession(sessionId);
+      if (session) {
+        // Route based on session
+        instanceId = session.instanceId;
+        targetPort = session.port;
+        workspacePath = session.workspacePath;
+        sessionRouted = true;
+        console.log(
+          `[WS-SESSION] Using session ${sessionId.substring(0, 8)} -> instance ${instanceId} on port ${targetPort}`
+        );
+      } else {
+        console.log(
+          `[WS-SESSION] Invalid or expired session ${sessionId.substring(0, 8)}`
+        );
+        // Fall through to default routing
+      }
+    }
+
+    // 2. Route based on URL params - direct path routing with direct mounting
+    if (!sessionRouted && params.ew) {
       targetPort = MAIN_PORT;
       instanceId = 'main';
-    } else if (params.workspace) {
+    } else if (!sessionRouted && params.workspace) {
       const { port, instanceId: allocatedId } = await getOrAllocatePort(
         params.workspace
       );
       targetPort = port;
       instanceId = allocatedId;
-    } else if (params.folder) {
+      workspacePath = params.workspace;
+    } else if (!sessionRouted && params.folder) {
       const { port, instanceId: allocatedId } = await getOrAllocatePort(
         params.folder
       );
       targetPort = port;
       instanceId = allocatedId;
+      workspacePath = params.folder;
     }
 
     // Update last-access timestamp
     updateLastAccess(instanceId);
 
+    // Track activity for idle detection (WebSocket traffic monitoring)
+    const workspaceId = extractWorkspaceId(req);
+    if (workspaceId) {
+      activityTracker.recordActivity(workspaceId);
+    }
+
     // Store original URL for potential redirect handling
     req._originalUrl = req.url;
-
-    // DON'T strip workspace/folder parameters from WebSocket upgrades
-    // WebSocket connections need to maintain routing context
 
     // Proxy the WebSocket
     const target = `http://127.0.0.1:${targetPort}`;
@@ -713,6 +1102,42 @@ async function handleUpgrade(req, socket, head) {
     console.error('Error handling WebSocket upgrade:', error);
     socket.destroy();
   }
+}
+
+/**
+ * Express-style middleware to create activity tracking API endpoint
+ * @param {http.IncomingMessage} req - Request object
+ * @param {http.ServerResponse} res - Response object
+ * @returns {boolean} - True if request was handled
+ */
+function handleActivityEndpoint(req, res) {
+  const activityMatch = req.url.match(/^\/api\/activity\/([^/?]+)/);
+  if (!activityMatch) {
+    return false;
+  }
+
+  const workspaceId = activityMatch[1];
+  const idleTime = activityTracker.getIdleTime(workspaceId);
+
+  if (idleTime === null) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        error: 'Workspace not found or no activity recorded',
+      })
+    );
+  } else {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        workspaceId,
+        idleSeconds: idleTime,
+        lastActivity: activityTracker.getLastActivity(workspaceId),
+      })
+    );
+  }
+
+  return true;
 }
 
 // Initialize base directory structure
@@ -740,8 +1165,16 @@ if (!fs.existsSync(mainMetadataPath)) {
   fs.writeFileSync(mainMetadataPath, JSON.stringify(mainMetadata, null, 2));
 }
 
-// Create HTTP server
-const server = http.createServer(handleRequest);
+// Create HTTP server with activity tracking endpoint support
+const server = http.createServer((req, res) => {
+  // Check if this is an activity tracking API request
+  if (handleActivityEndpoint(req, res)) {
+    return;
+  }
+
+  // Otherwise, handle as normal proxy request
+  handleRequest(req, res);
+});
 
 // Handle WebSocket upgrades
 server.on('upgrade', handleUpgrade);
@@ -776,20 +1209,50 @@ server.listen(PROXY_PORT, PROXY_HOST, async () => {
         error.message
       );
     }
+
+    // Start settings sync service
+    if (settingsSync) {
+      try {
+        settingsSync.start();
+        console.log('Settings sync service started');
+      } catch (error) {
+        console.error('Failed to start settings sync service:', error.message);
+      }
+    }
   }
 });
 
 // Handle graceful shutdown
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
   console.log('\nShutting down proxy server...');
+
+  // Stop settings sync service
+  if (settingsSync) {
+    try {
+      await settingsSync.stop();
+    } catch (error) {
+      console.error('Error stopping settings sync:', error.message);
+    }
+  }
+
   server.close(() => {
     console.log('Proxy server stopped');
     process.exit(0);
   });
 });
 
-process.on('SIGTERM', () => {
+process.on('SIGTERM', async () => {
   console.log('\nShutting down proxy server...');
+
+  // Stop settings sync service
+  if (settingsSync) {
+    try {
+      await settingsSync.stop();
+    } catch (error) {
+      console.error('Error stopping settings sync:', error.message);
+    }
+  }
+
   server.close(() => {
     console.log('Proxy server stopped');
     process.exit(0);

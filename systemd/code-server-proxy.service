@@ -10,6 +10,10 @@ Restart=on-failure
 RestartSec=5s
 Environment=NODE_ENV=production
 Environment=XDG_RUNTIME_DIR=/run/user/1001
+Environment=SSH_AUTH_SOCK=/run/user/1001/ssh-agent.socket
+Environment=USE_DOCKER=true
+Environment=ENABLE_AUTO_SSH=true
+Environment=ENABLE_GPU=true
 StandardOutput=journal
 StandardError=journal
 

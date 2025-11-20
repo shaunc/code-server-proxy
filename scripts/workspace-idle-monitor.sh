@@ -9,6 +9,8 @@ IDLE_THRESHOLD_DAYS="${IDLE_THRESHOLD_DAYS:-3}"
 IDLE_GRACE_PERIOD_DAYS="${IDLE_GRACE_PERIOD_DAYS:-7}"
 IDLE_WHITELIST="${IDLE_WHITELIST:-}"
 LOG_PREFIX="[workspace-idle-monitor]"
+PROXY_URL="${PROXY_URL:-http://localhost:8083}"
+IDLE_THRESHOLD_SECONDS=$((IDLE_THRESHOLD_DAYS * 86400))
 
 # Create directories if needed
 mkdir -p "$ARCHIVES_DIR"
@@ -46,6 +48,31 @@ is_whitelisted() {
             return 0
         fi
     done
+    
+    return 1
+}
+
+# Get workspace idle time from activity tracker
+# Returns idle time in seconds, or empty string if not tracked
+get_workspace_idle_time() {
+    local workspace_id="$1"
+    
+    # Query the activity tracker API
+    local response
+    response=$(curl -s "${PROXY_URL}/api/activity/${workspace_id}" 2>/dev/null || echo "")
+    
+    if [ -z "$response" ]; then
+        return 1
+    fi
+    
+    # Parse JSON response for idleSeconds field
+    local idle_seconds
+    idle_seconds=$(echo "$response" | grep -o '"idleSeconds":[0-9]*' | cut -d':' -f2)
+    
+    if [ -n "$idle_seconds" ]; then
+        echo "$idle_seconds"
+        return 0
+    fi
     
     return 1
 }
@@ -88,27 +115,42 @@ monitor_docker() {
         
         # Extract state and timestamps
         local state=$(echo "$container_info" | grep -o '"Running": [^,]*' | head -1 | awk '{print $2}')
-        local started_at=$(echo "$container_info" | grep -o '"StartedAt": "[^"]*"' | head -1 | cut -d'"' -f4)
-        local finished_at=$(echo "$container_info" | grep -o '"FinishedAt": "[^"]*"' | head -1 | cut -d'"' -f4)
         
-        # Determine last activity time
-        local last_activity_seconds
+        # For running containers, try to get idle time from activity tracker
+        local idle_seconds=0
+        local idle_days=0
+        
         if [ "$state" = "true" ]; then
-            # Running container - use StartedAt
-            last_activity_seconds=$(date -d "$started_at" +%s 2>/dev/null || echo "0")
-        elif [ -n "$finished_at" ] && [ "$finished_at" != "0001-01-01T00:00:00Z" ]; then
-            # Stopped container - use FinishedAt
-            last_activity_seconds=$(date -d "$finished_at" +%s 2>/dev/null || echo "0")
+            # Running container - use activity tracker if available
+            local tracked_idle
+            tracked_idle=$(get_workspace_idle_time "$instance_id" 2>/dev/null || echo "")
+            
+            if [ -n "$tracked_idle" ]; then
+                # Activity tracker has data - use it
+                idle_seconds=$tracked_idle
+                idle_days=$((idle_seconds / 86400))
+                log "$instance_id: Using activity tracker - idle for $idle_days days (${idle_seconds}s)"
+            else
+                # Fall back to container start time
+                local started_at=$(echo "$container_info" | grep -o '"StartedAt": "[^"]*"' | head -1 | cut -d'"' -f4)
+                local last_activity_seconds=$(date -d "$started_at" +%s 2>/dev/null || echo "0")
+                idle_seconds=$((NOW - last_activity_seconds))
+                idle_days=$((idle_seconds / 86400))
+                log "$instance_id: No activity tracker data, using container start time - idle for $idle_days days"
+            fi
         else
-            log "Warning: Could not determine last activity for $instance_id"
-            continue
+            # Stopped container - use FinishedAt timestamp
+            local finished_at=$(echo "$container_info" | grep -o '"FinishedAt": "[^"]*"' | head -1 | cut -d'"' -f4)
+            
+            if [ -n "$finished_at" ] && [ "$finished_at" != "0001-01-01T00:00:00Z" ]; then
+                local last_activity_seconds=$(date -d "$finished_at" +%s 2>/dev/null || echo "0")
+                idle_seconds=$((NOW - last_activity_seconds))
+                idle_days=$((idle_seconds / 86400))
+            else
+                log "Warning: Could not determine last activity for $instance_id"
+                continue
+            fi
         fi
-        
-        # Calculate idle days
-        local idle_seconds=$((NOW - last_activity_seconds))
-        local idle_days=$((idle_seconds / 86400))
-        
-        log "$instance_id: idle for $idle_days days (running: $state)"
         
         # Stop running containers that exceed threshold
         if [ "$state" = "true" ] && [ $idle_days -gt $IDLE_THRESHOLD_DAYS ]; then

@@ -1486,4 +1486,266 @@ If deploying for multiple users or untrusted workspaces:
 - [systemd/README.md](../systemd/README.md) - Systemd service details
 - [src/proxy.js](../src/proxy.js) - Proxy implementation source
 - [src/container-manager.js](../src/container-manager.js) - Docker container management
+
+## Auto-SSH and GPU Access Architecture
+
+Starting with version 2.1, the system supports auto-SSH to host and GPU passthrough features that enable resource-intensive workloads while maintaining container isolation.
+
+### Overview
+
+The auto-SSH feature allows container terminals to automatically SSH to the host system, providing:
+
+- **Full host resource access**: GPU, CPU, and memory for intensive workloads
+- **Terminal isolation preserved**: Container shells remain in separate namespaces
+- **Seamless user experience**: Transparent SSH connection on terminal creation
+
+GPU passthrough via NVIDIA Container Toolkit enables:
+
+- **Extension host GPU access**: AI coding assistants can run GPU tests
+- **Native performance**: Minimal overhead for GPU operations
+- **Per-workspace control**: Enable GPU only where needed
+
+### Auto-SSH Terminal Architecture
+
+#### Terminal Connection Flow
+
+```
+User Opens Terminal in Browser
+    ↓
+VSCode Creates PTY in Container
+    ↓
+Container Shell Starts (/bin/bash or /bin/zsh)
+    ↓
+Shell Sources ~/.bashrc or ~/.zshrc
+    ↓
+Auto-SSH Script Executes (.auto-ssh-bashrc)
+    ↓
+exec ssh user@host.docker.internal
+    ↓
+SSH Replaces Shell Process (Container PTY → SSH Client → Host Shell)
+    ↓
+User Sees Host Prompt (cd to workspace directory)
+```
+
+**Key Insight**: The container shell process remains in the container namespace, but `exec ssh` replaces it with an SSH client. All subsequent commands execute on the host.
+
+#### Auto-SSH Configuration
+
+**Environment Variables**:
+
+| Variable          | Purpose                     | Example                     |
+| ----------------- | --------------------------- | --------------------------- |
+| `ENABLE_AUTO_SSH` | Enable auto-SSH feature     | `true`                      |
+| `HOST_USER`       | Host username for SSH       | `shauncutts`                |
+| `WORKSPACE_PATH`  | Workspace directory on host | `/home/user/projects/myapp` |
+| `SSH_AUTH_SOCK`   | SSH agent socket path       | `/ssh-agent`                |
+
+**Initialization Script**: `docker/code-server/root/etc/cont-init.d/60-setup-auto-ssh`
+
+Creates `.auto-ssh-bashrc` script that:
+
+1. Checks if terminal is interactive
+2. Verifies auto-SSH is enabled
+3. Ensures not already in SSH session
+4. Executes SSH with connection options:
+   - `StrictHostKeyChecking=no`: Accept host key automatically
+   - `UserKnownHostsFile=/dev/null`: Don't persist host keys
+   - `ServerAliveInterval=60`: Send keep-alive every 60 seconds
+   - `ServerAliveCountMax=3`: Disconnect after 3 failed keep-alives
+
+**SSH Authentication**:
+
+Auto-SSH uses SSH agent forwarding (recommended):
+
+- Container mounts host's `SSH_AUTH_SOCK` as read-only volume
+- SSH agent socket: `${SSH_AUTH_SOCK}:/ssh-agent:ro`
+- No private keys exposed to containers
+- Works with passphrase-protected keys
+
+**Network Connectivity**:
+
+Containers connect to host via `host.docker.internal`:
+
+- Docker Desktop: Built-in DNS name
+- Linux: Added via `ExtraHosts: ['host.docker.internal:host-gateway']`
+
+#### Terminal Isolation
+
+**Why Terminal Isolation is Preserved**:
+
+Despite commands running on host, terminals remain isolated:
+
+- Container shells exist in separate IPC namespaces
+- Each workspace container has isolated PTY devices
+- SSH sessions are independent per container
+- No cross-workspace terminal stealing (Docker IPC isolation)
+
+### WebSocket Activity Tracking
+
+#### Problem Statement
+
+Traditional idle detection monitors container processes, which doesn't work with auto-SSH because:
+
+- Container always has running processes (SSH clients)
+- Container start time doesn't reflect user activity
+- Cannot distinguish active vs idle SSH sessions
+
+#### Solution: Browser Traffic Monitoring
+
+Activity tracking monitors HTTP and WebSocket traffic from browser:
+
+**Implementation** (`src/activity-tracker.js`):
+
+```javascript
+class ActivityTracker {
+  recordActivity(workspaceId) {
+    this.lastActivity.set(workspaceId, Date.now());
+  }
+
+  getIdleTime(workspaceId) {
+    const lastActivity = this.getLastActivity(workspaceId);
+    return Math.floor((Date.now() - lastActivity) / 1000);
+  }
+}
+```
+
+**Activity API Endpoint**:
+
+```
+GET /api/activity/<workspaceId>
+
+Response:
+{
+  "workspaceId": "abc123...",
+  "idleSeconds": 3600,
+  "lastActivity": 1700000000000
+}
+```
+
+**Advantages**:
+
+- Accurate user activity measurement
+- Works regardless of container process state
+- Low overhead (event-driven, not polling)
+- Captures terminal I/O, file operations, extension activity
+
+### GPU Passthrough Architecture
+
+#### NVIDIA Container Toolkit Integration
+
+GPU access provided via Docker runtime with NVIDIA Container Toolkit:
+
+**Container Configuration**:
+
+```javascript
+HostConfig: {
+  Runtime: 'nvidia',
+  DeviceRequests: [{
+    Driver: 'nvidia',
+    Count: -1,  // All GPUs
+    Capabilities: [['gpu', 'compute', 'utility']]
+  }]
+}
+```
+
+**Environment Variables**:
+
+```javascript
+Env: [
+  'NVIDIA_VISIBLE_DEVICES=all',
+  'NVIDIA_DRIVER_CAPABILITIES=compute,utility',
+];
+```
+
+#### Per-Workspace GPU Configuration
+
+GPU access can be enabled per-workspace:
+
+**Global Enable**:
+
+```bash
+export ENABLE_GPU=true
+systemctl --user restart code-server-proxy.service
+```
+
+**Per-Workspace Enable** (metadata.json):
+
+```json
+{
+  "workspacePath": "/path/to/gpu-project",
+  "port": 8142,
+  "instanceId": "abc123...",
+  "backend": "docker",
+  "enableGPU": true
+}
+```
+
+### Security Considerations
+
+#### Auto-SSH Security
+
+**SSH Agent Socket**:
+
+- ✅ Mounted read-only
+- ✅ No private key exposure
+- ⚠️ Container can use agent for any SSH connection
+
+**Host Access**:
+
+- ⚠️ User commands run on host with full user permissions
+- ✅ Mitigated: Single-user deployment (not multi-tenant)
+- ✅ SSH authentication required
+
+**Recommended SSH Server Configuration** (`/etc/ssh/sshd_config`):
+
+```
+AllowUsers youruser
+PermitRootLogin no
+PasswordAuthentication no
+AllowAgentForwarding yes
+MaxStartups 10:30:60
+```
+
+#### GPU Security
+
+**Resource Sharing**:
+
+- ⚠️ GPU memory visible to all containers with GPU access
+- ✅ Per-workspace GPU enable flag limits exposure
+- ❌ No GPU memory quotas (Docker doesn't support)
+
+### Environment Variables Reference
+
+| Variable                     | Purpose                     | Default             | Required            |
+| ---------------------------- | --------------------------- | ------------------- | ------------------- |
+| `ENABLE_AUTO_SSH`            | Enable auto-SSH feature     | `false`             | No                  |
+| `HOST_USER`                  | Host username for SSH       | `$USER`             | If auto-SSH enabled |
+| `WORKSPACE_PATH`             | Workspace directory on host | Container workspace | If auto-SSH enabled |
+| `SSH_AUTH_SOCK`              | SSH agent socket path       | Host value          | If auto-SSH enabled |
+| `ENABLE_GPU`                 | Enable GPU passthrough      | `false`             | No                  |
+| `NVIDIA_VISIBLE_DEVICES`     | GPU devices to expose       | `all`               | If GPU enabled      |
+| `NVIDIA_DRIVER_CAPABILITIES` | GPU capabilities            | `compute,utility`   | If GPU enabled      |
+
+### Troubleshooting
+
+**Auto-SSH Connection Failures**:
+
+1. Check SSH agent: `echo $SSH_AUTH_SOCK` (on host)
+2. Verify host SSH server: `systemctl status sshd`
+3. Test SSH from container: `docker exec -it <container> ssh user@host.docker.internal`
+4. Check container logs: `docker logs code-server-<instanceId> | grep auto-ssh`
+
+**GPU Not Accessible**:
+
+1. Verify NVIDIA Container Toolkit: `docker run --rm --runtime=nvidia nvidia/cuda:11.0-base nvidia-smi`
+2. Check Docker daemon configuration: `/etc/docker/daemon.json`
+3. Test GPU in container: `docker exec <container> nvidia-smi`
+4. Verify environment variables: `docker inspect <container> | grep NVIDIA`
+
+**Activity Tracking Not Working**:
+
+1. Check API endpoint: `curl http://localhost:8083/api/activity/<workspaceId>`
+2. Verify activity tracker module loaded: Check proxy.js logs
+3. Test WebSocket traffic: Open terminal, check activity timestamp updates
+
 - [docker/code-server/Dockerfile](../docker/code-server/Dockerfile) - Docker image definition

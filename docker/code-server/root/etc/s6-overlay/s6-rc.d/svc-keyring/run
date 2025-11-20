@@ -1,0 +1,25 @@
+#!/usr/bin/with-contenv bash
+
+# Wait for D-Bus to be ready
+for i in {1..60}; do
+    if [ -S "/run/user/1001/bus" ]; then
+        break
+    fi
+    sleep 1
+done
+
+# Set D-Bus address
+export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/1001/bus"
+
+# Check if password file exists
+PASSWORD_FILE="/keyring-password"
+if [ ! -f "$PASSWORD_FILE" ]; then
+    # No password file - just run daemon without unlock
+    exec s6-setuidgid abc /usr/bin/gnome-keyring-daemon \
+        --foreground \
+        --components=secrets \
+        --control-directory=/config/.cache/keyring-control
+fi
+
+# Start gnome-keyring-daemon with unlock
+exec s6-setuidgid abc sh -c "cat '$PASSWORD_FILE' | /usr/bin/gnome-keyring-daemon --unlock --foreground --components=secrets --control-directory=/config/.cache/keyring-control"

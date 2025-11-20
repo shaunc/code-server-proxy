@@ -24,6 +24,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "chokidar": "^4.0.3",
     "dockerode": "^4.0.0",
     "http-proxy": "^1.18.1",
     "http-proxy-middleware": "^2.0.6"

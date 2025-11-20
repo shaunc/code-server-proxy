@@ -11,6 +11,7 @@ This document provides step-by-step procedures for common operational tasks with
 - [Container Health Checks](#container-health-checks)
 - [Idle Cleanup Management](#idle-cleanup-management)
 - [Emergency Procedures](#emergency-procedures)
+- [Auto-SSH and GPU Operations](#auto-ssh-and-gpu-operations)
 
 ---
 
@@ -856,6 +857,291 @@ Environment="IDLE_WHITELIST=instance-id-1,instance-id-2"
 
 ---
 
+## Auto-SSH and GPU Operations
+
+### Enabling Auto-SSH for Existing Workspaces
+
+**When to use**: Enabling auto-SSH after workspaces are already created.
+
+**Prerequisites**:
+
+- SSH server running on host
+- ssh-agent running with loaded keys
+- User has SSH access to host
+
+**Procedure**:
+
+1. **Stop proxy**:
+
+   ```bash
+   systemctl --user stop code-server-proxy.service
+   ```
+
+2. **Set environment variables globally**:
+
+   ```bash
+   systemctl --user edit code-server-proxy.service
+   ```
+
+   Add:
+
+   ```ini
+   [Service]
+   Environment="ENABLE_AUTO_SSH=true"
+   Environment="HOST_USER=your-username"
+   ```
+
+3. **Rebuild Docker image** (if using Docker mode):
+
+   ```bash
+   docker build -t code-server-proxy:latest \
+     -f docker/code-server/Dockerfile docker/code-server/
+   ```
+
+4. **Restart proxy**:
+
+   ```bash
+   systemctl --user daemon-reload
+   systemctl --user start code-server-proxy.service
+   ```
+
+5. **Verify terminals auto-SSH**:
+
+   ```bash
+   # Access workspace in browser
+   # Open terminal
+   # Verify prompt shows host user (not container user)
+   # Run: hostname
+   # Should show host hostname, not container ID
+   ```
+
+**Expected results**:
+
+- Terminal prompt shows host username
+- `hostname` returns host system name
+- `nvidia-smi` works if GPU enabled (see below)
+
+**Per-workspace configuration** (alternative):
+
+Edit `~/.code-workspaces/instances/<instance-id>/metadata.json`:
+
+```json
+{
+  "enableAutoSSH": true,
+  "hostUser": "your-username"
+}
+```
+
+Then restart container:
+
+```bash
+docker restart code-server-<instance-id>
+```
+
+### Troubleshooting GPU Access
+
+**When to use**: GPU not accessible in workspace terminals or containers.
+
+**Symptoms**:
+
+- `nvidia-smi` command not found in terminal
+- CUDA tests fail with "no CUDA devices"
+- AI coding assistant GPU features disabled
+
+**Diagnosis**:
+
+1. **Verify NVIDIA drivers on host**:
+
+   ```bash
+   nvidia-smi
+   ```
+
+   Should show GPU information. If error: Install NVIDIA drivers first.
+
+2. **Check NVIDIA Container Toolkit installed**:
+
+   ```bash
+   which nvidia-container-runtime
+   docker run --rm --gpus all nvidia/cuda:12.0-base nvidia-smi
+   ```
+
+   If error: Install NVIDIA Container Toolkit (see AUTO-SSH-GPU.md).
+
+3. **Verify GPU enabled for workspace**:
+
+   ```bash
+   # Check global setting
+   systemctl --user show code-server-proxy.service | grep ENABLE_GPU
+
+   # Check per-workspace metadata
+   INSTANCE_ID="<instance-id>"
+   cat ~/.code-workspaces/instances/${INSTANCE_ID}/metadata.json | jq .enableGPU
+   ```
+
+4. **Check container GPU access** (Docker mode):
+
+   ```bash
+   INSTANCE_ID="<instance-id>"
+   docker inspect code-server-${INSTANCE_ID} | grep -i gpu
+   # Should show runtime: nvidia-container-runtime
+   ```
+
+**Solutions**:
+
+1. **Enable GPU globally**:
+
+   ```bash
+   systemctl --user edit code-server-proxy.service
+   ```
+
+   Add:
+
+   ```ini
+   [Service]
+   Environment="ENABLE_GPU=true"
+   ```
+
+   Restart:
+
+   ```bash
+   systemctl --user daemon-reload
+   systemctl --user restart code-server-proxy.service
+   ```
+
+2. **Enable GPU for specific workspace**:
+
+   Edit `~/.code-workspaces/instances/<instance-id>/metadata.json`:
+
+   ```json
+   {
+     "enableGPU": true
+   }
+   ```
+
+   Recreate container:
+
+   ```bash
+   INSTANCE_ID="<instance-id>"
+   docker stop code-server-${INSTANCE_ID}
+   docker rm code-server-${INSTANCE_ID}
+   # Access workspace in browser to recreate with GPU
+   ```
+
+3. **Test GPU access**:
+
+   ```bash
+   # Run test script
+   ./scripts/test-gpu-access.sh
+
+   # Or manually test in container
+   INSTANCE_ID="<instance-id>"
+   docker exec code-server-${INSTANCE_ID} nvidia-smi
+   ```
+
+4. **If auto-SSH enabled**, verify GPU access from host terminal:
+
+   ```bash
+   # In workspace terminal (should be SSH'd to host)
+   nvidia-smi
+   # Should show GPU information
+   ```
+
+**Common issues**:
+
+- **NVIDIA toolkit not installed**: Follow installation steps in AUTO-SSH-GPU.md
+- **Docker daemon not configured**: Restart Docker after toolkit installation
+- **Container created before GPU enabled**: Recreate container (stop, rm, access workspace)
+- **Auto-SSH not working**: GPU available in container but not in terminal (fix SSH first)
+
+### Monitoring Workspace Activity
+
+**When to use**: Checking workspace idle time, verifying activity tracking.
+
+**Procedure**:
+
+1. **Query activity tracker API**:
+
+   ```bash
+   WORKSPACE_ID="<instance-id>"
+   curl http://localhost:8083/api/activity/${WORKSPACE_ID}
+   ```
+
+   Example response:
+
+   ```json
+   {
+     "workspaceId": "workspace-abc123...",
+     "idleMinutes": 45,
+     "lastActivity": "2024-11-18T15:30:00.000Z",
+     "status": "active"
+   }
+   ```
+
+2. **Interpret idle times**:
+   - `idleMinutes`: Minutes since last browser activity (HTTP/WebSocket)
+   - `lastActivity`: Timestamp of last recorded activity
+   - `status`: `"active"` if activity within threshold, `"idle"` otherwise
+
+3. **Run idle monitor manually**:
+
+   ```bash
+   ./scripts/workspace-idle-monitor.sh
+   ```
+
+   Shows:
+   - Detected mode (systemd or docker)
+   - Workspace idle times
+   - Actions taken (stopped/archived instances)
+
+4. **Correlate with container state**:
+
+   ```bash
+   # Check if container running
+   INSTANCE_ID="<instance-id>"
+   docker ps --filter "name=code-server-${INSTANCE_ID}"
+
+   # Check activity
+   curl http://localhost:8083/api/activity/${INSTANCE_ID}
+   ```
+
+**Expected behavior**:
+
+- Activity recorded on browser page load
+- Activity recorded on WebSocket messages (terminal input, file edits)
+- NO activity recorded for background container processes
+- Idle time resets on any browser interaction
+
+**Troubleshooting activity tracking**:
+
+1. **Activity not recording**:
+
+   ```bash
+   # Check proxy logs
+   journalctl --user -u code-server-proxy.service -f | grep activity
+
+   # Should show: "Activity recorded for workspace-..."
+   ```
+
+2. **Activity stuck at old timestamp**:
+   - Browser tab not in focus: Activity only records from active tabs
+   - WebSocket disconnected: Refresh browser page
+   - Proxy restarted: Activity state lost (expected behavior)
+
+3. **Manual activity reset**:
+
+   ```bash
+   # Record activity via API
+   WORKSPACE_ID="<instance-id>"
+   curl -X POST http://localhost:8083/api/activity/${WORKSPACE_ID}
+   ```
+
+**For detailed activity tracking architecture**, see:
+
+- [ARCHITECTURE.md - WebSocket Activity Tracking](ARCHITECTURE.md#websocket-activity-tracking)
+- [AUTO-SSH-GPU.md - Activity Tracking](AUTO-SSH-GPU.md#activity-tracking)
+
+---
+
 ## Quick Reference
 
 ### Common Docker Commands
@@ -910,6 +1196,10 @@ node -e "require('./src/container-manager').backupVolume('<id>', '/path/backup.t
 | `IDLE_THRESHOLD_DAYS`    | Number              | Days before stopping container |
 | `IDLE_GRACE_PERIOD_DAYS` | Number              | Days before removing container |
 | `IDLE_WHITELIST`         | Comma-separated IDs | Never cleanup these instances  |
+| `ENABLE_AUTO_SSH`        | `true`/`false`      | Enable auto-SSH to host        |
+| `ENABLE_GPU`             | `true`/`false`      | Enable GPU passthrough         |
+| `HOST_USER`              | Username            | Host user for SSH connection   |
+| `WORKSPACE_PATH`         | Absolute path       | Workspace path on host         |
 
 ---
 

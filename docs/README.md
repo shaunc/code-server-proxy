@@ -24,7 +24,7 @@ This proxy solves these issues by routing each workspace to a separate port, giv
 ### Key Features
 
 - **Transparent routing**: URL parameters determine instance routing
-- **Automatic instance management**: Instances launch on-demand via systemd
+- **Automatic instance management**: Instances launch on-demand via systemd or Docker
 - **Deterministic port assignment**: Same workspace always gets same port
 - **Port registry**: Persistent bidirectional mapping between ports and instances
 - **Collision resolution**: Linear probing handles port conflicts (max 20 attempts)
@@ -34,6 +34,9 @@ This proxy solves these issues by routing each workspace to a separate port, giv
 - **Resource limits**: Per-instance memory and CPU quotas (4GB/300%)
 - **Instance limits**: Maximum 30 concurrent workspace instances
 - **Zero configuration**: Instances created automatically on first access
+- **Auto-SSH to host**: Terminal commands run on host for unrestricted resource access
+- **WebSocket activity tracking**: Accurate idle detection based on browser traffic
+- **NVIDIA GPU passthrough**: GPU access for AI coding assistants and CUDA workloads
 
 ## Documentation Structure
 
@@ -42,10 +45,12 @@ This proxy solves these issues by routing each workspace to a separate port, giv
 - **[Quick Start](#quick-start)**: Get running in 5 minutes
 - **[DEPLOYMENT.md](DEPLOYMENT.md)**: Complete installation and configuration guide
 - **[OPERATIONS.md](OPERATIONS.md)**: Daily usage, monitoring, and maintenance
+- **[AUTO-SSH-GPU.md](AUTO-SSH-GPU.md)**: Auto-SSH and GPU access guide
 
 ### For Developers
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)**: Technical architecture and design decisions
+- **[RUNBOOKS.md](RUNBOOKS.md)**: Troubleshooting procedures and operational runbooks
 - **[systemd/README.md](../systemd/README.md)**: Systemd service configuration details
 
 ## Quick Start

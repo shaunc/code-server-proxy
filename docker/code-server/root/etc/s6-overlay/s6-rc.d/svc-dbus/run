@@ -1,0 +1,30 @@
+#!/usr/bin/with-contenv bash
+
+# Wait for init-adduser to set abc's UID to PUID
+# Base image creates abc with UID 911, then changes to PUID during init
+echo "[svc-dbus] Waiting for abc UID to be set to $PUID..."
+for i in {1..60}; do
+    CURRENT_UID=$(id -u abc 2>/dev/null || echo "0")
+    if [ "$CURRENT_UID" = "$PUID" ]; then
+        echo "[svc-dbus] abc UID correctly set to $PUID, starting D-Bus..."
+        break
+    fi
+    if [ $i -eq 60 ]; then
+        echo "[svc-dbus] ERROR: Timed out waiting for abc UID change"
+        exit 1
+    fi
+    sleep 0.1
+done
+
+# Start D-Bus session bus
+mkdir -p /run/user/1001
+chown abc:abc /run/user/1001
+chmod 0755 /run/user/1001
+
+# Start dbus-daemon for the abc user
+exec s6-setuidgid abc \
+    /usr/bin/dbus-daemon \
+    --session \
+    --nofork \
+    --nopidfile \
+    --address="unix:path=/run/user/1001/bus"

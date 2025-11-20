@@ -1,0 +1,16 @@
+#!/usr/bin/with-contenv bash
+
+echo "[init-keyring-wait] Waiting for /config to be writable..."
+
+# Wait for /config to be writable by abc user
+for i in {1..60}; do
+    if s6-setuidgid abc test -w /config 2>/dev/null; then
+        echo "[init-keyring-wait] /config is writable, continuing init..."
+        exit 0
+    fi
+    echo "[init-keyring-wait] Waiting... ($i/60)"
+    sleep 0.5
+done
+
+echo "[init-keyring-wait] ERROR: /config still not writable after 30s"
+exit 1

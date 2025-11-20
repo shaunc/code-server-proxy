@@ -947,4 +947,313 @@ systemctl --user restart code-server-proxy.service
 
 - [DEPLOYMENT.md](DEPLOYMENT.md) - Installation and setup
 - [ARCHITECTURE.md](ARCHITECTURE.md) - Technical architecture details
+
+## Auto-SSH and GPU Configuration
+
+### Auto-SSH to Host
+
+Auto-SSH allows container terminals to automatically SSH to the host system, providing full access to host resources (GPU, CPU, memory) while maintaining terminal isolation.
+
+#### Prerequisites
+
+Before enabling auto-SSH:
+
+1. **SSH Server Running on Host**:
+
+   ```bash
+   # Check SSH server status
+   systemctl status sshd
+
+   # Start if not running
+   sudo systemctl start sshd
+   sudo systemctl enable sshd
+   ```
+
+2. **SSH Agent with Loaded Keys**:
+
+   ```bash
+   # Start SSH agent if not running
+   eval $(ssh-agent)
+
+   # Add your SSH key
+   ssh-add ~/.ssh/id_rsa
+
+   # Verify agent is running
+   echo $SSH_AUTH_SOCK
+   # Should output a path like /tmp/ssh-XXX/agent.12345
+   ```
+
+3. **Verify SSH Access**:
+   ```bash
+   # Test SSH to localhost
+   ssh $USER@localhost whoami
+   # Should connect without password prompt
+   ```
+
+#### Enabling Auto-SSH Globally
+
+Enable auto-SSH for all new workspaces:
+
+```bash
+# Set environment variable
+export ENABLE_AUTO_SSH=true
+
+# Edit systemd service to persist
+systemctl --user edit code-server-proxy.service
+```
+
+Add to the service file:
+
+```ini
+[Service]
+Environment="ENABLE_AUTO_SSH=true"
+```
+
+Restart proxy:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user restart code-server-proxy.service
+```
+
+#### Enabling Auto-SSH Per-Workspace
+
+Enable auto-SSH for a specific workspace:
+
+1. **Edit workspace metadata**:
+
+   ```bash
+   # Find instance ID for workspace
+   WORKSPACE_PATH="/path/to/workspace"
+   INSTANCE_ID=$(echo -n "$WORKSPACE_PATH" | sha256sum | awk '{print $1}')
+
+   # Edit metadata
+   $EDITOR ~/.code-workspaces/instances/$INSTANCE_ID/metadata.json
+   ```
+
+2. **Add auto-SSH configuration**:
+
+   ```json
+   {
+     "workspacePath": "/path/to/workspace",
+     "port": 8142,
+     "instanceId": "abc123...",
+     "backend": "docker",
+     "autoSSH": true
+   }
+   ```
+
+3. **Recreate container**:
+
+   ```bash
+   # Stop and remove existing container
+   docker stop code-server-$INSTANCE_ID
+   docker rm code-server-$INSTANCE_ID
+
+   # Next access will create new container with auto-SSH
+   ```
+
+#### Verifying Auto-SSH
+
+After enabling auto-SSH, verify it's working:
+
+```bash
+# Access workspace
+curl "http://localhost:8083/?workspace=/path/to/workspace"
+
+# Open terminal in browser, run:
+hostname
+# Should show host machine name, not container ID
+
+whoami
+# Should show host user, not 'abc'
+
+pwd
+# Should show workspace path on host
+```
+
+### GPU Access Configuration
+
+GPU passthrough enables containers to access NVIDIA GPUs for AI/CUDA workloads.
+
+#### Prerequisites
+
+1. **NVIDIA Drivers Installed on Host**:
+
+   ```bash
+   # Check NVIDIA driver
+   nvidia-smi
+   # Should show GPU information
+   ```
+
+2. **NVIDIA Container Toolkit Installed**:
+
+   ```bash
+   # Ubuntu/Debian installation
+   distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+   curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+       sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+
+   curl -s -L https://nvidia.github.io/libnvidia-container/$distribution/libnvidia-container.list | \
+       sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+       sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+   sudo apt-get update
+   sudo apt-get install -y nvidia-container-toolkit
+
+   # Configure Docker to use NVIDIA runtime
+   sudo nvidia-ctk runtime configure --runtime=docker
+   sudo systemctl restart docker
+   ```
+
+3. **Verify NVIDIA Container Toolkit**:
+
+   ```bash
+   # Run test script
+   ./scripts/test-gpu-access.sh
+
+   # Or test manually
+   docker run --rm --runtime=nvidia nvidia/cuda:11.0-base nvidia-smi
+   # Should show GPU information
+   ```
+
+#### Enabling GPU Access Globally
+
+Enable GPU for all new workspaces:
+
+```bash
+# Set environment variable
+export ENABLE_GPU=true
+
+# Edit systemd service
+systemctl --user edit code-server-proxy.service
+```
+
+Add to service file:
+
+```ini
+[Service]
+Environment="ENABLE_GPU=true"
+```
+
+Restart proxy:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user restart code-server-proxy.service
+```
+
+#### Enabling GPU Per-Workspace
+
+Enable GPU for specific workspace:
+
+1. **Edit workspace metadata**:
+
+   ```bash
+   # Find instance ID
+   WORKSPACE_PATH="/path/to/gpu-project"
+   INSTANCE_ID=$(echo -n "$WORKSPACE_PATH" | sha256sum | awk '{print $1}')
+
+   # Edit metadata
+   $EDITOR ~/.code-workspaces/instances/$INSTANCE_ID/metadata.json
+   ```
+
+2. **Add GPU configuration**:
+
+   ```json
+   {
+     "workspacePath": "/path/to/gpu-project",
+     "port": 8142,
+     "instanceId": "abc123...",
+     "backend": "docker",
+     "enableGPU": true
+   }
+   ```
+
+3. **Recreate container**:
+   ```bash
+   docker stop code-server-$INSTANCE_ID
+   docker rm code-server-$INSTANCE_ID
+   ```
+
+#### Verifying GPU Access
+
+Test GPU access from container:
+
+```bash
+# Get instance ID
+WORKSPACE_PATH="/path/to/workspace"
+INSTANCE_ID=$(echo -n "$WORKSPACE_PATH" | sha256sum | awk '{print $1}')
+
+# Test nvidia-smi in container
+docker exec code-server-$INSTANCE_ID nvidia-smi
+# Should show GPU information
+
+# Test from extension host
+docker exec code-server-$INSTANCE_ID sh -c "cd /workspace && python -c 'import torch; print(torch.cuda.is_available())'"
+# Should print: True
+```
+
+### Monitoring Workspace Activity
+
+The activity tracker monitors workspace usage based on browser traffic (WebSocket/HTTP), enabling accurate idle detection when auto-SSH is enabled.
+
+#### Querying Activity via API
+
+Check workspace idle time:
+
+```bash
+# Get workspace ID (SHA256 of workspace path)
+WORKSPACE_PATH="/path/to/workspace"
+WORKSPACE_ID=$(echo -n "$WORKSPACE_PATH" | sha256sum | awk '{print $1}')
+
+# Query activity
+curl "http://localhost:8083/api/activity/$WORKSPACE_ID"
+```
+
+Response:
+
+```json
+{
+  "workspaceId": "abc123...",
+  "idleSeconds": 3600,
+  "lastActivity": 1700000000000
+}
+```
+
+If no activity recorded:
+
+```json
+{
+  "error": "Workspace not found or no activity recorded"
+}
+```
+
+#### Manual Idle Monitor Execution
+
+Run idle monitor manually:
+
+```bash
+# Docker mode (uses activity tracking API)
+./scripts/workspace-idle-monitor.sh
+
+# Check specific threshold
+IDLE_THRESHOLD_DAYS=1 ./scripts/workspace-idle-monitor.sh
+```
+
+#### Activity Tracking Behavior
+
+Activity is recorded when:
+
+- User loads workspace in browser (HTTP request)
+- User types in terminal (WebSocket traffic)
+- User edits files (WebSocket traffic)
+- Extension performs operations (WebSocket traffic)
+
+Activity is **not** recorded when:
+
+- Container processes run (SSH clients, background jobs)
+- Scheduled tasks execute in container
+- No browser connection active
+
 - [systemd/README.md](../systemd/README.md) - Systemd service documentation

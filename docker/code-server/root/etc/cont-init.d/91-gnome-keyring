@@ -1,0 +1,53 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+
+# Initialize gnome-keyring directories and default keyring
+# Runs once on container initialization before services start
+
+echo "[init-keyring] Setting up gnome-keyring directories..."
+
+# Wait for /config to be writable by abc user
+for i in {1..30}; do
+    if s6-setuidgid abc test -w /config 2>/dev/null; then
+        echo "[init-keyring] /config is writable"
+        break
+    fi
+    echo "[init-keyring] Waiting for /config to be writable... ($i/30)"
+    sleep 0.5
+done
+
+# Initialize D-Bus machine ID if missing
+if [ ! -f /var/lib/dbus/machine-id ]; then
+    echo "[init-keyring] Generating D-Bus machine ID..."
+    dbus-uuidgen > /var/lib/dbus/machine-id
+fi
+
+# Ensure D-Bus user session directory exists
+mkdir -p /run/user/1001
+chown abc:abc /run/user/1001
+chmod 0755 /run/user/1001
+
+# Set D-Bus session address for all subsequent services and shells
+echo "unix:path=/run/user/1001/bus" > /var/run/s6/container_environment/DBUS_SESSION_BUS_ADDRESS
+
+# Also create profile script for shell sessions
+mkdir -p /etc/profile.d
+cat > /etc/profile.d/dbus-session.sh << 'EOF'
+# D-Bus session bus address for gnome-keyring
+export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/1001/bus"
+EOF
+chmod 644 /etc/profile.d/dbus-session.sh
+
+# Add to user's .bashrc for non-login shells (code-server terminals)
+if [ -f /config/.bashrc ]; then
+    if ! grep -q "DBUS_SESSION_BUS_ADDRESS" /config/.bashrc; then
+        echo "[init-keyring] Adding DBUS_SESSION_BUS_ADDRESS to .bashrc..."
+        s6-setuidgid abc bash -c 'cat >> /config/.bashrc << '\''EOF'\''
+
+# D-Bus session bus for gnome-keyring (set by init script)
+export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/1001/bus"
+EOF'
+    fi
+fi
+
+echo "[init-keyring] ✓ gnome-keyring setup complete"

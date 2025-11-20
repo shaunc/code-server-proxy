@@ -11,12 +11,38 @@
 
 const Docker = require('dockerode');
 const path = require('path');
+const { execSync } = require('child_process');
 
 // Initialize Docker client
 const docker = new Docker();
 
+/**
+ * Check if NVIDIA Container Toolkit is available
+ * @returns {boolean} True if NVIDIA runtime is available
+ */
+function isNvidiaRuntimeAvailable() {
+  try {
+    // Check if nvidia-smi exists (NVIDIA driver installed)
+    const result = execSync('which nvidia-smi', {
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'ignore'],
+    });
+    return result.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+// Check NVIDIA availability at module load
+const NVIDIA_AVAILABLE = isNvidiaRuntimeAvailable();
+
 // Configuration
 const DOCKER_IMAGE = process.env.DOCKER_IMAGE || 'code-server-proxy:latest';
+
+// Cache current image ID (refreshed periodically)
+let cachedImageId = null;
+let cacheTimestamp = 0;
+const IMAGE_CACHE_TTL = 60000; // 1 minute
 const DOCKER_MEMORY_LIMIT = process.env.DOCKER_MEMORY_LIMIT || '4g';
 const DOCKER_CPU_LIMIT = parseFloat(process.env.DOCKER_CPU_LIMIT || '3.0');
 const SHARED_EXTENSIONS_VOLUME =
@@ -29,9 +55,9 @@ const WORKSPACE_VOLUMES_PATH =
 const HOST_SECRETS_PATH =
   process.env.HOST_SECRETS_PATH ||
   path.join(process.env.HOME, '.local/share/code-server/User/globalStorage');
-const SHARED_SETTINGS_PATH =
-  process.env.SHARED_SETTINGS_PATH ||
-  path.join(process.env.HOME, '.code-workspaces/shared/User');
+const INSTANCES_BASE_PATH =
+  process.env.INSTANCES_BASE_PATH ||
+  path.join(process.env.HOME, '.code-workspaces/instances');
 
 // Idle monitoring configuration
 const IDLE_THRESHOLD_DAYS = parseInt(
@@ -148,15 +174,58 @@ async function createContainer(instanceId, workspacePath, port) {
   console.log(`  Port: ${port} -> 8443`);
   console.log(`  Image: ${DOCKER_IMAGE}`);
 
+  // Check if auto-SSH is enabled
+  const autoSshEnabled = process.env.ENABLE_AUTO_SSH === 'true';
+  if (autoSshEnabled) {
+    console.log(`  Auto-SSH: enabled`);
+  }
+
+  // Check if GPU passthrough is enabled
+  const enableGpu = process.env.ENABLE_GPU === 'true' && NVIDIA_AVAILABLE;
+  if (process.env.ENABLE_GPU === 'true') {
+    console.log(`  GPU passthrough: requested`);
+    console.log(`  NVIDIA runtime available: ${NVIDIA_AVAILABLE}`);
+    if (!NVIDIA_AVAILABLE) {
+      console.warn(
+        '  Warning: NVIDIA Container Toolkit not detected. Install from:'
+      );
+      console.warn(
+        '  https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html'
+      );
+    } else {
+      console.log(`  GPU passthrough: enabled`);
+    }
+  }
+
   // Ensure volumes exist
   await ensureSharedExtensionsVolume();
   await createConfigVolume(instanceId);
 
+  // Handle workspace file vs directory mounting
+  // For .code-workspace files, mount the directory containing the file
+  // and pass the workspace file path to code-server via environment variable
+  // For main instance (workspacePath === null), don't mount any workspace
+  let mountPath = workspacePath;
+  let workspaceFile = null;
+
+  if (workspacePath && workspacePath.endsWith('.code-workspace')) {
+    // Mount the directory containing the workspace file
+    mountPath = path.dirname(workspacePath);
+    // Store the workspace file path relative to the mount point
+    workspaceFile = path.join('/workspace', path.basename(workspacePath));
+    console.log(`  Workspace file detected: ${path.basename(workspacePath)}`);
+    console.log(`  Mounting directory: ${mountPath}`);
+    console.log(`  Workspace file path in container: ${workspaceFile}`);
+  }
+
   // Prepare volume binds
   const binds = [
-    `${workspacePath}:/workspace:rw`,
     `${configVolume}:/config`,
     `${SHARED_EXTENSIONS_VOLUME}:/config/extensions`,
+    // Mount host directories at their original paths so no rewriting needed
+    // This also makes symlinks work (e.g., /home/shauncutts/src -> /data/sda/shaunc-src)
+    '/home/shauncutts:/home/shauncutts:rw',
+    '/data/sda:/data/sda:rw',
   ];
 
   // Add host secrets mount if available
@@ -166,40 +235,109 @@ async function createContainer(instanceId, workspacePath, port) {
     console.log(`  Mounting host secrets from: ${HOST_SECRETS_PATH}`);
   }
 
-  // Add shared settings mounts if available
-  const settingsFile = path.join(SHARED_SETTINGS_PATH, 'settings.json');
-  const keybindingsFile = path.join(SHARED_SETTINGS_PATH, 'keybindings.json');
-
-  if (fs.existsSync(settingsFile)) {
-    binds.push(`${settingsFile}:/config/data/User/settings.json:rw`);
-    console.log(`  Mounting shared settings from: ${settingsFile}`);
+  // Mount host keyrings for kilo-code credentials
+  const hostKeyringsPath = path.join(process.env.HOME, '.local/share/keyrings');
+  if (fs.existsSync(hostKeyringsPath)) {
+    binds.push(`${hostKeyringsPath}:/host-keyrings:ro`);
+    console.log(`  Mounting host keyrings from: ${hostKeyringsPath}`);
   }
 
-  if (fs.existsSync(keybindingsFile)) {
-    binds.push(`${keybindingsFile}:/config/data/User/keybindings.json:rw`);
-    console.log(`  Mounting shared keybindings from: ${keybindingsFile}`);
+  // Mount keyring password for unlocking (separate mount point to avoid nesting)
+  const keyringPasswordPath = path.join(
+    process.env.HOME,
+    '.ssh/keyring-password'
+  );
+  if (fs.existsSync(keyringPasswordPath)) {
+    binds.push(`${keyringPasswordPath}:/keyring-password:ro`);
+    console.log(`  Mounting keyring password from: ${keyringPasswordPath}`);
+  }
+
+  // Mount host .gitconfig for git credentials and settings
+  const hostGitconfigPath = path.join(process.env.HOME, '.gitconfig');
+  if (fs.existsSync(hostGitconfigPath)) {
+    binds.push(`${hostGitconfigPath}:/host-gitconfig:ro`);
+    console.log(`  Mounting host .gitconfig from: ${hostGitconfigPath}`);
+  }
+
+  // Mount workspace-specific User directory for settings isolation
+  // Each workspace has its own User directory on the host filesystem
+  // Settings sync service will propagate settings.json and keybindings.json
+  // across all workspaces, while keeping other data (globalStorage, etc.) isolated
+  const instanceUserDir = path.join(
+    INSTANCES_BASE_PATH,
+    instanceId,
+    'data/User'
+  );
+  if (!fs.existsSync(instanceUserDir)) {
+    fs.mkdirSync(instanceUserDir, { recursive: true });
+    console.log(`  Created instance User directory: ${instanceUserDir}`);
+  }
+  binds.push(`${instanceUserDir}:/config/data/User:rw`);
+  console.log(`  Mounting instance User directory: ${instanceUserDir}`);
+
+  // Mount SSH agent socket if available (for claude wrapper and auto-SSH)
+  const sshAuthSock = process.env.SSH_AUTH_SOCK;
+  if (sshAuthSock && fs.existsSync(sshAuthSock)) {
+    binds.push(`${sshAuthSock}:/ssh-agent/socket:ro`);
+    console.log(`  Mounting SSH agent: ${sshAuthSock}`);
   }
 
   const memoryBytes = parseMemoryLimit(DOCKER_MEMORY_LIMIT);
   const nanoCpus = Math.floor(DOCKER_CPU_LIMIT * 1e9);
 
+  // Prepare environment variables
+  // Use current user's UID/GID so container files are owned by correct user
+  const uid = process.getuid ? process.getuid() : 1000;
+  const gid = process.getgid ? process.getgid() : 1000;
+  const envVars = [
+    `PUID=${uid}`,
+    `PGID=${gid}`,
+    'TZ=America/New_York',
+    'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus',
+    `DEFAULT_WORKSPACE=${workspacePath || '/config/workspace'}`,
+  ];
+
+  // SSH_AUTH_SOCK is set in Dockerfile, mount is configured above
+
+  // Set HOST_USER for SSH operations (claude wrapper, auto-SSH)
+  if (!process.env.USER) {
+    throw new Error(
+      'USER environment variable not set - required for SSH operations'
+    );
+  }
+  envVars.push(`HOST_USER=${process.env.USER}`);
+
+  // Don't use DEFAULT_WORKSPACE - we'll pass workspace as command line arg instead
+  // (like systemd mode did)
+
+  // Auto-SSH: Add environment variables if enabled
+  if (autoSshEnabled) {
+    envVars.push('ENABLE_AUTO_SSH=true');
+
+    // Add workspace path for auto-SSH to cd into correct directory
+    if (workspacePath) {
+      // For workspace files, use the directory containing the file
+      const workspaceDir = workspacePath.endsWith('.code-workspace')
+        ? path.dirname(workspacePath)
+        : workspacePath;
+      envVars.push(`WORKSPACE_PATH=${workspaceDir}`);
+    }
+  }
+
+  // Let s6-overlay's svc-code-server service handle starting code-server
+  // Workspace path is passed via DEFAULT_WORKSPACE environment variable
+
   const containerConfig = {
     name: containerName,
     Image: DOCKER_IMAGE,
-    Env: [
-      'PUID=1000',
-      'PGID=1000',
-      'TZ=America/New_York',
-      'DEFAULT_WORKSPACE=/workspace',
-      'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket',
-    ],
+    Env: envVars,
     ExposedPorts: {
       '8443/tcp': {},
     },
     Labels: {
       app: 'code-server-proxy',
       instanceId: instanceId,
-      workspace: workspacePath,
+      workspace: workspacePath || 'none',
     },
     HostConfig: {
       Binds: binds,
@@ -215,6 +353,19 @@ async function createContainer(instanceId, workspacePath, port) {
       CapDrop: ['ALL'],
       CapAdd: ['CHOWN', 'FOWNER', 'SETGID', 'SETUID', 'IPC_LOCK'],
       ReadonlyRootfs: false,
+      // Add host.docker.internal alias for Linux (allows SSH to host)
+      ExtraHosts: ['host.docker.internal:host-gateway'],
+      // Add NVIDIA runtime if GPU enabled
+      ...(enableGpu && {
+        Runtime: 'nvidia',
+        DeviceRequests: [
+          {
+            Driver: 'nvidia',
+            Count: -1, // All GPUs
+            Capabilities: [['gpu', 'compute', 'utility']],
+          },
+        ],
+      }),
     },
   };
 
@@ -223,6 +374,36 @@ async function createContainer(instanceId, workspacePath, port) {
     console.log(`Container created successfully: ${containerName}`);
     return container;
   } catch (error) {
+    // If GPU-related error, retry without GPU (graceful degradation)
+    if (
+      enableGpu &&
+      (error.message.includes('nvidia') ||
+        error.message.includes('Runtime') ||
+        error.message.includes('runtime'))
+    ) {
+      console.warn(
+        `GPU container creation failed, retrying without GPU: ${error.message}`
+      );
+
+      // Remove GPU-specific options
+      delete containerConfig.HostConfig.Runtime;
+      delete containerConfig.HostConfig.DeviceRequests;
+
+      try {
+        const container = await docker.createContainer(containerConfig);
+        console.log(
+          `Container created successfully without GPU: ${containerName}`
+        );
+        return container;
+      } catch (retryError) {
+        console.error(
+          `Failed to create container ${containerName} (retry):`,
+          retryError.message
+        );
+        throw new Error(`Container creation failed: ${retryError.message}`);
+      }
+    }
+
     console.error(
       `Failed to create container ${containerName}:`,
       error.message
@@ -247,6 +428,82 @@ async function startContainer(instanceId) {
   } catch (error) {
     console.error(`Failed to start container ${containerName}:`, error.message);
     throw new Error(`Container start failed: ${error.message}`);
+  }
+}
+
+/**
+ * Create workspace symlink in container for hash-based routing
+ * @param {string} instanceId - Instance ID
+ * @param {string} workspacePath - Workspace path (null for main instance)
+ * @returns {Promise<void>}
+ */
+async function createWorkspaceSymlink(instanceId, workspacePath) {
+  if (!workspacePath) {
+    // Main instance has no workspace, skip symlink
+    return;
+  }
+
+  const containerName = `code-server-${instanceId}`;
+  const hash = instanceId.substring(0, 8);
+
+  // Determine target and symlink path based on workspace type
+  // For workspace files, put symlink in same directory as target
+  // so relative paths in the workspace file resolve correctly
+  let target;
+  let symlinkPath;
+  if (workspacePath.endsWith('.code-workspace')) {
+    const basename = path.basename(workspacePath);
+    target = basename; // Relative path - symlink will be in same dir
+
+    // Extract workspace name (without .code-workspace extension) for readable symlink
+    const workspaceName = basename.replace('.code-workspace', '');
+    symlinkPath = `/workspace/${workspaceName}-${hash}.code-workspace`;
+  } else {
+    // For folders, extract directory name
+    const folderName = path.basename(workspacePath);
+    target = '/workspace';
+    symlinkPath = `/ws-${folderName}-${hash}`;
+  }
+
+  console.log(
+    `Creating workspace symlink in ${containerName}: ${symlinkPath} -> ${target}`
+  );
+
+  try {
+    const container = docker.getContainer(containerName);
+
+    // Create symlink via exec
+    // For workspace file symlinks in /workspace, run as user 1001 (not root)
+    const execOptions = {
+      Cmd: ['ln', '-sf', target, symlinkPath],
+      AttachStdout: true,
+      AttachStderr: true,
+    };
+
+    // If symlink is in /workspace dir, run as user  (not root) for permissions
+    if (symlinkPath.startsWith('/workspace/')) {
+      execOptions.User = '1001:1001';
+    }
+
+    const exec = await container.exec(execOptions);
+
+    const stream = await exec.start();
+
+    // Wait for exec to complete
+    await new Promise((resolve, reject) => {
+      stream.on('end', resolve);
+      stream.on('error', reject);
+    });
+
+    console.log(
+      `Workspace symlink created successfully: ${symlinkPath} -> ${target}`
+    );
+  } catch (error) {
+    console.error(
+      `Failed to create workspace symlink in ${containerName}:`,
+      error.message
+    );
+    // Don't throw - symlink creation is not critical, container can still work
   }
 }
 
@@ -345,6 +602,49 @@ async function inspectContainer(instanceId) {
       error.message
     );
     throw error;
+  }
+}
+
+/**
+ * Check if a container is using the current image
+ * Returns true if container needs to be recreated due to image update
+ * @param {string} instanceId - Instance ID
+ * @returns {Promise<boolean>} True if container needs recreation
+ */
+async function isContainerImageOutdated(instanceId) {
+  try {
+    // Get current image ID (cached with 1-minute TTL)
+    const now = Date.now();
+    if (!cachedImageId || now - cacheTimestamp > IMAGE_CACHE_TTL) {
+      const imageInfo = await docker.getImage(DOCKER_IMAGE).inspect();
+      cachedImageId = imageInfo.Id;
+      cacheTimestamp = now;
+    }
+    const currentImageId = cachedImageId;
+
+    // Get container info
+    const containerInfo = await inspectContainer(instanceId);
+    if (!containerInfo) {
+      return false; // Container doesn't exist, no need to recreate
+    }
+
+    const containerImageId = containerInfo.Image;
+
+    // Compare image IDs
+    if (containerImageId !== currentImageId) {
+      console.log(
+        `Container ${instanceId} is using outdated image ${containerImageId.substring(7, 19)}, current is ${currentImageId.substring(7, 19)}`
+      );
+      return true;
+    }
+
+    return false;
+  } catch (error) {
+    console.error(
+      `Error checking container image for ${instanceId}:`,
+      error.message
+    );
+    return false; // On error, don't recreate
   }
 }
 
@@ -889,10 +1189,12 @@ module.exports = {
   isDockerAvailable,
   createContainer,
   startContainer,
+  createWorkspaceSymlink,
   stopContainer,
   removeContainer,
   isContainerRunning,
   inspectContainer,
+  isContainerImageOutdated,
   getContainerLogs,
   createConfigVolume,
   ensureSharedExtensionsVolume,

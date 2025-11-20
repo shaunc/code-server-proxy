@@ -1,0 +1,48 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+#
+# Sync Host Keyring to Container
+#
+# This script copies the host user's keyring files into the container
+# and starts gnome-keyring-daemon with the password to unlock them.
+#
+
+echo "[keyring-sync] Syncing host keyring..."
+
+HOST_KEYRING_DIR="/host-keyrings"
+CONTAINER_KEYRING_DIR="/config/.local/share/keyrings"
+PASSWORD_FILE="/keyring-password"
+
+# Check if host keyring directory is mounted
+if [ ! -d "$HOST_KEYRING_DIR" ]; then
+    echo "[keyring-sync] Warning: Host keyring directory not mounted"
+    exit 0
+fi
+
+# Create container keyring directory as abc user
+# Use 755 for directories (allows root's find to traverse) but keep files 600
+s6-setuidgid abc sh -c "
+    mkdir -p '$CONTAINER_KEYRING_DIR'
+    chmod 755 /config/.local /config/.local/share '$CONTAINER_KEYRING_DIR'
+    mkdir -p /config/.cache
+    chmod 755 /config/.cache
+"
+
+# Copy keyring files from host
+if [ -f "$HOST_KEYRING_DIR/login.keyring" ]; then
+    s6-setuidgid abc sh -c "
+        cp '$HOST_KEYRING_DIR/login.keyring' '$CONTAINER_KEYRING_DIR/'
+        cp '$HOST_KEYRING_DIR/default' '$CONTAINER_KEYRING_DIR/' 2>/dev/null || true
+        cp '$HOST_KEYRING_DIR/user.keystore' '$CONTAINER_KEYRING_DIR/' 2>/dev/null || true
+        chmod 600 '$CONTAINER_KEYRING_DIR/login.keyring'
+    "
+    echo "[keyring-sync] Copied host keyring files"
+else
+    echo "[keyring-sync] Warning: No login.keyring found on host"
+    exit 0
+fi
+
+# Export keyring control path for services
+echo "/config/.cache/keyring-control" > /var/run/s6/container_environment/GNOME_KEYRING_CONTROL
+
+echo "[keyring-sync] ✓ Keyring sync complete (daemon will start as service)"
