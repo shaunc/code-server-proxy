@@ -74,5 +74,9 @@ RUN chmod +x /etc/cont-init.d/91-gnome-keyring \
 # Set SSH agent socket path (host agent is mounted to this location)
 ENV SSH_AUTH_SOCK=/ssh-agent/socket
 
+# Set D-Bus and GNOME Keyring environment variables
+ENV DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus
+ENV GNOME_KEYRING_CONTROL=/config/.cache/keyring-control
+
 # Expose code-server port
 EXPOSE 8443

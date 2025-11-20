@@ -41,13 +41,27 @@ chmod 644 /etc/profile.d/dbus-session.sh
 # Add to user's .bashrc for non-login shells (code-server terminals)
 if [ -f /config/.bashrc ]; then
     if ! grep -q "DBUS_SESSION_BUS_ADDRESS" /config/.bashrc; then
-        echo "[init-keyring] Adding DBUS_SESSION_BUS_ADDRESS to .bashrc..."
+        echo "[init-keyring] Adding D-Bus and keyring environment to .bashrc..."
         s6-setuidgid abc bash -c 'cat >> /config/.bashrc << '\''EOF'\''
 
-# D-Bus session bus for gnome-keyring (set by init script)
+# D-Bus session bus and GNOME Keyring for secret storage (set by init script)
 export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/1001/bus"
+export GNOME_KEYRING_CONTROL="/config/.cache/keyring-control"
+EOF'
+    elif ! grep -q "GNOME_KEYRING_CONTROL" /config/.bashrc; then
+        echo "[init-keyring] Adding GNOME_KEYRING_CONTROL to .bashrc..."
+        s6-setuidgid abc bash -c 'cat >> /config/.bashrc << '\''EOF'\''
+export GNOME_KEYRING_CONTROL="/config/.cache/keyring-control"
 EOF'
     fi
 fi
+
+# Also update profile script to include GNOME_KEYRING_CONTROL
+cat > /etc/profile.d/dbus-session.sh << 'EOF'
+# D-Bus session bus and GNOME Keyring for secret storage
+export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/1001/bus"
+export GNOME_KEYRING_CONTROL="/config/.cache/keyring-control"
+EOF
+chmod 644 /etc/profile.d/dbus-session.sh
 
 echo "[init-keyring] ✓ gnome-keyring setup complete"

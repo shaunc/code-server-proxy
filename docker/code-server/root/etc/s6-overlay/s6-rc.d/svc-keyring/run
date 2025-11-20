@@ -8,8 +8,12 @@ for i in {1..60}; do
     sleep 1
 done
 
-# Set D-Bus address
+# Set D-Bus address and keyring control directory
 export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/1001/bus"
+export GNOME_KEYRING_CONTROL="/config/.cache/keyring-control"
+
+# Export to s6 environment so other services can access
+echo "$GNOME_KEYRING_CONTROL" > /var/run/s6/container_environment/GNOME_KEYRING_CONTROL
 
 # Check if password file exists
 PASSWORD_FILE="/keyring-password"
