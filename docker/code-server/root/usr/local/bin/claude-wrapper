@@ -10,6 +10,15 @@ fi
 # Get current working directory to preserve context
 CWD=$(pwd)
 
+# Copy any /tmp files referenced in arguments to host
+# Kilo Code creates temp files like /tmp/kilocode-system-prompt-*.txt
+# Use </dev/null to avoid consuming stdin meant for claude
+for arg in "$@"; do
+    if [[ "$arg" == /tmp/* ]] && [ -f "$arg" ]; then
+        ssh "$HOST_USER@host.docker.internal" "cat > '$arg'" < "$arg"
+    fi
+done
+
 # Conditionally allocate PTY only for interactive sessions (no arguments)
 if [ $# -eq 0 ] && [ -t 0 ]; then
     # Interactive mode: allocate PTY, pass stdin through

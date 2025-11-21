@@ -8,10 +8,16 @@ if [ -z "$HOST_USER" ]; then
     exec /bin/bash "$@"
 fi
 
+# Build cd prefix if WORKSPACE_PATH is set
+cd_cmd=""
+if [ -n "$WORKSPACE_PATH" ]; then
+    cd_cmd="cd '$WORKSPACE_PATH' && "
+fi
+
 # If stdin is a TTY, allocate PTY for SSH
 if [ -t 0 ]; then
-    exec ssh -t "$HOST_USER@host.docker.internal" "bash" "$@"
+    exec ssh -t "$HOST_USER@host.docker.internal" "${cd_cmd}exec bash" "$@"
 fi
 
 # Non-interactive: no PTY needed
-exec ssh "$HOST_USER@host.docker.internal" "bash" "$@"
+exec ssh "$HOST_USER@host.docker.internal" "${cd_cmd}bash" "$@"

@@ -21,6 +21,18 @@
 
 # Check if this is -c "command" style invocation
 if [ "$1" = "-c" ] && [ -n "$2" ]; then
+    # Commands that should run locally in container
+    case "$2" in
+        claude\ *|claude)
+            # Let container's /usr/local/bin/claude wrapper handle SSH
+            exec /bin/dash.real "$@"
+            ;;
+        git\ config\ *)
+            # Don't forward git config - avoid modifying host gitconfig
+            exec /bin/dash.real "$@"
+            ;;
+    esac
+
     # Forward command to host
     cd_prefix=""
     [ -n "$WORKSPACE_PATH" ] && cd_prefix="cd '$WORKSPACE_PATH' 2>/dev/null; "
