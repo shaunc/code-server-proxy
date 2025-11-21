@@ -11,9 +11,52 @@
 
 const Docker = require('dockerode');
 const path = require('path');
+const fs = require('fs');
 const crypto = require('crypto');
 const { execSync } = require('child_process');
 const activityTracker = require('./activity-tracker');
+
+// Config file path
+const CONFIG_DIR = path.join(__dirname, '..', 'config');
+const MOUNTS_CONFIG_PATH = path.join(CONFIG_DIR, 'mounts.json');
+
+// Cached mounts config (reloaded on SIGHUP)
+let mountsConfig = null;
+
+/**
+ * Load mounts configuration from config file
+ * @returns {Array} Array of bind mount strings
+ */
+function loadMountsConfig() {
+  try {
+    if (fs.existsSync(MOUNTS_CONFIG_PATH)) {
+      const config = JSON.parse(fs.readFileSync(MOUNTS_CONFIG_PATH, 'utf8'));
+      mountsConfig = config.binds || [];
+      console.log(
+        `[Config] Loaded ${mountsConfig.length} mounts from ${MOUNTS_CONFIG_PATH}`
+      );
+      return mountsConfig;
+    }
+  } catch (error) {
+    console.error(`[Config] Failed to load mounts config: ${error.message}`);
+  }
+  return null;
+}
+
+/**
+ * Reload configuration (called on SIGHUP)
+ */
+function reloadConfig() {
+  console.log('[Config] Reloading configuration...');
+  loadMountsConfig();
+  // Clear image cache to force re-check
+  cachedImageId = null;
+  cacheTimestamp = 0;
+  console.log('[Config] Configuration reloaded');
+}
+
+// Load config on module init
+loadMountsConfig();
 
 // Initialize Docker client
 const docker = new Docker();
@@ -224,14 +267,27 @@ async function createContainer(instanceId, workspacePath, port) {
   const binds = [
     `${configVolume}:/config`,
     `${SHARED_EXTENSIONS_VOLUME}:/config/extensions`,
-    // Mount host directories at their original paths so no rewriting needed
-    // This also makes symlinks work (e.g., /home/shauncutts/src -> /data/sda/shaunc-src)
-    '/home/shauncutts:/home/shauncutts:rw',
-    '/data/sda:/data/sda:rw',
   ];
 
+  // Add mounts from config file (or use defaults)
+  if (mountsConfig && mountsConfig.length > 0) {
+    for (const mount of mountsConfig) {
+      const bindStr = `${mount.source}:${mount.target}:${mount.mode || 'rw'}`;
+      binds.push(bindStr);
+      if (mount.comment) {
+        console.log(
+          `  Mount: ${mount.source} -> ${mount.target} (${mount.comment})`
+        );
+      }
+    }
+  } else {
+    // Fallback defaults if no config
+    console.log('  Using default mounts (no config file)');
+    binds.push('/home/shauncutts:/home/shauncutts:rw');
+    binds.push('/data/sda:/data/sda:rw');
+  }
+
   // Add host secrets mount if available
-  const fs = require('fs');
   if (fs.existsSync(HOST_SECRETS_PATH)) {
     binds.push(`${HOST_SECRETS_PATH}:/host-secrets:ro`);
     console.log(`  Mounting host secrets from: ${HOST_SECRETS_PATH}`);
@@ -1438,4 +1494,5 @@ module.exports = {
   findOrphanedContainers,
   cleanupOrphanedContainers,
   getActivityTracker,
+  reloadConfig,
 };

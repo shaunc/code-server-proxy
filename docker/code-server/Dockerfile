@@ -95,5 +95,8 @@ ENV SSH_AUTH_SOCK=/ssh-agent/socket
 ENV DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus
 ENV GNOME_KEYRING_CONTROL=/config/.cache/keyring-control
 
+# Create symlink for node (bundled with code-server) so extensions like Pyright can find it
+RUN ln -sf /app/code-server/lib/node /usr/local/bin/node
+
 # Expose code-server port
 EXPOSE 8443

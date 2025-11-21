@@ -1280,6 +1280,17 @@ server.listen(PROXY_PORT, PROXY_HOST, async () => {
   }
 });
 
+// Handle SIGHUP to reload configuration
+process.on('SIGHUP', () => {
+  console.log('\nReceived SIGHUP - reloading configuration...');
+  if (USE_DOCKER && containerManager) {
+    containerManager.reloadConfig();
+  }
+  console.log(
+    'Configuration reloaded. New containers will use updated mounts.'
+  );
+});
+
 // Handle graceful shutdown
 process.on('SIGINT', async () => {
   console.log('\nShutting down proxy server...');

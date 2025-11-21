@@ -1,0 +1,23 @@
+{
+  "description": "Container mount configuration for code-server-proxy",
+  "binds": [
+    {
+      "source": "/home/shauncutts",
+      "target": "/home/shauncutts",
+      "mode": "rw",
+      "comment": "User home directory"
+    },
+    {
+      "source": "/data/sda",
+      "target": "/data/sda",
+      "mode": "rw",
+      "comment": "Data directory (symlink target for ~/src)"
+    },
+    {
+      "source": "/usr/local/share/mambaforge",
+      "target": "/usr/local/share/mambaforge",
+      "mode": "ro",
+      "comment": "Python environments for poetry virtualenv symlinks"
+    }
+  ]
+}

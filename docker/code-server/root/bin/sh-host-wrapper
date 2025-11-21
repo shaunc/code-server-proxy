@@ -31,6 +31,10 @@ if [ "$1" = "-c" ] && [ -n "$2" ]; then
             # Don't forward git config - avoid modifying host gitconfig
             exec /bin/dash.real "$@"
             ;;
+        */config/*|/config/*)
+            # Commands referencing /config paths must run in container
+            exec /bin/dash.real "$@"
+            ;;
     esac
 
     # Forward command to host via login shell (for full PATH including ~/.local/bin)
