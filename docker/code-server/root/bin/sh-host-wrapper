@@ -1,6 +1,10 @@
 #!/bin/dash
 # Forward shell commands to host via SSH (dash-compatible)
-# Used by Kilo Code which runs: /bin/sh -c "command"
+# Used by Kilo Code/VS Code extensions which run: /bin/sh -c "command"
+#
+# IMPORTANT: Only forwards commands from VS Code extension host processes.
+# System scripts (s6 services, init scripts, etc.) run locally in container.
+# Detection: VS Code sets VSCODE_CWD environment variable for extension processes.
 
 # Skip if already on host (SSH session)
 [ -n "$SSH_CONNECTION" ] && exec /bin/dash.real "$@"
@@ -10,6 +14,10 @@
 
 # Skip if HOST_USER not set
 [ -z "$HOST_USER" ] && exec /bin/dash.real "$@"
+
+# Skip if NOT running from VS Code extension host
+# VS Code sets VSCODE_CWD for extension processes - only forward those
+[ -z "$VSCODE_CWD" ] && exec /bin/dash.real "$@"
 
 # Check if this is -c "command" style invocation
 if [ "$1" = "-c" ] && [ -n "$2" ]; then
