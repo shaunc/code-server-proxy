@@ -1256,4 +1256,102 @@ Activity is **not** recorded when:
 - Scheduled tasks execute in container
 - No browser connection active
 
+### Persistent Activity Tracking
+
+Activity is persisted to `~/.code-workspaces/.activity.json` and survives proxy restarts.
+
+```json
+{
+  "version": 1,
+  "lastSaved": "2025-11-21T20:22:25.040Z",
+  "activity": {
+    "b71ce35ba9d6...": "2025-11-21T20:18:27.343Z",
+    "7e8067bf48eb...": "2025-11-21T20:19:21.758Z"
+  }
+}
+```
+
+- **Debounced saves**: 30 seconds after activity change
+- **Periodic saves**: Every 5 minutes
+- **Shutdown save**: Activity saved on SIGINT/SIGTERM
+
+### Scheduled Cleanup Tasks
+
+The proxy automatically manages idle containers:
+
+| Task                    | Interval      | Action                                                                  |
+| ----------------------- | ------------- | ----------------------------------------------------------------------- |
+| Stop idle containers    | Every 1 hour  | Stops containers idle > `IDLE_THRESHOLD_DAYS` (default: 3)              |
+| Cleanup idle containers | Every 6 hours | Removes stopped containers idle > `IDLE_GRACE_PERIOD_DAYS` (default: 7) |
+| Orphan detection        | Every 6 hours | Removes duplicate containers for same workspace                         |
+
+Before removal, container volumes are backed up to `~/.code-workspaces/volumes/`.
+
+## Configuration
+
+### Mount Configuration
+
+Container mounts are configured in `config/mounts.json`:
+
+```json
+{
+  "description": "Container mount configuration",
+  "binds": [
+    {
+      "source": "/home/shauncutts",
+      "target": "/home/shauncutts",
+      "mode": "rw",
+      "comment": "User home directory"
+    },
+    {
+      "source": "/data/sda",
+      "target": "/data/sda",
+      "mode": "rw",
+      "comment": "Data directory"
+    },
+    {
+      "source": "/usr/local/share/mambaforge",
+      "target": "/usr/local/share/mambaforge",
+      "mode": "ro",
+      "comment": "Python environments for poetry virtualenvs"
+    }
+  ]
+}
+```
+
+**Fields:**
+
+- `source`: Host path to mount
+- `target`: Container path (usually same as source for symlink compatibility)
+- `mode`: `rw` (read-write) or `ro` (read-only)
+- `comment`: Optional description (logged during container creation)
+
+### Reloading Configuration
+
+Reload mounts config without restarting the proxy:
+
+```bash
+# Send SIGHUP to reload config
+kill -HUP $(pgrep -f 'node.*proxy.js')
+
+# Or via systemctl
+systemctl --user kill -s HUP code-server-proxy
+```
+
+**Note**: Config reload only affects **new** containers. Existing containers must be recreated to pick up mount changes.
+
+### Environment Variables
+
+| Variable                 | Default                    | Description                                   |
+| ------------------------ | -------------------------- | --------------------------------------------- |
+| `USE_DOCKER`             | `false`                    | Enable Docker container mode                  |
+| `DOCKER_IMAGE`           | `code-server-proxy:latest` | Docker image to use                           |
+| `DOCKER_MEMORY_LIMIT`    | `4g`                       | Container memory limit                        |
+| `DOCKER_CPU_LIMIT`       | `3.0`                      | Container CPU limit                           |
+| `IDLE_THRESHOLD_DAYS`    | `3`                        | Days before stopping idle container           |
+| `IDLE_GRACE_PERIOD_DAYS` | `7`                        | Days before removing stopped container        |
+| `IDLE_WHITELIST`         | ``                         | Comma-separated instance IDs to never cleanup |
+| `ENABLE_AUTO_SSH`        | `false`                    | Forward commands to host via SSH              |
+| `ENABLE_GPU`             | `false`                    | Enable NVIDIA GPU passthrough                 |
+
 - [systemd/README.md](../systemd/README.md) - Systemd service documentation
