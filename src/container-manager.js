@@ -11,7 +11,9 @@
 
 const Docker = require('dockerode');
 const path = require('path');
+const crypto = require('crypto');
 const { execSync } = require('child_process');
+const activityTracker = require('./activity-tracker');
 
 // Initialize Docker client
 const docker = new Docker();
@@ -968,38 +970,39 @@ async function migrateToVolume(instanceId, systemdDataPath) {
 
 /**
  * Get container last activity timestamp
+ * Uses persistent activity tracker as primary source.
+ * Falls back to container creation time for new containers.
  * @param {string} instanceId - Instance ID
  * @returns {Promise<Date|null>} Last activity timestamp or null if not found
  */
 async function getContainerLastActivity(instanceId) {
+  // Primary source: activity tracker (tracks WebSocket/HTTP traffic)
+  const trackedActivity = activityTracker.getLastActivity(instanceId);
+  if (trackedActivity) {
+    return new Date(trackedActivity);
+  }
+
+  // Fallback: container creation time (for new/pre-existing containers)
   const containerName = `code-server-${instanceId}`;
 
   try {
     const container = docker.getContainer(containerName);
     const info = await container.inspect();
 
-    // Check if container exists
     if (!info) {
       return null;
     }
 
-    // Use container's last state change time as activity indicator
-    // This includes start, stop, and other state transitions
-    const finishedAt = info.State.FinishedAt;
-    const startedAt = info.State.StartedAt;
+    // Use container creation time as initial activity timestamp
+    const createdAt = new Date(info.Created);
 
-    // If container is running, use StartedAt
-    // If container is stopped, use FinishedAt
-    let activityTime;
-    if (info.State.Running) {
-      activityTime = new Date(startedAt);
-    } else if (finishedAt && finishedAt !== '0001-01-01T00:00:00Z') {
-      activityTime = new Date(finishedAt);
-    } else {
-      activityTime = new Date(startedAt);
-    }
+    // Initialize activity tracker with creation time so future checks use tracker
+    activityTracker.initializeActivity(instanceId, createdAt.getTime());
+    console.log(
+      `[ActivityTracker] Initialized activity for ${instanceId} from container creation: ${createdAt.toISOString()}`
+    );
 
-    return activityTime;
+    return createdAt;
   } catch (error) {
     if (error.statusCode === 404) {
       return null;
@@ -1208,6 +1211,206 @@ async function cleanupIdleContainers(gracePeriodDays = IDLE_GRACE_PERIOD_DAYS) {
   }
 }
 
+/**
+ * Find orphaned containers (multiple containers for same workspace path)
+ * An orphan is a container whose workspace path is served by another container
+ * @returns {Promise<Array>} List of orphaned containers
+ */
+async function findOrphanedContainers() {
+  const orphans = [];
+
+  try {
+    // List all code-server containers
+    const containers = await docker.listContainers({
+      all: true,
+      filters: {
+        label: ['app=code-server-proxy'],
+      },
+    });
+
+    // Group containers by workspace path
+    const workspacePaths = new Map(); // workspacePath -> [containerInfo]
+
+    for (const containerInfo of containers) {
+      const workspace = containerInfo.Labels.workspace;
+      if (!workspace || workspace === 'none') {
+        continue;
+      }
+
+      if (!workspacePaths.has(workspace)) {
+        workspacePaths.set(workspace, []);
+      }
+      workspacePaths.get(workspace).push({
+        instanceId: containerInfo.Labels.instanceId,
+        state: containerInfo.State,
+        created: containerInfo.Created,
+        names: containerInfo.Names,
+      });
+    }
+
+    // Find workspaces with multiple containers
+    for (const [workspace, containerList] of workspacePaths) {
+      if (containerList.length > 1) {
+        console.log(
+          `[Orphan Detection] Found ${containerList.length} containers for workspace: ${workspace}`
+        );
+
+        // Sort by activity (most recent first), then by running state
+        containerList.sort((a, b) => {
+          // Prefer running containers
+          if (a.state === 'running' && b.state !== 'running') return -1;
+          if (b.state === 'running' && a.state !== 'running') return 1;
+
+          // Then by most recent activity
+          const activityA =
+            activityTracker.getLastActivity(a.instanceId) || a.created * 1000;
+          const activityB =
+            activityTracker.getLastActivity(b.instanceId) || b.created * 1000;
+          return activityB - activityA;
+        });
+
+        // First container is the active one, rest are orphans
+        const [active, ...orphanContainers] = containerList;
+        console.log(
+          `  Active container: ${active.instanceId} (${active.state})`
+        );
+
+        for (const orphan of orphanContainers) {
+          console.log(
+            `  Orphan container: ${orphan.instanceId} (${orphan.state})`
+          );
+          orphans.push({
+            instanceId: orphan.instanceId,
+            workspace,
+            state: orphan.state,
+            activeInstanceId: active.instanceId,
+          });
+        }
+      }
+    }
+
+    return orphans;
+  } catch (error) {
+    console.error('Error finding orphaned containers:', error.message);
+    throw error;
+  }
+}
+
+/**
+ * Cleanup orphaned containers
+ * Only removes orphans that are stopped OR idle beyond threshold
+ * @param {number} thresholdDays - Idle threshold for running orphans
+ * @returns {Promise<Array>} List of cleaned up containers
+ */
+async function cleanupOrphanedContainers(thresholdDays = IDLE_THRESHOLD_DAYS) {
+  const cleanedContainers = [];
+
+  try {
+    const orphans = await findOrphanedContainers();
+
+    for (const orphan of orphans) {
+      // Check whitelist
+      if (IDLE_WHITELIST.includes(orphan.instanceId)) {
+        console.log(`Skipping whitelisted orphan: ${orphan.instanceId}`);
+        continue;
+      }
+
+      // Only cleanup if stopped OR idle beyond threshold
+      let shouldCleanup = false;
+      let idleDays = 0;
+
+      if (orphan.state !== 'running') {
+        shouldCleanup = true;
+        console.log(`Orphan ${orphan.instanceId} is stopped, will cleanup`);
+      } else {
+        // Check if running orphan is idle
+        const idleStatus = await isContainerIdle(
+          orphan.instanceId,
+          thresholdDays
+        );
+        if (idleStatus.idle) {
+          shouldCleanup = true;
+          idleDays = idleStatus.idleDays;
+          console.log(
+            `Orphan ${orphan.instanceId} is idle (${idleDays} days), will cleanup`
+          );
+        } else {
+          console.log(
+            `Orphan ${orphan.instanceId} is running and active, skipping`
+          );
+        }
+      }
+
+      if (shouldCleanup) {
+        try {
+          // Backup volume before removal
+          const backupPath = path.join(
+            WORKSPACE_VOLUMES_PATH,
+            `orphan-${orphan.instanceId}-${Date.now()}.tar.gz`
+          );
+
+          const fs = require('fs');
+          if (!fs.existsSync(WORKSPACE_VOLUMES_PATH)) {
+            fs.mkdirSync(WORKSPACE_VOLUMES_PATH, { recursive: true });
+          }
+
+          await backupVolume(orphan.instanceId, backupPath);
+          console.log(`Volume backed up to: ${backupPath}`);
+
+          // Stop if running
+          if (orphan.state === 'running') {
+            await stopContainer(orphan.instanceId);
+          }
+
+          // Remove container and volumes
+          await removeContainer(orphan.instanceId, true);
+          await removeVolumes(orphan.instanceId);
+
+          // Remove from activity tracker
+          activityTracker.removeWorkspace(orphan.instanceId);
+
+          cleanedContainers.push({
+            instanceId: orphan.instanceId,
+            workspace: orphan.workspace,
+            activeInstanceId: orphan.activeInstanceId,
+            idleDays,
+            backupPath,
+            cleanedAt: new Date().toISOString(),
+          });
+        } catch (error) {
+          console.error(
+            `Failed to cleanup orphan ${orphan.instanceId}:`,
+            error.message
+          );
+        }
+      }
+    }
+
+    if (cleanedContainers.length > 0) {
+      console.log(
+        `Cleaned up ${cleanedContainers.length} orphaned container(s)`
+      );
+    } else if (orphans.length > 0) {
+      console.log('Found orphans but none were eligible for cleanup');
+    } else {
+      console.log('No orphaned containers found');
+    }
+
+    return cleanedContainers;
+  } catch (error) {
+    console.error('Error cleaning up orphaned containers:', error.message);
+    throw error;
+  }
+}
+
+/**
+ * Get activity tracker reference for external use
+ * @returns {Object} Activity tracker instance
+ */
+function getActivityTracker() {
+  return activityTracker;
+}
+
 module.exports = {
   isDockerAvailable,
   createContainer,
@@ -1232,4 +1435,7 @@ module.exports = {
   isContainerIdle,
   stopIdleContainers,
   cleanupIdleContainers,
+  findOrphanedContainers,
+  cleanupOrphanedContainers,
+  getActivityTracker,
 };

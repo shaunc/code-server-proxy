@@ -953,10 +953,10 @@ async function handleRequest(req, res) {
     // Update last-access timestamp
     updateLastAccess(instanceId);
 
-    // Track activity for idle detection (WebSocket traffic monitoring)
-    const workspaceId = extractWorkspaceId(req);
-    if (workspaceId) {
-      activityTracker.recordActivity(workspaceId);
+    // Track activity for idle detection
+    // Use instanceId from routing (works for session-based routing too)
+    if (instanceId && instanceId !== 'main') {
+      activityTracker.recordActivity(instanceId);
     }
 
     // Attach routing context to request (for redirect handler)
@@ -1083,10 +1083,10 @@ async function handleUpgrade(req, socket, head) {
     // Update last-access timestamp
     updateLastAccess(instanceId);
 
-    // Track activity for idle detection (WebSocket traffic monitoring)
-    const workspaceId = extractWorkspaceId(req);
-    if (workspaceId) {
-      activityTracker.recordActivity(workspaceId);
+    // Track activity for idle detection
+    // Use instanceId from routing (works for session-based routing too)
+    if (instanceId && instanceId !== 'main') {
+      activityTracker.recordActivity(instanceId);
     }
 
     // Store original URL for potential redirect handling
@@ -1219,12 +1219,74 @@ server.listen(PROXY_PORT, PROXY_HOST, async () => {
         console.error('Failed to start settings sync service:', error.message);
       }
     }
+
+    // Schedule idle container cleanup tasks
+    // Stop idle containers every hour
+    setInterval(
+      async () => {
+        console.log('[CLEANUP] Running scheduled idle container check...');
+        try {
+          const stopped = await containerManager.stopIdleContainers();
+          if (stopped.length > 0) {
+            console.log(
+              `[CLEANUP] Stopped ${stopped.length} idle container(s)`
+            );
+          }
+        } catch (error) {
+          console.error(
+            '[CLEANUP] Error stopping idle containers:',
+            error.message
+          );
+        }
+      },
+      60 * 60 * 1000
+    ); // 1 hour
+
+    // Run full cleanup (remove containers) every 6 hours
+    setInterval(
+      async () => {
+        console.log('[CLEANUP] Running scheduled container cleanup...');
+        try {
+          const cleaned = await containerManager.cleanupIdleContainers();
+          if (cleaned.length > 0) {
+            console.log(
+              `[CLEANUP] Cleaned up ${cleaned.length} idle container(s)`
+            );
+          }
+        } catch (error) {
+          console.error(
+            '[CLEANUP] Error cleaning up containers:',
+            error.message
+          );
+        }
+
+        // Also cleanup orphaned containers
+        console.log('[CLEANUP] Running orphan detection...');
+        try {
+          const orphans = await containerManager.cleanupOrphanedContainers();
+          if (orphans.length > 0) {
+            console.log(
+              `[CLEANUP] Cleaned up ${orphans.length} orphaned container(s)`
+            );
+          }
+        } catch (error) {
+          console.error('[CLEANUP] Error cleaning up orphans:', error.message);
+        }
+      },
+      6 * 60 * 60 * 1000
+    ); // 6 hours
+
+    console.log('Scheduled cleanup tasks registered');
   }
 });
 
 // Handle graceful shutdown
 process.on('SIGINT', async () => {
   console.log('\nShutting down proxy server...');
+
+  // Save activity tracker state
+  console.log('Saving activity tracker state...');
+  activityTracker.shutdown();
 
   // Stop settings sync service
   if (settingsSync) {
@@ -1243,6 +1305,10 @@ process.on('SIGINT', async () => {
 
 process.on('SIGTERM', async () => {
   console.log('\nShutting down proxy server...');
+
+  // Save activity tracker state
+  console.log('Saving activity tracker state...');
+  activityTracker.shutdown();
 
   // Stop settings sync service
   if (settingsSync) {
