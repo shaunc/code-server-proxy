@@ -396,6 +396,86 @@ Env: [
 ]
 ```
 
+### AI Coding Assistant Command Execution (Kilo Code)
+
+AI coding assistants like Kilo Code execute commands differently from user terminals.
+
+#### Discovery
+
+Kilo Code uses `/bin/sh -c "command"` to execute commands, NOT:
+
+- The `$SHELL` environment variable
+- VS Code terminal profiles
+- `/bin/bash`
+
+This was discovered by wrapping `/bin/sh` with diagnostic logging.
+
+#### Solution: /bin/sh Wrapper
+
+Replace `/bin/sh` with a dash-compatible wrapper that forwards commands to host:
+
+**File**: `docker/code-server/root/bin/sh-host-wrapper`
+
+```sh
+#!/bin/dash
+# Forward shell commands to host via SSH (dash-compatible)
+
+# Skip if already on host (SSH session)
+[ -n "$SSH_CONNECTION" ] && exec /bin/dash.real "$@"
+
+# Skip if auto-SSH not enabled
+[ "$ENABLE_AUTO_SSH" != "true" ] && exec /bin/dash.real "$@"
+
+# Skip if HOST_USER not set
+[ -z "$HOST_USER" ] && exec /bin/dash.real "$@"
+
+# Check if this is -c "command" style invocation
+if [ "$1" = "-c" ] && [ -n "$2" ]; then
+    # Forward command to host
+    cd_prefix=""
+    [ -n "$WORKSPACE_PATH" ] && cd_prefix="cd '$WORKSPACE_PATH' 2>/dev/null; "
+    exec ssh "$HOST_USER@host.docker.internal" "${cd_prefix}$2"
+fi
+
+# Otherwise run locally
+exec /bin/dash.real "$@"
+```
+
+**Dockerfile installation**:
+
+```dockerfile
+COPY root/bin/sh-host-wrapper /bin/sh-host-wrapper
+RUN cp /bin/dash /bin/dash.real \
+    && mv /bin/sh-host-wrapper /bin/sh \
+    && chmod +x /bin/sh
+```
+
+#### Command Execution Flow
+
+```
+Kilo Code Executes Command
+    ↓
+/bin/sh -c "whoami"
+    ↓
+sh-host-wrapper detects -c flag
+    ↓
+Checks: ENABLE_AUTO_SSH? HOST_USER set? Not already SSH?
+    ↓
+exec ssh user@host.docker.internal "cd /workspace; whoami"
+    ↓
+Command runs on HOST
+    ↓
+Result returned to Kilo Code
+```
+
+#### Why This Works
+
+- Kilo Code (and VS Code) use `/bin/sh` for command execution
+- On Debian/Ubuntu, `/bin/sh` is symlinked to `dash`
+- The wrapper intercepts `-c "command"` invocations
+- Other `/bin/sh` uses (system scripts, etc.) fall through to real dash
+- Must be dash-compatible syntax (no bash-isms like `[[ ]]` or `printf %q`)
+
 ### Activity Tracking
 
 #### Why Activity Tracking is Needed

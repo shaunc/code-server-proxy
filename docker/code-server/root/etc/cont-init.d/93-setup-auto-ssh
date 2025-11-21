@@ -30,6 +30,16 @@ if [ ! -d /config/.ssh ]; then
     s6-setuidgid abc chmod 700 /config/.ssh
 fi
 
+# Populate known_hosts with host.docker.internal's key
+# This prevents "Warning: Permanently added..." messages on every SSH connection
+echo "[auto-ssh-setup] Scanning host keys for host.docker.internal..."
+if ssh-keyscan -T 5 host.docker.internal 2>/dev/null | s6-setuidgid abc tee /config/.ssh/known_hosts > /dev/null; then
+    s6-setuidgid abc chmod 644 /config/.ssh/known_hosts
+    echo "[auto-ssh-setup] Host keys added to known_hosts"
+else
+    echo "[auto-ssh-setup] Warning: Could not scan host keys (host may not be reachable yet)"
+fi
+
 # Create auto-SSH bashrc script
 echo "[auto-ssh-setup] Creating auto-SSH shell initialization script..."
 # Use s6-setuidgid to run as abc user for file creation
@@ -62,11 +72,8 @@ fi
 # SSH to host, cd to workspace, exec bash
 # The 'exec' replaces the container shell process with SSH client,
 # so when SSH exits, the terminal closes cleanly
-exec ssh -o "StrictHostKeyChecking=no" \
-         -o "UserKnownHostsFile=/dev/null" \
-         -o "ServerAliveInterval=60" \
-         -o "ServerAliveCountMax=3" \
-         -t "${HOST_USER}@host.docker.internal" \
+# Note: StrictHostKeyChecking and UserKnownHostsFile are set in /etc/ssh/ssh_config
+exec ssh -t "${HOST_USER}@host.docker.internal" \
          "cd '${WORKSPACE_PATH}' && exec bash -l"
 EOF
 

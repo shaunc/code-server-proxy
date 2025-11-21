@@ -1,5 +1,6 @@
 #!/bin/bash
 # Claude Code wrapper - forwards to host via SSH
+# SSH config is in /etc/ssh/ssh_config (StrictHostKeyChecking, known_hosts, etc.)
 # Requires HOST_USER environment variable to be set
 if [ -z "$HOST_USER" ]; then
     echo "Error: HOST_USER environment variable not set" >&2
@@ -12,27 +13,15 @@ CWD=$(pwd)
 # Conditionally allocate PTY only for interactive sessions (no arguments)
 if [ $# -eq 0 ] && [ -t 0 ]; then
     # Interactive mode: allocate PTY, pass stdin through
-    exec ssh -o StrictHostKeyChecking=no \
-             -o UserKnownHostsFile=/dev/null \
-             -o ServerAliveInterval=60 \
-             -o ServerAliveCountMax=3 \
-             -o LogLevel=ERROR \
-             -t \
-             "$HOST_USER@host.docker.internal" \
+    exec ssh -t "$HOST_USER@host.docker.internal" \
              "bash -l -c 'cd $(printf '%q' "$CWD") && exec claude'"
 else
     # Non-interactive mode: build command with proper escaping
-    # Use eval on remote side to properly parse the escaped arguments
     cmd="cd $(printf '%q' "$CWD") && exec claude"
     for arg in "$@"; do
         cmd="$cmd $(printf '%q' "$arg")"
     done
 
-    exec ssh -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o ServerAliveInterval=60 \
-        -o ServerAliveCountMax=3 \
-        -o LogLevel=ERROR \
-        "$HOST_USER@host.docker.internal" \
+    exec ssh "$HOST_USER@host.docker.internal" \
         "bash -l -c $(printf '%q' "$cmd")"
 fi

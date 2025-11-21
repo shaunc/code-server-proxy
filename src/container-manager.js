@@ -272,6 +272,29 @@ async function createContainer(instanceId, workspacePath, port) {
     fs.mkdirSync(instanceUserDir, { recursive: true });
     console.log(`  Created instance User directory: ${instanceUserDir}`);
   }
+
+  // Bootstrap settings files from shared User directory if missing
+  // This ensures new instances AND existing instances with missing settings
+  // get the shared settings. The settings-sync.js service handles ongoing propagation.
+  const sharedUserDir = path.join(INSTANCES_BASE_PATH, '..', 'shared', 'User');
+  const filesToBootstrap = ['settings.json', 'keybindings.json'];
+
+  for (const fileName of filesToBootstrap) {
+    const sourcePath = path.join(sharedUserDir, fileName);
+    const targetPath = path.join(instanceUserDir, fileName);
+
+    if (fs.existsSync(sourcePath) && !fs.existsSync(targetPath)) {
+      try {
+        fs.copyFileSync(sourcePath, targetPath);
+        console.log(`  Bootstrapped ${fileName} from shared settings`);
+      } catch (err) {
+        console.warn(
+          `  Warning: Failed to bootstrap ${fileName}: ${err.message}`
+        );
+      }
+    }
+  }
+
   binds.push(`${instanceUserDir}:/config/data/User:rw`);
   console.log(`  Mounting instance User directory: ${instanceUserDir}`);
 

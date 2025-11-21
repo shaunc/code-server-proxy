@@ -1,0 +1,17 @@
+#!/bin/bash
+# Host bash wrapper - forwards shell commands to host via SSH
+# Used as SHELL for Kilo Code to execute commands on host instead of container
+# SSH config is in /etc/ssh/ssh_config (StrictHostKeyChecking, known_hosts, etc.)
+
+if [ -z "$HOST_USER" ]; then
+    # Fallback to container bash if HOST_USER not set
+    exec /bin/bash "$@"
+fi
+
+# If stdin is a TTY, allocate PTY for SSH
+if [ -t 0 ]; then
+    exec ssh -t "$HOST_USER@host.docker.internal" "bash" "$@"
+fi
+
+# Non-interactive: no PTY needed
+exec ssh "$HOST_USER@host.docker.internal" "bash" "$@"

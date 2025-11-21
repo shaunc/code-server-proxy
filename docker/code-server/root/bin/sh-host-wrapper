@@ -1,0 +1,23 @@
+#!/bin/dash
+# Forward shell commands to host via SSH (dash-compatible)
+# Used by Kilo Code which runs: /bin/sh -c "command"
+
+# Skip if already on host (SSH session)
+[ -n "$SSH_CONNECTION" ] && exec /bin/dash.real "$@"
+
+# Skip if auto-SSH not enabled
+[ "$ENABLE_AUTO_SSH" != "true" ] && exec /bin/dash.real "$@"
+
+# Skip if HOST_USER not set
+[ -z "$HOST_USER" ] && exec /bin/dash.real "$@"
+
+# Check if this is -c "command" style invocation
+if [ "$1" = "-c" ] && [ -n "$2" ]; then
+    # Forward command to host
+    cd_prefix=""
+    [ -n "$WORKSPACE_PATH" ] && cd_prefix="cd '$WORKSPACE_PATH' 2>/dev/null; "
+    exec ssh "$HOST_USER@host.docker.internal" "${cd_prefix}$2"
+fi
+
+# Otherwise run locally
+exec /bin/dash.real "$@"

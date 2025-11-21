@@ -23,10 +23,11 @@ RUN if command -v nvidia-smi >/dev/null 2>&1; then \
     fi
 
 # Configure SSH client for auto-SSH to host
+# Use /config/.ssh/known_hosts which is populated at container startup by 93-setup-auto-ssh
 RUN mkdir -p /etc/ssh && \
     echo "Host host.docker.internal" >> /etc/ssh/ssh_config && \
     echo "    StrictHostKeyChecking no" >> /etc/ssh/ssh_config && \
-    echo "    UserKnownHostsFile /dev/null" >> /etc/ssh/ssh_config && \
+    echo "    UserKnownHostsFile /config/.ssh/known_hosts" >> /etc/ssh/ssh_config && \
     echo "    ServerAliveInterval 60" >> /etc/ssh/ssh_config && \
     echo "    ServerAliveCountMax 3" >> /etc/ssh/ssh_config
 
@@ -37,6 +38,22 @@ RUN chmod +x /usr/local/bin/git-credential-keyring
 # Copy Claude Code wrapper for kilo-code integration
 COPY root/usr/local/bin/claude-wrapper /usr/local/bin/claude
 RUN chmod +x /usr/local/bin/claude
+
+# Copy host-bash wrapper - forwards shell commands to host via SSH
+# Used as SHELL for Kilo Code to execute commands on host instead of container
+COPY root/usr/local/bin/host-bash /usr/local/bin/host-bash
+RUN chmod +x /usr/local/bin/host-bash
+
+# Set SHELL to host-bash for processes that respect $SHELL
+ENV SHELL=/usr/local/bin/host-bash
+
+# Replace /bin/sh with wrapper that forwards commands to host via SSH
+# Kilo Code uses /bin/sh -c "command" to execute commands
+# Backup original dash, install wrapper as /bin/sh
+COPY root/bin/sh-host-wrapper /bin/sh-host-wrapper
+RUN cp /bin/dash /bin/dash.real \
+    && mv /bin/sh-host-wrapper /bin/sh \
+    && chmod +x /bin/sh
 
 # Create directory structure for initialization
 RUN mkdir -p /etc/cont-init.d
