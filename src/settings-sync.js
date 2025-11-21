@@ -9,10 +9,10 @@
  * - Each workspace instance has: ~/.code-workspaces/instances/{instanceId}/data/User/
  * - This service watches all instance User directories for changes to settings files
  * - When a change is detected, it's propagated to all other instances atomically
+ * - Uses native fs.watch (inotify on Linux) instead of chokidar for reliable event detection
  * - Uses debouncing to avoid duplicate writes and event loops
  */
 
-const chokidar = require('chokidar');
 const fs = require('fs');
 const path = require('path');
 
@@ -21,12 +21,23 @@ const INSTANCES_BASE_PATH =
   process.env.INSTANCES_BASE_PATH ||
   path.join(process.env.HOME, '.code-workspaces/instances');
 const DEBOUNCE_DELAY = 100; // milliseconds
+const SCAN_INTERVAL = 30000; // 30 seconds - check for new instances
+
+// Files in the User directory to sync
 const SYNCED_FILES = ['settings.json', 'keybindings.json'];
 
+// Files in globalStorage/kilocode.kilo-code/settings/ to sync
+const KILO_CODE_SYNCED_FILES = ['mcp_settings.json', 'custom_modes.yaml'];
+
+// Additional files in User directory to sync (wrapper scripts, etc.)
+const SYNCED_USER_FILES = ['mcp-ssh-wrapper.sh'];
+
 // State
-let watcher = null;
-let debounceTimers = new Map(); // filename -> timeout
+let watchers = new Map(); // filePath -> fs.FSWatcher
+let debounceTimers = new Map(); // instanceId:filename -> timeout
 let lastWriteTimes = new Map(); // instanceId:filename -> timestamp
+let scanInterval = null;
+let isRunning = false;
 
 /**
  * Get all workspace instance directories
@@ -65,11 +76,15 @@ function copyFileAtomic(sourcePath, targetPath) {
   const tempPath = `${targetPath}.tmp`;
 
   try {
+    // Get source file permissions
+    const sourceStats = fs.statSync(sourcePath);
+    const sourceMode = sourceStats.mode;
+
     // Read source file
     const content = fs.readFileSync(sourcePath, 'utf8');
 
-    // Write to temp file
-    fs.writeFileSync(tempPath, content, 'utf8');
+    // Write to temp file with same permissions
+    fs.writeFileSync(tempPath, content, { encoding: 'utf8', mode: sourceMode });
 
     // Atomic rename
     fs.renameSync(tempPath, targetPath);
@@ -83,28 +98,53 @@ function copyFileAtomic(sourcePath, targetPath) {
 }
 
 /**
+ * Get relative path from User directory for a file
+ * @param {string} filePath - Full file path
+ * @param {string} userDir - User directory path
+ * @returns {string} Relative path from User directory
+ */
+function getRelativePath(filePath, userDir) {
+  return path.relative(userDir, filePath);
+}
+
+/**
  * Propagate settings file change to all other instances
  * @param {string} changedFile - Full path to changed file
  */
 function propagateChange(changedFile) {
   const fileName = path.basename(changedFile);
 
-  // Only sync specific files
-  if (!SYNCED_FILES.includes(fileName)) {
-    return;
-  }
-
   // Extract source instance ID from path
   const pathParts = changedFile.split(path.sep);
   const instancesIndex = pathParts.indexOf('instances');
   if (instancesIndex === -1 || instancesIndex + 1 >= pathParts.length) {
-    console.error(`Invalid instance path: ${changedFile}`);
+    console.error(`[SETTINGS-SYNC] Invalid instance path: ${changedFile}`);
     return;
   }
   const sourceInstanceId = pathParts[instancesIndex + 1];
 
+  // Determine the relative path within User directory
+  const userDir = path.join(INSTANCES_BASE_PATH, sourceInstanceId, 'data/User');
+  const relativePath = getRelativePath(changedFile, userDir);
+
+  // Only sync specific files (check all lists)
+  const allSyncedFiles = [
+    ...SYNCED_FILES,
+    ...SYNCED_USER_FILES,
+    ...KILO_CODE_SYNCED_FILES.map(
+      (f) => `globalStorage/kilocode.kilo-code/settings/${f}`
+    ),
+  ];
+
+  if (
+    !allSyncedFiles.includes(relativePath) &&
+    !SYNCED_FILES.includes(fileName)
+  ) {
+    return;
+  }
+
   // Debounce: clear existing timer for this file
-  const debounceKey = `${sourceInstanceId}:${fileName}`;
+  const debounceKey = `${sourceInstanceId}:${relativePath}`;
   if (debounceTimers.has(debounceKey)) {
     clearTimeout(debounceTimers.get(debounceKey));
   }
@@ -113,8 +153,16 @@ function propagateChange(changedFile) {
   const timer = setTimeout(() => {
     debounceTimers.delete(debounceKey);
 
+    // Check if file still exists (might have been deleted)
+    if (!fs.existsSync(changedFile)) {
+      console.log(
+        `[SETTINGS-SYNC] Source file no longer exists: ${changedFile}`
+      );
+      return;
+    }
+
     // Record this write time to avoid loops
-    const writeKey = `${sourceInstanceId}:${fileName}`;
+    const writeKey = `${sourceInstanceId}:${relativePath}`;
     lastWriteTimes.set(writeKey, Date.now());
 
     // Get all instances
@@ -127,11 +175,17 @@ function propagateChange(changedFile) {
         continue; // Skip source instance
       }
 
-      const targetPath = path.join(instance.userDir, fileName);
+      const targetPath = path.join(instance.userDir, relativePath);
+
+      // Ensure target directory exists (for nested paths like globalStorage/...)
+      const targetDir = path.dirname(targetPath);
+      if (!fs.existsSync(targetDir)) {
+        fs.mkdirSync(targetDir, { recursive: true });
+      }
 
       try {
         // Check if we recently wrote to this target (avoid loops)
-        const targetWriteKey = `${instance.instanceId}:${fileName}`;
+        const targetWriteKey = `${instance.instanceId}:${relativePath}`;
         const lastWrite = lastWriteTimes.get(targetWriteKey);
         if (lastWrite && Date.now() - lastWrite < DEBOUNCE_DELAY * 2) {
           // Skip if we wrote to this file very recently
@@ -146,7 +200,7 @@ function propagateChange(changedFile) {
         lastWriteTimes.set(targetWriteKey, Date.now());
       } catch (error) {
         console.error(
-          `Failed to sync ${fileName} to ${instance.instanceId}:`,
+          `[SETTINGS-SYNC] Failed to sync ${fileName} to ${instance.instanceId}:`,
           error.message
         );
       }
@@ -154,7 +208,7 @@ function propagateChange(changedFile) {
 
     if (propagatedCount > 0) {
       console.log(
-        `[SETTINGS-SYNC] Propagated ${fileName} from ${sourceInstanceId} to ${propagatedCount} instance(s)`
+        `[SETTINGS-SYNC] Propagated ${relativePath} from ${sourceInstanceId.substring(0, 8)}... to ${propagatedCount} instance(s)`
       );
     }
   }, DEBOUNCE_DELAY);
@@ -163,10 +217,108 @@ function propagateChange(changedFile) {
 }
 
 /**
+ * Start watching a specific file
+ * @param {string} filePath - Path to file to watch
+ */
+function watchFile(filePath) {
+  if (watchers.has(filePath)) {
+    return; // Already watching
+  }
+
+  if (!fs.existsSync(filePath)) {
+    return; // File doesn't exist yet
+  }
+
+  try {
+    const watcher = fs.watch(filePath, (eventType, filename) => {
+      if (eventType === 'change') {
+        console.log(`[SETTINGS-SYNC] Detected change: ${filePath}`);
+        propagateChange(filePath);
+      } else if (eventType === 'rename') {
+        // File was renamed/deleted - stop watching and re-scan
+        console.log(`[SETTINGS-SYNC] File renamed/deleted: ${filePath}`);
+        unwatchFile(filePath);
+      }
+    });
+
+    watcher.on('error', (error) => {
+      console.error(`[SETTINGS-SYNC] Watcher error for ${filePath}:`, error);
+      unwatchFile(filePath);
+    });
+
+    watchers.set(filePath, watcher);
+  } catch (error) {
+    console.error(`[SETTINGS-SYNC] Failed to watch ${filePath}:`, error);
+  }
+}
+
+/**
+ * Stop watching a specific file
+ * @param {string} filePath - Path to file to unwatch
+ */
+function unwatchFile(filePath) {
+  const watcher = watchers.get(filePath);
+  if (watcher) {
+    try {
+      watcher.close();
+    } catch (error) {
+      // Ignore close errors
+    }
+    watchers.delete(filePath);
+  }
+}
+
+/**
+ * Scan for all instances and ensure watchers are set up
+ */
+function scanAndWatch() {
+  const instances = getWorkspaceInstances();
+  const currentFiles = new Set();
+
+  // Set up watchers for all instance files
+  for (const instance of instances) {
+    // Watch main settings files (settings.json, keybindings.json)
+    for (const fileName of SYNCED_FILES) {
+      const filePath = path.join(instance.userDir, fileName);
+      currentFiles.add(filePath);
+      watchFile(filePath);
+    }
+
+    // Watch additional User files (mcp-ssh-wrapper.sh, etc.)
+    for (const fileName of SYNCED_USER_FILES) {
+      const filePath = path.join(instance.userDir, fileName);
+      currentFiles.add(filePath);
+      watchFile(filePath);
+    }
+
+    // Watch Kilo Code settings files
+    const kiloCodeDir = path.join(
+      instance.userDir,
+      'globalStorage/kilocode.kilo-code/settings'
+    );
+    for (const fileName of KILO_CODE_SYNCED_FILES) {
+      const filePath = path.join(kiloCodeDir, fileName);
+      currentFiles.add(filePath);
+      watchFile(filePath);
+    }
+  }
+
+  // Remove watchers for files that no longer exist
+  for (const filePath of watchers.keys()) {
+    if (!currentFiles.has(filePath)) {
+      console.log(`[SETTINGS-SYNC] Removing watcher for deleted: ${filePath}`);
+      unwatchFile(filePath);
+    }
+  }
+
+  return instances.length;
+}
+
+/**
  * Start settings sync service
  */
 function start() {
-  if (watcher) {
+  if (isRunning) {
     console.warn('[SETTINGS-SYNC] Service already running');
     return;
   }
@@ -178,58 +330,38 @@ function start() {
     fs.mkdirSync(INSTANCES_BASE_PATH, { recursive: true });
   }
 
-  // Build watch patterns for all synced files in all instances
-  const watchPatterns = SYNCED_FILES.map((file) =>
-    path.join(INSTANCES_BASE_PATH, '*/data/User', file)
+  isRunning = true;
+
+  // Initial scan
+  const instanceCount = scanAndWatch();
+  console.log(
+    `[SETTINGS-SYNC] Service ready, watching ${instanceCount} instance(s), ${watchers.size} file(s)`
   );
 
-  console.log(`[SETTINGS-SYNC] Watching patterns:`, watchPatterns);
+  // Periodic scan for new instances
+  scanInterval = setInterval(() => {
+    const count = scanAndWatch();
+    // Only log if watcher count changed significantly
+  }, SCAN_INTERVAL);
 
-  // Create watcher
-  watcher = chokidar.watch(watchPatterns, {
-    persistent: true,
-    ignoreInitial: true, // Don't trigger on initial scan
-    awaitWriteFinish: {
-      stabilityThreshold: 50,
-      pollInterval: 10,
-    },
-  });
-
-  // Handle file changes
-  watcher.on('change', (filePath) => {
-    console.log(`[SETTINGS-SYNC] Detected change: ${filePath}`);
-    propagateChange(filePath);
-  });
-
-  // Handle file additions (new settings file created)
-  watcher.on('add', (filePath) => {
-    console.log(`[SETTINGS-SYNC] Detected new file: ${filePath}`);
-    propagateChange(filePath);
-  });
-
-  // Handle errors
-  watcher.on('error', (error) => {
-    console.error('[SETTINGS-SYNC] Watcher error:', error);
-  });
-
-  // Log when ready
-  watcher.on('ready', () => {
-    const instances = getWorkspaceInstances();
-    console.log(
-      `[SETTINGS-SYNC] Service ready, watching ${instances.length} instance(s)`
-    );
-  });
+  console.log('[SETTINGS-SYNC] Using native fs.watch (inotify)');
 }
 
 /**
  * Stop settings sync service
  */
 async function stop() {
-  if (!watcher) {
+  if (!isRunning) {
     return;
   }
 
   console.log('[SETTINGS-SYNC] Stopping service...');
+
+  // Stop periodic scan
+  if (scanInterval) {
+    clearInterval(scanInterval);
+    scanInterval = null;
+  }
 
   // Clear all debounce timers
   for (const timer of debounceTimers.values()) {
@@ -238,10 +370,12 @@ async function stop() {
   debounceTimers.clear();
   lastWriteTimes.clear();
 
-  // Close watcher
-  await watcher.close();
-  watcher = null;
+  // Close all watchers
+  for (const filePath of watchers.keys()) {
+    unwatchFile(filePath);
+  }
 
+  isRunning = false;
   console.log('[SETTINGS-SYNC] Service stopped');
 }
 
