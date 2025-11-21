@@ -33,10 +33,12 @@ if [ "$1" = "-c" ] && [ -n "$2" ]; then
             ;;
     esac
 
-    # Forward command to host
+    # Forward command to host via login shell (for full PATH including ~/.local/bin)
     cd_prefix=""
     [ -n "$WORKSPACE_PATH" ] && cd_prefix="cd '$WORKSPACE_PATH' 2>/dev/null; "
-    exec ssh "$HOST_USER@host.docker.internal" "${cd_prefix}$2"
+    # Escape single quotes in command for bash -l -c '...'
+    escaped_cmd=$(printf '%s' "$2" | sed "s/'/'\\\\''/g")
+    exec ssh "$HOST_USER@host.docker.internal" "bash -l -c '${cd_prefix}${escaped_cmd}'"
 fi
 
 # Otherwise run locally
