@@ -3,6 +3,9 @@ FROM lscr.io/linuxserver/code-server:latest
 # Override base image's DBUS_SESSION_BUS_ADDRESS to use session bus instead of system bus
 ENV DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus
 
+# Set ENV for POSIX shells to source .shrc (used for tool environments like CUDA)
+ENV ENV=/config/.shrc
+
 # Install gnome-keyring and dependencies for VSCode extension secrets
 RUN apt-get update && apt-get install -y \
     gnome-keyring \

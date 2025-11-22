@@ -63,11 +63,11 @@ if [ ${#new_args[@]} -eq 0 ] && [ -t 0 ]; then
     # Interactive mode: allocate PTY, pass stdin through
     log_debug "Interactive mode"
     ssh -t "$HOST_USER@host.docker.internal" \
-        "bash -l -c 'cd $(printf '%q' "$CWD") && exec claude'"
+        "bash -l -c '. ~/.shrc 2>/dev/null || true; cd $(printf '%q' "$CWD") && exec claude'"
     EXIT_CODE=$?
 else
     # Non-interactive mode: build command with proper escaping, use stdbuf for line buffering
-    cmd="cd $(printf '%q' "$CWD") && exec claude"
+    cmd=". ~/.shrc 2>/dev/null || true; cd $(printf '%q' "$CWD") && exec claude"
     for arg in "${new_args[@]}"; do
         cmd="$cmd $(printf '%q' "$arg")"
     done

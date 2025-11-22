@@ -1347,6 +1347,46 @@ The `/usr/local/bin/claude` wrapper provides:
    - Enable debug mode: `export CLAUDE_WRAPPER_DEBUG=true`
    - Captures timing, file sizes, exit codes
 
+5. **Environment Integration**
+   - Automatically sources `~/.shrc` on host for tool environments
+   - CUDA, compiler paths, and other tool-specific variables available
+   - Works for all host command execution (claude, sh-host-wrapper, host-bash)
+
+### Shell Environment Setup
+
+All commands executed on the host automatically source `~/.shrc` to ensure tool environments (CUDA, compilers, etc.) are available.
+
+**Host Setup** (`~/.shrc` on host machine):
+
+```bash
+# ~/.shrc: executed by sh(1) for non-login shells via ENV variable
+# This file should be lightweight - only environment variables
+
+# Source CUDA environment
+if [ -f "$HOME/bin/cuda_env.sh" ]; then
+    . "$HOME/bin/cuda_env.sh"
+fi
+
+# Add other tool paths as needed
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+**Container Setup**:
+
+- `ENV=/config/.shrc` set in container environment
+- POSIX shells automatically source `/config/.shrc` when run locally
+- Host commands via SSH automatically source `~/.shrc` on host
+
+**Verification**:
+
+```bash
+# Test from container terminal
+/bin/sh -c 'echo $CUDA_HOME'  # Should show CUDA path if .shrc sets it
+
+# Test via Kilo Code command execution
+# CUDA_HOME and related vars will be available to all tools
+```
+
 ### Monitoring Claude Wrapper
 
 Check for errors:

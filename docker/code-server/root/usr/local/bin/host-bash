@@ -14,10 +14,13 @@ if [ -n "$WORKSPACE_PATH" ]; then
     cd_cmd="cd '$WORKSPACE_PATH' && "
 fi
 
+# Source .shrc for tool environments (CUDA, etc.)
+shrc_source=". ~/.shrc 2>/dev/null || true; "
+
 # If stdin is a TTY, allocate PTY for SSH
 if [ -t 0 ]; then
-    exec ssh -t "$HOST_USER@host.docker.internal" "${cd_cmd}exec bash" "$@"
+    exec ssh -t "$HOST_USER@host.docker.internal" "${shrc_source}${cd_cmd}exec bash" "$@"
 fi
 
 # Non-interactive: no PTY needed
-exec ssh "$HOST_USER@host.docker.internal" "${cd_cmd}bash" "$@"
+exec ssh "$HOST_USER@host.docker.internal" "${shrc_source}${cd_cmd}bash" "$@"
