@@ -606,6 +606,170 @@ function parseUrlParams(urlString) {
 }
 
 /**
+ * Generate waiting page HTML for container startup
+ * @param {string} workspacePath - Workspace or folder path
+ * @param {string} instanceId - Instance ID
+ * @param {number} port - Target port
+ * @returns {string} - HTML page
+ */
+function generateWaitingPage(workspacePath, instanceId, port) {
+  const shortId = instanceId.substring(0, 8);
+  const displayPath = workspacePath || 'Main Instance';
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="refresh" content="2">
+  <title>Workspace Starting - code-server</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      background: #1e1e1e;
+      color: #cccccc;
+      padding: 20px;
+    }
+    .container { text-align: center; max-width: 600px; width: 100%; }
+    .spinner {
+      width: 48px; height: 48px; margin: 0 auto 32px;
+      border: 3px solid #3c3c3c; border-top-color: #007acc;
+      border-radius: 50%; animation: spin 1s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    h1 {
+      font-size: 28px; font-weight: 400; margin-bottom: 16px; color: #ffffff;
+    }
+    .workspace-path {
+      font-size: 14px; color: #007acc; margin-bottom: 24px;
+      padding: 8px 16px; background: #2d2d30; border-radius: 4px;
+      display: inline-block;
+      font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+      word-break: break-all;
+    }
+    .message {
+      font-size: 16px; color: #858585; line-height: 1.6; margin-bottom: 12px;
+    }
+    .status {
+      display: flex; align-items: center; justify-content: center;
+      gap: 12px; margin: 24px 0; padding: 16px;
+      background: #252526; border-radius: 6px; border-left: 3px solid #007acc;
+    }
+    .status-dot {
+      width: 8px; height: 8px; background: #007acc;
+      border-radius: 50%; animation: pulse 1.5s ease-in-out infinite;
+    }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+    .status-text { font-size: 14px; color: #cccccc; }
+    .details {
+      margin-top: 32px; padding-top: 24px; border-top: 1px solid #3c3c3c;
+    }
+    .detail-item {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 8px 0; font-size: 13px; color: #858585;
+    }
+    .detail-label { font-weight: 500; }
+    .detail-value {
+      color: #cccccc;
+      font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+    }
+    .progress-bar {
+      width: 100%; height: 3px; background: #3c3c3c;
+      border-radius: 2px; margin-top: 24px; overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%; background: linear-gradient(90deg, #007acc, #00a0ff);
+      animation: progress 2s ease-in-out infinite; width: 40%;
+    }
+    @keyframes progress {
+      0% { transform: translateX(-100%); }
+      100% { transform: translateX(250%); }
+    }
+    .note {
+      margin-top: 32px; font-size: 12px; color: #6a6a6a; font-style: italic;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="spinner"></div>
+    <h1>Preparing Workspace</h1>
+    <div class="workspace-path">${displayPath}</div>
+    <p class="message">
+      Your workspace container is being started.
+      <br>
+      This page will automatically refresh when ready.
+    </p>
+    <div class="status">
+      <div class="status-dot"></div>
+      <div class="status-text">
+        <strong>Status:</strong> Starting container
+      </div>
+    </div>
+    <div class="details">
+      <div class="detail-item">
+        <span class="detail-label">Instance ID:</span>
+        <span class="detail-value">${shortId}</span>
+      </div>
+      <div class="detail-item">
+        <span class="detail-label">Port:</span>
+        <span class="detail-value">${port}</span>
+      </div>
+      <div class="detail-item">
+        <span class="detail-label">Elapsed:</span>
+        <span class="detail-value" id="elapsed">0s</span>
+      </div>
+    </div>
+    <div class="progress-bar">
+      <div class="progress-fill"></div>
+    </div>
+    <p class="note">
+      Container startup typically takes 10-15 seconds.
+      <br>
+      This page refreshes every 2 seconds.
+    </p>
+  </div>
+  <script>
+    const startTime = Date.now();
+    setInterval(() => {
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      document.getElementById('elapsed').textContent = elapsed + 's';
+    }, 1000);
+  </script>
+</body>
+</html>`;
+}
+
+/**
+ * Check if request is an initial page load (not a resource request)
+ * @param {http.IncomingMessage} req - Request object
+ * @returns {boolean} - True if initial page load
+ */
+function isInitialPageLoad(req) {
+  const url = req.url;
+
+  // Main page loads
+  if (url === '/' || url.startsWith('/?')) {
+    return true;
+  }
+
+  // Not a page load if it's a resource
+  const resourcePatterns = [
+    /\.(css|js|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot)$/i,
+    /^\/_static\//,
+    /^\/static\//,
+    /^\/vscode-remote-resource/,
+    /^\/stable-/,
+  ];
+
+  return !resourcePatterns.some((pattern) => pattern.test(url));
+}
+
+/**
  * Extract workspace ID from request for activity tracking
  * @param {http.IncomingMessage} req - Request object
  * @returns {string|null} - Workspace instance ID or null
@@ -791,8 +955,22 @@ async function handleRequest(req, res) {
       // Check if main instance is running, launch if needed
       if (!(await isPortListening(targetPort))) {
         console.log(`Main instance not running, launching ${instanceId}...`);
-        await launchInstance(instanceId, null, targetPort);
 
+        // Launch async (don't await)
+        launchInstance(instanceId, null, targetPort).catch((err) => {
+          console.error(`Failed to launch ${instanceId}:`, err);
+        });
+
+        // For initial page load, return waiting page
+        if (isInitialPageLoad(req)) {
+          console.log('[WAITING] Returning waiting page for bare mode');
+          const waitingPage = generateWaitingPage(null, instanceId, targetPort);
+          res.writeHead(200, { 'Content-Type': 'text/html' });
+          res.end(waitingPage);
+          return;
+        }
+
+        // For resource requests, block and wait
         console.log(
           `Waiting for main instance on port ${targetPort} to be ready...`
         );
@@ -848,8 +1026,26 @@ async function handleRequest(req, res) {
       // Check if instance is running, launch if needed
       if (!(await isPortListening(targetPort))) {
         console.log(`Instance not running, launching ${instanceId}...`);
-        await launchInstance(instanceId, workspacePath, targetPort);
 
+        // Launch async (don't await)
+        launchInstance(instanceId, workspacePath, targetPort).catch((err) => {
+          console.error(`Failed to launch ${instanceId}:`, err);
+        });
+
+        // For initial page load, return waiting page
+        if (isInitialPageLoad(req)) {
+          console.log('[WAITING] Returning waiting page for workspace');
+          const waitingPage = generateWaitingPage(
+            workspacePath,
+            instanceId,
+            targetPort
+          );
+          res.writeHead(200, { 'Content-Type': 'text/html' });
+          res.end(waitingPage);
+          return;
+        }
+
+        // For resource requests, block and wait
         console.log(`Waiting for backend on port ${targetPort} to be ready...`);
         const ready = await waitForBackend(targetPort);
         if (!ready) {
@@ -914,8 +1110,25 @@ async function handleRequest(req, res) {
       // Check if instance is running, launch if needed
       if (!(await isPortListening(targetPort))) {
         console.log(`Instance not running, launching ${instanceId}...`);
-        await launchInstance(instanceId, workspacePath, targetPort);
 
+        // Launch async (don't await)
+        launchInstance(instanceId, workspacePath, targetPort).catch((err) => {
+          console.error(`Failed to launch ${instanceId}:`, err);
+        });
+
+        // For initial page load, return waiting page
+        if (isInitialPageLoad(req)) {
+          const waitingPage = generateWaitingPage(
+            workspacePath,
+            instanceId,
+            targetPort
+          );
+          res.writeHead(200, { 'Content-Type': 'text/html' });
+          res.end(waitingPage);
+          return;
+        }
+
+        // For resource requests, block and wait
         console.log(`Waiting for backend on port ${targetPort} to be ready...`);
         const ready = await waitForBackend(targetPort);
         if (!ready) {
@@ -948,8 +1161,21 @@ async function handleRequest(req, res) {
       // Check if main instance is running, launch if needed
       if (!(await isPortListening(targetPort))) {
         console.log(`Main instance not running, launching ${instanceId}...`);
-        await launchInstance(instanceId, null, targetPort);
 
+        // Launch async (don't await)
+        launchInstance(instanceId, null, targetPort).catch((err) => {
+          console.error(`Failed to launch ${instanceId}:`, err);
+        });
+
+        // For initial page load, return waiting page
+        if (isInitialPageLoad(req)) {
+          const waitingPage = generateWaitingPage(null, instanceId, targetPort);
+          res.writeHead(200, { 'Content-Type': 'text/html' });
+          res.end(waitingPage);
+          return;
+        }
+
+        // For resource requests, block and wait
         console.log(
           `Waiting for main instance on port ${targetPort} to be ready...`
         );

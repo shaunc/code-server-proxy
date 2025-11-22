@@ -88,6 +88,38 @@ Example:
 ?folder=/home/user/project                    → Instance A (port 8142)
 ```
 
+### Container Startup Experience
+
+When you open a workspace or folder that doesn't have a running container, the proxy automatically launches it in the background and shows a waiting page.
+
+**What you'll see:**
+
+1. **Waiting Page**: A styled page with:
+   - Workspace path being prepared
+   - Loading spinner and progress bar
+   - Elapsed time counter
+   - Automatic refresh every 2 seconds
+
+2. **Automatic Container Launch**: The container starts in the background without blocking your browser
+
+3. **Automatic Redirect**: Once the container is ready (typically 10-15 seconds), the next refresh loads code-server
+
+**Technical Details:**
+
+- Initial HTTP request returns waiting page immediately
+- Container launches asynchronously (non-blocking)
+- Page auto-refreshes every 2 seconds via meta-refresh
+- Resource requests (CSS, JS, images) block and wait for backend
+- WebSocket connections retry automatically when backend is ready
+
+**No Action Required**: Just wait for the automatic refresh. You don't need to manually refresh your browser.
+
+**Typical Startup Times:**
+
+- First launch (new container): 10-15 seconds
+- Restart (existing container): 5-8 seconds
+- Resume (container already running): Instant
+
 ### Checking System Status
 
 #### Proxy Status
