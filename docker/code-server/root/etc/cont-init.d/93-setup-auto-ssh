@@ -13,6 +13,15 @@
 
 echo "[auto-ssh-setup] Initializing auto-SSH configuration..."
 
+# Ensure /run/user/1001 exists for SSH ControlMaster socket
+# This directory is also used by D-Bus but may not exist yet
+if [ ! -d /run/user/1001 ]; then
+    echo "[auto-ssh-setup] Creating /run/user/1001 for SSH control socket..."
+    mkdir -p /run/user/1001
+    chown abc:abc /run/user/1001
+    chmod 700 /run/user/1001
+fi
+
 # Wait for /config to be writable by abc user
 for i in {1..30}; do
     if s6-setuidgid abc test -w /config 2>/dev/null; then

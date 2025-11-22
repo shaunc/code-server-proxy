@@ -18,6 +18,12 @@
       "target": "/usr/local/share/mambaforge",
       "mode": "ro",
       "comment": "Python environments for poetry virtualenv symlinks"
+    },
+    {
+      "source": "/tmp/kilocode-shared",
+      "target": "/tmp/kilocode-shared",
+      "mode": "rw",
+      "comment": "Shared temp for Kilo Code system prompts (avoids SSH copy)"
     }
   ]
 }

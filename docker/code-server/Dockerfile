@@ -24,12 +24,16 @@ RUN if command -v nvidia-smi >/dev/null 2>&1; then \
 
 # Configure SSH client for auto-SSH to host
 # Use /config/.ssh/known_hosts which is populated at container startup by 93-setup-auto-ssh
+# ControlMaster enables connection multiplexing - first connection persists, subsequent reuse it
 RUN mkdir -p /etc/ssh && \
     echo "Host host.docker.internal" >> /etc/ssh/ssh_config && \
     echo "    StrictHostKeyChecking no" >> /etc/ssh/ssh_config && \
     echo "    UserKnownHostsFile /config/.ssh/known_hosts" >> /etc/ssh/ssh_config && \
     echo "    ServerAliveInterval 60" >> /etc/ssh/ssh_config && \
-    echo "    ServerAliveCountMax 3" >> /etc/ssh/ssh_config
+    echo "    ServerAliveCountMax 3" >> /etc/ssh/ssh_config && \
+    echo "    ControlMaster auto" >> /etc/ssh/ssh_config && \
+    echo "    ControlPath /run/user/1001/ssh-control-%h" >> /etc/ssh/ssh_config && \
+    echo "    ControlPersist 600" >> /etc/ssh/ssh_config
 
 # Copy git credential helper for keyring
 COPY root/usr/local/bin/git-credential-keyring /usr/local/bin/git-credential-keyring

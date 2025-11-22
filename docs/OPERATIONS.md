@@ -1284,8 +1284,90 @@ The proxy automatically manages idle containers:
 | Stop idle containers    | Every 1 hour  | Stops containers idle > `IDLE_THRESHOLD_DAYS` (default: 3)              |
 | Cleanup idle containers | Every 6 hours | Removes stopped containers idle > `IDLE_GRACE_PERIOD_DAYS` (default: 7) |
 | Orphan detection        | Every 6 hours | Removes duplicate containers for same workspace                         |
+| Shared tmp cleanup      | Every 1 hour  | Removes files from `/tmp/kilocode-shared` older than 1 hour             |
 
 Before removal, container volumes are backed up to `~/.code-workspaces/volumes/`.
+
+## Claude Code Integration
+
+The proxy includes optimized integration for Claude Code (Kilo Code) when running in containers with auto-SSH enabled.
+
+### Claude Wrapper Features
+
+The `/usr/local/bin/claude` wrapper provides:
+
+1. **SSH Connection Multiplexing**
+   - First SSH connection persists for 10 minutes
+   - Subsequent calls reuse the connection (eliminates ~200ms handshake)
+   - Control socket at `/run/user/1001/ssh-control-host.docker.internal`
+
+2. **Shared Temp Files**
+   - Kilo Code system prompts (~74KB each) copied to `/tmp/kilocode-shared`
+   - Shared volume mount eliminates SSH file transfer overhead
+   - Hourly cleanup prevents accumulation
+
+3. **Streaming Optimization**
+   - Line buffering (`stdbuf -oL -eL`) for non-interactive mode
+   - Prevents truncated Claude responses from buffer issues
+
+4. **Error Logging**
+   - Always logs errors to `/tmp/claude-wrapper.log`
+   - Enable debug mode: `export CLAUDE_WRAPPER_DEBUG=true`
+   - Captures timing, file sizes, exit codes
+
+### Monitoring Claude Wrapper
+
+Check for errors:
+
+```bash
+# View recent errors
+tail -100 /tmp/claude-wrapper.log | grep ERROR
+
+# Check error rate
+grep -c ERROR /tmp/claude-wrapper.log
+```
+
+Enable debug logging (in container):
+
+```bash
+# Set environment variable
+export CLAUDE_WRAPPER_DEBUG=true
+
+# Now all claude calls will log detailed debug info
+claude -p "test message"
+
+# View debug log
+tail -50 /tmp/claude-wrapper.log
+```
+
+Debug log includes:
+
+- Start/end timestamps with PID
+- File copy operations with sizes
+- Elapsed time in milliseconds
+- Exit codes and errors
+
+### SSH ControlMaster Status
+
+Check active SSH control connections:
+
+```bash
+# List control sockets (from container)
+ls -la /run/user/1001/ssh-control-*
+
+# See active connections
+ssh -O check shauncutts@host.docker.internal 2>&1
+```
+
+### Shared Tmp Usage
+
+```bash
+# Check shared tmp usage
+du -sh /tmp/kilocode-shared
+ls /tmp/kilocode-shared | wc -l  # File count
+```
+
+Files are cleaned automatically every hour (files >1 hour old removed).
 
 ## Configuration
 
@@ -1314,6 +1396,12 @@ Container mounts are configured in `config/mounts.json`:
       "target": "/usr/local/share/mambaforge",
       "mode": "ro",
       "comment": "Python environments for poetry virtualenvs"
+    },
+    {
+      "source": "/tmp/kilocode-shared",
+      "target": "/tmp/kilocode-shared",
+      "mode": "rw",
+      "comment": "Shared temp for Kilo Code system prompts (avoids SSH copy)"
     }
   ]
 }
@@ -1353,5 +1441,6 @@ systemctl --user kill -s HUP code-server-proxy
 | `IDLE_WHITELIST`         | ``                         | Comma-separated instance IDs to never cleanup |
 | `ENABLE_AUTO_SSH`        | `false`                    | Forward commands to host via SSH              |
 | `ENABLE_GPU`             | `false`                    | Enable NVIDIA GPU passthrough                 |
+| `CLAUDE_WRAPPER_DEBUG`   | `false`                    | Enable debug logging in claude-wrapper        |
 
 - [systemd/README.md](../systemd/README.md) - Systemd service documentation

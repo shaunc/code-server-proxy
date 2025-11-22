@@ -1,36 +1,89 @@
 #!/bin/bash
 # Claude Code wrapper - forwards to host via SSH
-# SSH config is in /etc/ssh/ssh_config (StrictHostKeyChecking, known_hosts, etc.)
+# SSH config is in /etc/ssh/ssh_config (StrictHostKeyChecking, known_hosts, ControlMaster, etc.)
 # Requires HOST_USER environment variable to be set
+
+# Logging - errors always logged, debug via CLAUDE_WRAPPER_DEBUG=true
+DEBUG="${CLAUDE_WRAPPER_DEBUG:-false}"
+LOG="/tmp/claude-wrapper.log"
+
+log_debug() {
+    [ "$DEBUG" = "true" ] && echo "$(date +%T.%3N) [$$] DEBUG: $*" >> "$LOG"
+}
+log_error() {
+    echo "$(date +%T.%3N) [$$] ERROR: $*" >> "$LOG"
+}
+
 if [ -z "$HOST_USER" ]; then
+    log_error "HOST_USER not set"
     echo "Error: HOST_USER environment variable not set" >&2
     exit 1
 fi
 
 # Get current working directory to preserve context
 CWD=$(pwd)
+log_debug "START pwd=$CWD args=($*)"
 
-# Copy any /tmp files referenced in arguments to host
-# Kilo Code creates temp files like /tmp/kilocode-system-prompt-*.txt
-# Use </dev/null to avoid consuming stdin meant for claude
+# Shared tmp directory for Kilo Code files (mounted in both container and host)
+SHARED_TMP="/tmp/kilocode-shared"
+
+# Ensure shared directory exists
+[ -d "$SHARED_TMP" ] || mkdir -p "$SHARED_TMP" 2>/dev/null
+
+# Build new args array, rewriting /tmp/kilocode-* paths to shared location
+new_args=()
 for arg in "$@"; do
-    if [[ "$arg" == /tmp/* ]] && [ -f "$arg" ]; then
-        ssh "$HOST_USER@host.docker.internal" "cat > '$arg'" < "$arg"
+    if [[ "$arg" == /tmp/kilocode-* ]] && [ -f "$arg" ]; then
+        # Copy to shared location (no SSH needed - it's a shared mount)
+        shared_path="$SHARED_TMP/$(basename "$arg")"
+        if cp "$arg" "$shared_path" 2>/dev/null; then
+            log_debug "Copied $arg to $shared_path ($(stat -c%s "$shared_path" 2>/dev/null || echo '?') bytes)"
+            new_args+=("$shared_path")
+        else
+            log_error "Failed to copy $arg to $shared_path, using original"
+            new_args+=("$arg")
+        fi
+    elif [[ "$arg" == /tmp/* ]] && [ -f "$arg" ]; then
+        # Other /tmp files: copy via SSH (fallback for non-kilocode files)
+        log_debug "Copying $arg via SSH ($(stat -c%s "$arg" 2>/dev/null || echo '?') bytes)"
+        if ! ssh "$HOST_USER@host.docker.internal" "cat > '$arg'" < "$arg" 2>/dev/null; then
+            log_error "Failed to copy $arg to host via SSH"
+        fi
+        new_args+=("$arg")
+    else
+        new_args+=("$arg")
     fi
 done
 
+# Record start time for elapsed calculation
+START_MS=$(date +%s%3N)
+
 # Conditionally allocate PTY only for interactive sessions (no arguments)
-if [ $# -eq 0 ] && [ -t 0 ]; then
+if [ ${#new_args[@]} -eq 0 ] && [ -t 0 ]; then
     # Interactive mode: allocate PTY, pass stdin through
-    exec ssh -t "$HOST_USER@host.docker.internal" \
-             "bash -l -c 'cd $(printf '%q' "$CWD") && exec claude'"
+    log_debug "Interactive mode"
+    ssh -t "$HOST_USER@host.docker.internal" \
+        "bash -l -c 'cd $(printf '%q' "$CWD") && exec claude'"
+    EXIT_CODE=$?
 else
-    # Non-interactive mode: build command with proper escaping
+    # Non-interactive mode: build command with proper escaping, use stdbuf for line buffering
     cmd="cd $(printf '%q' "$CWD") && exec claude"
-    for arg in "$@"; do
+    for arg in "${new_args[@]}"; do
         cmd="$cmd $(printf '%q' "$arg")"
     done
 
-    exec ssh "$HOST_USER@host.docker.internal" \
-        "bash -l -c $(printf '%q' "$cmd")"
+    log_debug "Non-interactive: $cmd"
+    ssh "$HOST_USER@host.docker.internal" \
+        "stdbuf -oL -eL bash -l -c $(printf '%q' "$cmd")"
+    EXIT_CODE=$?
 fi
+
+# Log timing and exit code
+ELAPSED_MS=$(( $(date +%s%3N) - START_MS ))
+if [ $EXIT_CODE -ne 0 ]; then
+    log_error "Exit $EXIT_CODE after ${ELAPSED_MS}ms"
+else
+    log_debug "END exit=$EXIT_CODE elapsed=${ELAPSED_MS}ms"
+fi
+
+exit $EXIT_CODE

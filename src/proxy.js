@@ -1276,7 +1276,26 @@ server.listen(PROXY_PORT, PROXY_HOST, async () => {
       6 * 60 * 60 * 1000
     ); // 6 hours
 
+    // Clean shared tmp directory hourly (with the idle container check)
+    setInterval(
+      () => {
+        cleanupSharedTmp();
+      },
+      60 * 60 * 1000
+    ); // 1 hour
+
     console.log('Scheduled cleanup tasks registered');
+  }
+
+  // Create shared tmp directory if it doesn't exist
+  const sharedTmpDir = '/tmp/kilocode-shared';
+  if (!fs.existsSync(sharedTmpDir)) {
+    try {
+      fs.mkdirSync(sharedTmpDir, { recursive: true });
+      console.log(`Created shared tmp directory: ${sharedTmpDir}`);
+    } catch (error) {
+      console.error(`Failed to create ${sharedTmpDir}: ${error.message}`);
+    }
   }
 });
 
@@ -1290,6 +1309,45 @@ process.on('SIGHUP', () => {
     'Configuration reloaded. New containers will use updated mounts.'
   );
 });
+
+/**
+ * Cleanup old files in the shared Kilo Code temp directory
+ * Files older than maxAgeMs are deleted to prevent accumulation
+ * @param {number} maxAgeMs - Maximum age in milliseconds (default: 1 hour)
+ */
+async function cleanupSharedTmp(maxAgeMs = 60 * 60 * 1000) {
+  const sharedDir = '/tmp/kilocode-shared';
+
+  try {
+    if (!fs.existsSync(sharedDir)) {
+      return; // Directory doesn't exist yet, nothing to clean
+    }
+
+    const now = Date.now();
+    const files = fs.readdirSync(sharedDir);
+    let cleaned = 0;
+
+    for (const file of files) {
+      const filePath = path.join(sharedDir, file);
+      try {
+        const stat = fs.statSync(filePath);
+        if (now - stat.mtimeMs > maxAgeMs) {
+          fs.unlinkSync(filePath);
+          cleaned++;
+        }
+      } catch (err) {
+        // File may have been deleted by another process
+        console.error(`[CLEANUP] Error checking ${filePath}: ${err.message}`);
+      }
+    }
+
+    if (cleaned > 0) {
+      console.log(`[CLEANUP] Removed ${cleaned} old file(s) from ${sharedDir}`);
+    }
+  } catch (error) {
+    console.error(`[CLEANUP] Error cleaning shared tmp: ${error.message}`);
+  }
+}
 
 // Handle graceful shutdown
 process.on('SIGINT', async () => {
