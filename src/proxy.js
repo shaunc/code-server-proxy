@@ -775,6 +775,19 @@ async function handleRequest(req, res) {
       targetPort = MAIN_PORT;
       instanceId = 'main';
 
+      // Expire any existing session cookie to prevent subsequent requests from routing to workspace
+      if (sessionId) {
+        console.log(
+          `[SESSION] Expiring session ${sessionId.substring(0, 8)} for bare mode`
+        );
+        sessionMap.delete(sessionId);
+        // Set expired cookie to clear it in browser
+        res.setHeader(
+          'Set-Cookie',
+          `${SESSION_COOKIE_NAME}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax`
+        );
+      }
+
       // Check if main instance is running, launch if needed
       if (!(await isPortListening(targetPort))) {
         console.log(`Main instance not running, launching ${instanceId}...`);
