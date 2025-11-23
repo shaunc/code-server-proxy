@@ -512,6 +512,9 @@ async function startContainer(instanceId) {
     const container = docker.getContainer(containerName);
     await container.start();
     console.log(`Container started successfully: ${containerName}`);
+
+    // Clear outdated cache to prevent recreation loops
+    clearOutdatedCache(instanceId);
   } catch (error) {
     console.error(`Failed to start container ${containerName}:`, error.message);
     throw new Error(`Container start failed: ${error.message}`);
@@ -818,6 +821,15 @@ function isContainerOutdatedCached(instanceId) {
   }
 
   return cached.outdated;
+}
+
+/**
+ * Clear the outdated cache entry for a container
+ * Called after successful container recreation to prevent recreation loops
+ * @param {string} instanceId - Instance ID
+ */
+function clearOutdatedCache(instanceId) {
+  outdatedContainersCache.delete(instanceId);
 }
 
 /**
@@ -1570,6 +1582,7 @@ module.exports = {
   isContainerImageOutdated,
   checkAllContainersForOutdatedImages,
   isContainerOutdatedCached,
+  clearOutdatedCache,
   getContainerLogs,
   createConfigVolume,
   ensureSharedExtensionsVolume,
