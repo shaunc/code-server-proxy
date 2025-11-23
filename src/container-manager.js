@@ -88,6 +88,12 @@ const DOCKER_IMAGE = process.env.DOCKER_IMAGE || 'code-server-proxy:latest';
 let cachedImageId = null;
 let cacheTimestamp = 0;
 const IMAGE_CACHE_TTL = 60000; // 1 minute
+
+// Cache for outdated container detection (background periodic check)
+// instanceId -> { outdated: boolean, containerImageId: string, checkedAt: timestamp }
+const outdatedContainersCache = new Map();
+const OUTDATED_CHECK_INTERVAL = 2 * 60 * 1000; // 2 minutes
+const OUTDATED_CACHE_TTL = 5 * 60 * 1000; // 5 minutes (safety margin)
 const DOCKER_MEMORY_LIMIT = process.env.DOCKER_MEMORY_LIMIT || '4g';
 const DOCKER_CPU_LIMIT = parseFloat(process.env.DOCKER_CPU_LIMIT || '3.0');
 const SHARED_EXTENSIONS_VOLUME =
@@ -727,6 +733,91 @@ async function isContainerImageOutdated(instanceId) {
     );
     return false; // On error, don't recreate
   }
+}
+
+/**
+ * Background periodic check for outdated container images
+ * Checks all running code-server containers and caches results
+ * This avoids Docker API calls on the hot request path
+ */
+async function checkAllContainersForOutdatedImages() {
+  try {
+    // Get current image ID (uses existing 1-min cache)
+    const now = Date.now();
+    if (!cachedImageId || now - cacheTimestamp > IMAGE_CACHE_TTL) {
+      const imageInfo = await docker.getImage(DOCKER_IMAGE).inspect();
+      cachedImageId = imageInfo.Id;
+      cacheTimestamp = now;
+    }
+    const currentImageId = cachedImageId;
+
+    // List all running code-server containers
+    const containers = await docker.listContainers({
+      filters: { name: ['code-server-'] },
+    });
+
+    console.log(
+      `[IMAGE-CHECK] Checking ${containers.length} containers against image ${currentImageId.substring(7, 19)}`
+    );
+
+    // Check each container
+    let outdatedCount = 0;
+    for (const containerInfo of containers) {
+      // Extract instanceId from container name
+      const instanceId = containerInfo.Names[0].replace('/code-server-', '');
+      const containerImageId = containerInfo.ImageID;
+      const isOutdated = containerImageId !== currentImageId;
+
+      outdatedContainersCache.set(instanceId, {
+        outdated: isOutdated,
+        containerImageId,
+        checkedAt: now,
+      });
+
+      if (isOutdated) {
+        outdatedCount++;
+        console.log(
+          `[IMAGE-CHECK] Container ${instanceId.substring(0, 8)} is outdated ` +
+            `(using ${containerImageId.substring(7, 19)} vs ${currentImageId.substring(7, 19)})`
+        );
+      }
+    }
+
+    if (outdatedCount === 0) {
+      console.log('[IMAGE-CHECK] All containers are up-to-date');
+    } else {
+      console.log(`[IMAGE-CHECK] Found ${outdatedCount} outdated container(s)`);
+    }
+  } catch (error) {
+    console.error(
+      '[IMAGE-CHECK] Error checking containers for outdated images:',
+      error.message
+    );
+  }
+}
+
+/**
+ * Fast cached check if container is using outdated image
+ * Uses cached results from background periodic check - no Docker API calls
+ * @param {string} instanceId - Instance ID
+ * @returns {boolean} True if container is outdated (should be recreated)
+ */
+function isContainerOutdatedCached(instanceId) {
+  const cached = outdatedContainersCache.get(instanceId);
+  if (!cached) {
+    // No cache entry - safe default is to not recreate
+    // This happens for new containers or before first background check
+    return false;
+  }
+
+  const now = Date.now();
+  if (now - cached.checkedAt > OUTDATED_CACHE_TTL) {
+    // Cache expired - safe default is to not recreate
+    // Background check will update soon
+    return false;
+  }
+
+  return cached.outdated;
 }
 
 /**
@@ -1477,6 +1568,8 @@ module.exports = {
   isContainerRunning,
   inspectContainer,
   isContainerImageOutdated,
+  checkAllContainersForOutdatedImages,
+  isContainerOutdatedCached,
   getContainerLogs,
   createConfigVolume,
   ensureSharedExtensionsVolume,

@@ -952,9 +952,20 @@ async function handleRequest(req, res) {
         );
       }
 
-      // Check if main instance is running, launch if needed
-      if (!(await isPortListening(targetPort))) {
-        console.log(`Main instance not running, launching ${instanceId}...`);
+      // Check if container image is outdated (fast cached check - no Docker API)
+      const isOutdatedBare =
+        containerManager.isContainerOutdatedCached(instanceId);
+      const isListeningBare = await isPortListening(targetPort);
+
+      // If outdated or not running, need to launch/relaunch
+      if (isOutdatedBare || !isListeningBare) {
+        if (isOutdatedBare) {
+          console.log(
+            `Instance ${instanceId.substring(0, 8)} using outdated image, recreating...`
+          );
+        } else {
+          console.log(`Main instance not running, launching ${instanceId}...`);
+        }
 
         // Launch async (don't await)
         launchInstance(instanceId, null, targetPort).catch((err) => {
@@ -1023,9 +1034,20 @@ async function handleRequest(req, res) {
         createInstanceDirectory(instanceId, workspacePath, targetPort);
       }
 
-      // Check if instance is running, launch if needed
-      if (!(await isPortListening(targetPort))) {
-        console.log(`Instance not running, launching ${instanceId}...`);
+      // Check if container image is outdated (fast cached check - no Docker API)
+      const isOutdatedWorkspace =
+        containerManager.isContainerOutdatedCached(instanceId);
+      const isListeningWorkspace = await isPortListening(targetPort);
+
+      // If outdated or not running, need to launch/relaunch
+      if (isOutdatedWorkspace || !isListeningWorkspace) {
+        if (isOutdatedWorkspace) {
+          console.log(
+            `Instance ${instanceId.substring(0, 8)} using outdated image, recreating...`
+          );
+        } else {
+          console.log(`Instance not running, launching ${instanceId}...`);
+        }
 
         // Launch async (don't await)
         launchInstance(instanceId, workspacePath, targetPort).catch((err) => {
@@ -1107,9 +1129,20 @@ async function handleRequest(req, res) {
         createInstanceDirectory(instanceId, workspacePath, targetPort);
       }
 
-      // Check if instance is running, launch if needed
-      if (!(await isPortListening(targetPort))) {
-        console.log(`Instance not running, launching ${instanceId}...`);
+      // Check if container image is outdated (fast cached check - no Docker API)
+      const isOutdatedFolder =
+        containerManager.isContainerOutdatedCached(instanceId);
+      const isListeningFolder = await isPortListening(targetPort);
+
+      // If outdated or not running, need to launch/relaunch
+      if (isOutdatedFolder || !isListeningFolder) {
+        if (isOutdatedFolder) {
+          console.log(
+            `Instance ${instanceId.substring(0, 8)} using outdated image, recreating...`
+          );
+        } else {
+          console.log(`Instance not running, launching ${instanceId}...`);
+        }
 
         // Launch async (don't await)
         launchInstance(instanceId, workspacePath, targetPort).catch((err) => {
@@ -1158,9 +1191,20 @@ async function handleRequest(req, res) {
       targetPort = MAIN_PORT;
       instanceId = 'main';
 
-      // Check if main instance is running, launch if needed
-      if (!(await isPortListening(targetPort))) {
-        console.log(`Main instance not running, launching ${instanceId}...`);
+      // Check if container image is outdated (fast cached check - no Docker API)
+      const isOutdatedDefault =
+        containerManager.isContainerOutdatedCached(instanceId);
+      const isListeningDefault = await isPortListening(targetPort);
+
+      // If outdated or not running, need to launch/relaunch
+      if (isOutdatedDefault || !isListeningDefault) {
+        if (isOutdatedDefault) {
+          console.log(
+            `Instance ${instanceId.substring(0, 8)} using outdated image, recreating...`
+          );
+        } else {
+          console.log(`Main instance not running, launching ${instanceId}...`);
+        }
 
         // Launch async (don't await)
         launchInstance(instanceId, null, targetPort).catch((err) => {
@@ -1522,6 +1566,21 @@ server.listen(PROXY_PORT, PROXY_HOST, async () => {
       },
       60 * 60 * 1000
     ); // 1 hour
+
+    // Check for outdated container images every 2 minutes
+    // This runs in background to avoid Docker API calls on hot request path
+    setInterval(
+      async () => {
+        await containerManager.checkAllContainersForOutdatedImages();
+      },
+      2 * 60 * 1000
+    ); // 2 minutes
+
+    // Run initial image check after 10 seconds (let containers settle first)
+    setTimeout(async () => {
+      console.log('[IMAGE-CHECK] Running initial container image check...');
+      await containerManager.checkAllContainersForOutdatedImages();
+    }, 10000);
 
     console.log('Scheduled cleanup tasks registered');
   }
