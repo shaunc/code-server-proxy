@@ -1,0 +1,46 @@
+#!/usr/bin/with-contenv bash
+# Setup Kilo Code global rules and configuration
+# Creates symlink from /config/.kilocode to host's ~/.kilocode
+
+set -e
+
+echo "[init-kilocode] Setting up Kilo Code configuration..."
+
+# Source directory on host (mounted via /home/shauncutts)
+KILOCODE_SOURCE="/home/shauncutts/.kilocode"
+
+# Target in config volume
+KILOCODE_TARGET="/config/.kilocode"
+
+# Check if source exists on host
+if [ ! -d "$KILOCODE_SOURCE" ]; then
+    echo "[init-kilocode] WARNING: $KILOCODE_SOURCE not found on host"
+    echo "[init-kilocode] Kilo Code global rules will not be available"
+    exit 0
+fi
+
+# If target is already a symlink pointing to the right place, nothing to do
+if [ -L "$KILOCODE_TARGET" ] && [ "$(readlink -f "$KILOCODE_TARGET")" = "$KILOCODE_SOURCE" ]; then
+    echo "[init-kilocode] Kilo Code symlink already correctly configured"
+    exit 0
+fi
+
+# Remove target if it exists but is not the correct symlink
+if [ -e "$KILOCODE_TARGET" ]; then
+    echo "[init-kilocode] Removing existing $KILOCODE_TARGET"
+    rm -rf "$KILOCODE_TARGET"
+fi
+
+# Create symlink
+echo "[init-kilocode] Creating symlink: $KILOCODE_TARGET -> $KILOCODE_SOURCE"
+s6-setuidgid abc ln -sf "$KILOCODE_SOURCE" "$KILOCODE_TARGET"
+
+# Verify rules directory
+if [ -d "$KILOCODE_TARGET/rules" ]; then
+    RULES_COUNT=$(find "$KILOCODE_TARGET/rules" -type f -name "*.md" | wc -l)
+    echo "[init-kilocode] Found $RULES_COUNT global rule(s) in $KILOCODE_TARGET/rules"
+else
+    echo "[init-kilocode] WARNING: No rules directory found at $KILOCODE_TARGET/rules"
+fi
+
+echo "[init-kilocode] Kilo Code configuration setup complete"

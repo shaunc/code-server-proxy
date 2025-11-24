@@ -1352,6 +1352,51 @@ The `/usr/local/bin/claude` wrapper provides:
    - CUDA, compiler paths, and other tool-specific variables available
    - Works for all host command execution (claude, sh-host-wrapper, host-bash)
 
+6. **Global Rules Integration**
+   - Kilo Code global rules from `~/.kilocode/rules/` available in all containers
+   - Symlinked to `/config/.kilocode` for consistent access
+   - Rules, workflows, and CLI tools automatically available
+
+### Kilo Code Global Rules Setup
+
+All containers have access to global Kilo Code rules stored on the host at `~/.kilocode/`.
+
+**Container Setup** (automatic via init script):
+
+- `/config/.kilocode` → symlink to `/home/shauncutts/.kilocode`
+- Global rules accessible at `/config/.kilocode/rules/`
+- Workflows accessible at `/config/.kilocode/workflows/`
+- CLI tools accessible at `/config/.kilocode/cli/`
+
+**Host Setup** (`~/.kilocode/` structure):
+
+```
+~/.kilocode/
+├── rules/           # Global rules (*.md files)
+│   ├── DRY.md
+│   ├── No placeholders.md
+│   └── ...
+├── workflows/       # Reusable workflows
+└── cli/            # CLI tools and scripts
+```
+
+**Verification**:
+
+```bash
+# From container terminal
+ls -la /config/.kilocode
+ls /config/.kilocode/rules/
+
+# View a specific rule
+cat /config/.kilocode/rules/DRY.md
+```
+
+**Adding New Rules**:
+
+1. Add rule file to `~/.kilocode/rules/` on host machine
+2. Rules immediately available in all containers (via symlink)
+3. No container restart required
+
 ### Shell Environment Setup
 
 All commands executed on the host automatically source `~/.shrc` to ensure tool environments (CUDA, compilers, etc.) are available.

@@ -89,11 +89,13 @@ COPY root/etc/cont-init.d/92-sync-secrets /etc/cont-init.d/92-sync-secrets
 COPY root/etc/cont-init.d/93-setup-auto-ssh /etc/cont-init.d/93-setup-auto-ssh
 COPY root/etc/cont-init.d/94-sync-host-keyring /etc/cont-init.d/94-sync-host-keyring
 COPY root/etc/cont-init.d/95-sync-gitconfig /etc/cont-init.d/95-sync-gitconfig
+COPY root/etc/cont-init.d/96-setup-kilocode /etc/cont-init.d/96-setup-kilocode
 RUN chmod +x /etc/cont-init.d/91-gnome-keyring \
     && chmod +x /etc/cont-init.d/92-sync-secrets \
     && chmod +x /etc/cont-init.d/93-setup-auto-ssh \
     && chmod +x /etc/cont-init.d/94-sync-host-keyring \
-    && chmod +x /etc/cont-init.d/95-sync-gitconfig
+    && chmod +x /etc/cont-init.d/95-sync-gitconfig \
+    && chmod +x /etc/cont-init.d/96-setup-kilocode
 
 # Set SSH agent socket path (host agent is mounted to this location)
 ENV SSH_AUTH_SOCK=/ssh-agent/socket
