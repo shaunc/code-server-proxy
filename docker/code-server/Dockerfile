@@ -107,5 +107,19 @@ ENV GNOME_KEYRING_CONTROL=/config/.cache/keyring-control
 # Create symlink for node (bundled with code-server) so extensions like Pyright can find it
 RUN ln -sf /app/code-server/lib/node /usr/local/bin/node
 
+# Install 'code' command for opening files in the running code-server instance
+COPY root/usr/local/bin/code /usr/local/bin/code
+RUN chmod +x /usr/local/bin/code
+
+# Install patch script for Kilo Code opus 4.5 support
+# Run manually after Kilo Code updates: patch-kilocode-opus45 && restart-container
+COPY root/usr/local/bin/patch-kilocode-opus45 /usr/local/bin/patch-kilocode-opus45
+RUN chmod +x /usr/local/bin/patch-kilocode-opus45
+
+# Add /config/bin to PATH for user scripts (restart-container, etc.)
+RUN echo '' >> /etc/bash.bashrc && \
+    echo '# Add /config/bin to PATH for user scripts' >> /etc/bash.bashrc && \
+    echo 'export PATH="/config/bin:$PATH"' >> /etc/bash.bashrc
+
 # Expose code-server port
 EXPOSE 8443

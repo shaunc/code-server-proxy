@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+#
+# Wrapper to open files in the running code-server instance
+# Uses code-server's -r flag to open in existing browser window
+#
+
+# Use code-server with -r (reuse window) flag to open in existing instance
+exec /app/code-server/bin/code-server -r "$@"

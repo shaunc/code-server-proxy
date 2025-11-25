@@ -959,6 +959,62 @@ systemctl --user restart code-server-proxy.service
 /path/to/scripts/workspace-idle-monitor.sh
 ```
 
+### Opening Files in IDE from Workspace Shells
+
+The `code` command is available in workspace shells to open files in the running code-server IDE instance without spawning a new server.
+
+#### Usage
+
+```bash
+# Open a file in the IDE
+code myfile.txt
+
+# Open a directory
+code /path/to/project
+
+# Open multiple files
+code file1.py file2.py
+
+# Open at a specific line
+code --goto myfile.py:25
+
+# Open in diff mode
+code --diff file1.txt file2.txt
+
+# Wait for file to be closed before returning (useful in EDITOR)
+code --wait myfile.txt
+```
+
+#### Environment Variables
+
+The `EDITOR` environment variable is automatically set in workspace shells:
+
+```bash
+# Container terminals (via bashrc detection)
+export EDITOR="code --reuse-window --wait"
+export VISUAL="code --reuse-window --wait"
+```
+
+This allows commands that use `$EDITOR` to open files in the IDE:
+
+```bash
+# Git commit uses code as editor
+git commit  # Opens commit message in IDE
+
+# Edit a file with default editor
+$EDITOR myfile.txt
+```
+
+#### Technical Details
+
+The `code` command uses code-server's `-r` (reuse window) flag to open files in the existing browser instance:
+
+- **Implementation**: `/usr/local/bin/code` → `/app/code-server/bin/code-server -r "$@"`
+- **Behavior**: Opens files/folders in the currently active code-server browser window
+- **Works from**: Both integrated terminal and SSH terminals
+
+**Note**: Unlike running `code-server` directly (which starts a new server), the `code -r` command connects to the existing server instance and opens files in your browser window.
+
 ### Common Paths
 
 ```bash
