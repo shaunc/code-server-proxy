@@ -337,23 +337,105 @@ async function createContainer(instanceId, workspacePath, port) {
     console.log(`  Created instance User directory: ${instanceUserDir}`);
   }
 
-  // Bootstrap settings files from shared User directory if missing
-  // This ensures new instances AND existing instances with missing settings
-  // get the shared settings. The settings-sync.js service handles ongoing propagation.
+  // Create symlinks to shared settings files
+  // All instances share the same settings via symlinks to the shared directory.
+  // This ensures settings changes in any workspace are immediately visible in all others.
+  // PUID/PGID ensures container user matches host user, so symlinks work correctly.
   const sharedUserDir = path.join(INSTANCES_BASE_PATH, '..', 'shared', 'User');
-  const filesToBootstrap = ['settings.json', 'keybindings.json'];
+  const filesToSymlink = ['settings.json', 'keybindings.json'];
 
-  for (const fileName of filesToBootstrap) {
-    const sourcePath = path.join(sharedUserDir, fileName);
-    const targetPath = path.join(instanceUserDir, fileName);
+  for (const fileName of filesToSymlink) {
+    const sharedPath = path.join(sharedUserDir, fileName);
+    const instancePath = path.join(instanceUserDir, fileName);
 
-    if (fs.existsSync(sourcePath) && !fs.existsSync(targetPath)) {
-      try {
-        fs.copyFileSync(sourcePath, targetPath);
-        console.log(`  Bootstrapped ${fileName} from shared settings`);
-      } catch (err) {
+    // Skip if shared file doesn't exist
+    if (!fs.existsSync(sharedPath)) {
+      continue;
+    }
+
+    try {
+      const stats = fs.lstatSync(instancePath);
+      if (stats.isSymbolicLink()) {
+        // Already a symlink - verify it points to the right place
+        const target = fs.readlinkSync(instancePath);
+        if (target === sharedPath) {
+          continue; // Correct symlink exists
+        }
+        // Wrong target - remove and recreate
+        fs.unlinkSync(instancePath);
+      } else {
+        // Regular file exists - remove it to replace with symlink
+        fs.unlinkSync(instancePath);
+        console.log(`  Replacing ${fileName} with symlink to shared`);
+      }
+    } catch (err) {
+      if (err.code !== 'ENOENT') {
+        console.warn(`  Warning: Error checking ${fileName}: ${err.message}`);
+        continue;
+      }
+      // File doesn't exist - will create symlink below
+    }
+
+    try {
+      fs.symlinkSync(sharedPath, instancePath);
+      console.log(`  Created symlink: ${fileName} -> shared`);
+    } catch (err) {
+      console.warn(
+        `  Warning: Failed to create symlink for ${fileName}: ${err.message}`
+      );
+    }
+  }
+
+  // Create symlink for Kilo Code settings directory
+  // This shares API keys, model preferences, etc. across all workspaces
+  const sharedKiloCodeSettings = path.join(
+    sharedUserDir,
+    'globalStorage/kilocode.kilo-code/settings'
+  );
+  const instanceGlobalStorage = path.join(instanceUserDir, 'globalStorage');
+  const instanceKiloCodeDir = path.join(
+    instanceGlobalStorage,
+    'kilocode.kilo-code'
+  );
+  const instanceKiloCodeSettings = path.join(instanceKiloCodeDir, 'settings');
+
+  if (fs.existsSync(sharedKiloCodeSettings)) {
+    // Ensure parent directories exist
+    if (!fs.existsSync(instanceKiloCodeDir)) {
+      fs.mkdirSync(instanceKiloCodeDir, { recursive: true });
+    }
+
+    try {
+      const stats = fs.lstatSync(instanceKiloCodeSettings);
+      if (stats.isSymbolicLink()) {
+        const target = fs.readlinkSync(instanceKiloCodeSettings);
+        if (target === sharedKiloCodeSettings) {
+          // Correct symlink exists
+        } else {
+          fs.unlinkSync(instanceKiloCodeSettings);
+          fs.symlinkSync(sharedKiloCodeSettings, instanceKiloCodeSettings);
+          console.log(`  Updated Kilo Code settings symlink`);
+        }
+      } else if (stats.isDirectory()) {
+        // Directory exists - remove and replace with symlink
+        fs.rmSync(instanceKiloCodeSettings, { recursive: true });
+        fs.symlinkSync(sharedKiloCodeSettings, instanceKiloCodeSettings);
+        console.log(`  Replaced Kilo Code settings dir with symlink to shared`);
+      }
+    } catch (err) {
+      if (err.code === 'ENOENT') {
+        // Doesn't exist - create symlink
+        try {
+          fs.symlinkSync(sharedKiloCodeSettings, instanceKiloCodeSettings);
+          console.log(`  Created symlink: Kilo Code settings -> shared`);
+        } catch (symlinkErr) {
+          console.warn(
+            `  Warning: Failed to create Kilo Code settings symlink: ${symlinkErr.message}`
+          );
+        }
+      } else {
         console.warn(
-          `  Warning: Failed to bootstrap ${fileName}: ${err.message}`
+          `  Warning: Error checking Kilo Code settings: ${err.message}`
         );
       }
     }
@@ -1563,6 +1645,40 @@ async function cleanupOrphanedContainers(thresholdDays = IDLE_THRESHOLD_DAYS) {
 }
 
 /**
+ * Get the actual host port a container is bound to
+ * This is needed when registry gets out of sync with container's actual port binding
+ * @param {string} instanceId - Instance ID
+ * @returns {Promise<number|null>} Host port or null if not found
+ */
+async function getContainerPort(instanceId) {
+  const containerName = `code-server-${instanceId}`;
+
+  try {
+    const container = docker.getContainer(containerName);
+    const info = await container.inspect();
+
+    const portBindings = info.HostConfig?.PortBindings?.['8443/tcp'];
+    if (portBindings && portBindings.length > 0) {
+      const hostPort = parseInt(portBindings[0].HostPort, 10);
+      if (!isNaN(hostPort)) {
+        return hostPort;
+      }
+    }
+
+    return null;
+  } catch (error) {
+    if (error.statusCode === 404) {
+      return null;
+    }
+    console.error(
+      `Error getting container port for ${containerName}:`,
+      error.message
+    );
+    return null;
+  }
+}
+
+/**
  * Get activity tracker reference for external use
  * @returns {Object} Activity tracker instance
  */
@@ -1584,6 +1700,7 @@ module.exports = {
   isContainerOutdatedCached,
   clearOutdatedCache,
   getContainerLogs,
+  getContainerPort,
   createConfigVolume,
   ensureSharedExtensionsVolume,
   removeVolumes,

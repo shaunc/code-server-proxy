@@ -266,25 +266,73 @@ async function validatePortAvailability(port) {
 
 /**
  * Clean up stale entries in registry
+ * Checks if registry port is listening. If not, checks if container exists with
+ * a different port (can happen after port collision and container restart).
  * @param {Object} registry - Registry object
- * @returns {Promise<Object>} Cleaned registry
+ * @returns {Promise<{registry: Object, modified: boolean}>} Cleaned registry and modification flag
  */
 async function cleanupStaleEntries(registry) {
   const cleaned = { workspaces: {}, ports: {} };
+  let modified = false;
 
   for (const [workspacePath, entry] of Object.entries(registry.workspaces)) {
-    const port = entry.currentPort;
-    if (await validatePortAvailability(port)) {
+    const registryPort = entry.currentPort;
+    const instanceId = entry.instanceId;
+
+    if (await validatePortAvailability(registryPort)) {
+      // Registry port is listening, keep the entry unchanged
       cleaned.workspaces[workspacePath] = entry;
-      cleaned.ports[port] = registry.ports[port];
+      cleaned.ports[registryPort] = registry.ports[registryPort];
     } else {
-      console.log(
-        `Removing stale registry entry for ${workspacePath} (port ${port} not listening)`
-      );
+      // Registry port not listening - check if container exists with different port
+      // This happens when port collision occurred and container was created on next
+      // available port, but registry wasn't updated (or got stale and re-allocated)
+      const actualPort = await containerManager.getContainerPort(instanceId);
+
+      if (actualPort && actualPort !== registryPort) {
+        // Container exists on different port - update registry with actual port
+        console.log(
+          `Registry port mismatch for ${workspacePath}: ` +
+            `registry=${registryPort}, container=${actualPort}. Updating registry.`
+        );
+        modified = true;
+
+        // Update entry with correct port (whether listening or not)
+        const updatedEntry = { ...entry, currentPort: actualPort };
+        cleaned.workspaces[workspacePath] = updatedEntry;
+        cleaned.ports[actualPort] = {
+          workspacePath,
+          instanceId,
+        };
+
+        if (!(await validatePortAvailability(actualPort))) {
+          console.log(
+            `Container ${instanceId.substring(0, 8)} exists on port ${actualPort} ` +
+              `but not listening (stopped?). Registry updated.`
+          );
+        }
+      } else if (actualPort === null) {
+        // No container exists, safe to remove stale entry
+        console.log(
+          `Removing stale registry entry for ${workspacePath} ` +
+            `(port ${registryPort} not listening, no container found)`
+        );
+        modified = true;
+        // Don't add to cleaned - entry is removed
+      } else {
+        // actualPort === registryPort but not listening (container stopped)
+        // Keep the entry so container can be restarted
+        cleaned.workspaces[workspacePath] = entry;
+        cleaned.ports[registryPort] = registry.ports[registryPort];
+        console.log(
+          `Keeping registry entry for ${workspacePath} ` +
+            `(port ${registryPort} not listening, container may be stopped)`
+        );
+      }
     }
   }
 
-  return cleaned;
+  return { registry: cleaned, modified };
 }
 
 /**
@@ -326,9 +374,15 @@ function allocatePort(workspacePath, registry) {
  * @returns {Promise<{port: number, instanceId: string}>} Port and instance ID
  */
 async function getOrAllocatePort(workspacePath) {
-  let registry = loadRegistry();
+  const originalRegistry = loadRegistry();
 
-  registry = await cleanupStaleEntries(registry);
+  // Cleanup may update ports if containers exist on different ports than registry
+  const { registry, modified } = await cleanupStaleEntries(originalRegistry);
+
+  // Save registry after cleanup only if it was modified (port corrections, removals)
+  if (modified) {
+    saveRegistry(registry);
+  }
 
   if (registry.workspaces[workspacePath]) {
     const entry = registry.workspaces[workspacePath];
@@ -491,6 +545,9 @@ async function launchInstanceUnsafe(instanceId, workspacePath, port) {
           console.log(
             `Container ${instanceId} is using outdated image, recreating...`
           );
+          // Clear outdated cache immediately to prevent other requests from
+          // triggering concurrent recreation attempts during the slow stop/remove
+          containerManager.clearOutdatedCache(instanceId);
           await containerManager.stopContainer(instanceId);
           await containerManager.removeContainer(instanceId);
           // Container removed, will be recreated below
