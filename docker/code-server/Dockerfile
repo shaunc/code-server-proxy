@@ -111,11 +111,6 @@ RUN ln -sf /app/code-server/lib/node /usr/local/bin/node
 COPY root/usr/local/bin/code /usr/local/bin/code
 RUN chmod +x /usr/local/bin/code
 
-# Install patch script for Kilo Code opus 4.5 support
-# Run manually after Kilo Code updates: patch-kilocode-opus45 && restart-container
-COPY root/usr/local/bin/patch-kilocode-opus45 /usr/local/bin/patch-kilocode-opus45
-RUN chmod +x /usr/local/bin/patch-kilocode-opus45
-
 # Add /config/bin to PATH for user scripts (restart-container, etc.)
 RUN echo '' >> /etc/bash.bashrc && \
     echo '# Add /config/bin to PATH for user scripts' >> /etc/bash.bashrc && \
