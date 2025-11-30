@@ -44,7 +44,24 @@ if [ "$1" = "-c" ] && [ -n "$2" ]; then
     [ -n "$WORKSPACE_PATH" ] && cd_prefix="cd '$WORKSPACE_PATH' 2>/dev/null; "
     # Escape single quotes in command for bash -l -c '...'
     escaped_cmd=$(printf '%s' "$2" | sed "s/'/'\\\\''/g")
-    exec ssh "$HOST_USER@host.docker.internal" "bash -l -c '${shrc_source}${cd_prefix}${escaped_cmd}'"
+
+    # Try SSH with timeout. If it fails (connection error, not command error),
+    # fall back to local execution to prevent code-server hangs.
+    # Use -o ControlMaster=no to avoid stale control socket issues.
+    ssh -o ConnectTimeout=5 -o ControlMaster=no -o BatchMode=yes \
+        "$HOST_USER@host.docker.internal" \
+        "bash -l -c '${shrc_source}${cd_prefix}${escaped_cmd}'"
+    ssh_exit=$?
+
+    # Exit codes 255 = SSH connection error, 127 = command not found on remote
+    # For connection errors, fall back to local execution
+    if [ $ssh_exit -eq 255 ]; then
+        # SSH connection failed - run locally as fallback
+        exec /bin/dash.real "$@"
+    fi
+
+    # For other exit codes (including 127 from remote), return as-is
+    exit $ssh_exit
 fi
 
 # Otherwise run locally

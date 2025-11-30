@@ -1,0 +1,40 @@
+{
+  "mcpServers": {
+    "sequential-thinking": {
+      "command": "/config/data/User/mcp-ssh-wrapper.sh",
+      "args": ["npx", "-y", "@modelcontextprotocol/server-sequential-thinking"],
+      "alwaysAllow": ["sequential-thinking", "sequentialthinking"]
+    },
+    "memory": {
+      "command": "/config/data/User/mcp-ssh-wrapper.sh",
+      "args": ["/home/shauncutts/.local/bin/mcp-memory-wrapper"],
+      "alwaysAllow": [
+        "store_memory",
+        "retrieve_memory",
+        "recall_memory",
+        "search_memories",
+        "search_by_tag",
+        "delete_memory",
+        "list_memories",
+        "optimize_memory",
+        "backup_memory",
+        "health_check",
+        "check_database_health",
+        "dashboard_check_health",
+        "update_memory_metadata",
+        "ingest_document"
+      ]
+    },
+    "aws": {
+      "command": "/config/data/User/mcp-ssh-wrapper.sh",
+      "args": [
+        "npm",
+        "--silent",
+        "--prefix",
+        "/home/shauncutts/src/other/aws-mcp",
+        "start"
+      ],
+      "alwaysAllow": ["select-profile", "run-aws-code"]
+    }
+  }
+}
