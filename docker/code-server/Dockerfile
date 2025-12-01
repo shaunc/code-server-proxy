@@ -116,5 +116,10 @@ RUN echo '' >> /etc/bash.bashrc && \
     echo '# Add /config/bin to PATH for user scripts' >> /etc/bash.bashrc && \
     echo 'export PATH="/config/bin:$PATH"' >> /etc/bash.bashrc
 
+# Fix user shell for VSCode environment resolution
+# The linuxserver base image sets shell to /bin/false which causes
+# "Unable to resolve your shell environment" errors (exit code 127)
+RUN sed -i 's|/config:/bin/false|/config:/bin/bash|' /etc/passwd
+
 # Expose code-server port
 EXPOSE 8443
