@@ -1373,6 +1373,15 @@ async function handleRequest(req, res) {
     const target = `http://127.0.0.1:${targetPort}`;
     console.log(`[PROXY] Proxying ${req.method} ${req.url} -> ${target}`);
     console.log(`[PROXY] Instance: ${instanceId}, Port: ${targetPort}`);
+
+    // Strip Accept-Encoding for HTML requests to avoid compressed responses
+    // that we can't modify for script injection
+    const acceptHeader = req.headers['accept'] || '';
+    if (acceptHeader.includes('text/html')) {
+      delete req.headers['accept-encoding'];
+      console.log('[PROXY] Stripped Accept-Encoding for HTML request');
+    }
+
     console.log('='.repeat(80));
     proxy.web(req, res, { target });
   } catch (error) {
