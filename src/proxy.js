@@ -266,7 +266,9 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
       let body = Buffer.concat(chunks).toString('utf8');
       body = injectReconnectHelper(body);
 
-      // Update content-length for modified body
+      // Update headers for buffered response
+      // Remove chunked encoding since we're sending complete body
+      delete headers['transfer-encoding'];
       delete headers['content-length'];
       headers['content-length'] = Buffer.byteLength(body);
 
