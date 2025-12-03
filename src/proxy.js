@@ -29,6 +29,17 @@ const activityTracker = require('./activity-tracker');
 // Settings sync service (only in Docker mode)
 const settingsSync = USE_DOCKER ? require('./settings-sync') : null;
 
+// Load reconnect-helper script for injection into HTML pages
+const RECONNECT_HELPER_PATH = path.join(__dirname, 'reconnect-helper.js');
+const RECONNECT_HELPER_SCRIPT = fs.existsSync(RECONNECT_HELPER_PATH)
+  ? fs.readFileSync(RECONNECT_HELPER_PATH, 'utf8')
+  : null;
+if (RECONNECT_HELPER_SCRIPT) {
+  console.log('[INIT] Loaded reconnect-helper.js for HTML injection');
+} else {
+  console.warn('[INIT] reconnect-helper.js not found, auto-reload disabled');
+}
+
 // Configuration
 const PROXY_PORT = 8083;
 const PROXY_HOST = '127.0.0.1';
@@ -142,9 +153,10 @@ function cleanupExpiredSessions() {
 // Cleanup expired sessions every hour
 setInterval(cleanupExpiredSessions, 60 * 60 * 1000);
 
-// Create HTTP proxy
+// Create HTTP proxy with selfHandleResponse for HTML injection
 const proxy = httpProxy.createProxyServer({
   ws: true,
+  selfHandleResponse: true,
 });
 
 // Handle proxy errors
@@ -160,22 +172,49 @@ proxy.on('error', (err, req, res) => {
   }
 });
 
-// Intercept proxy responses to rewrite redirect Location headers and inject session cookies
+/**
+ * Inject reconnect-helper script into HTML content
+ * @param {string} html - Original HTML content
+ * @returns {string} Modified HTML with script injected
+ */
+function injectReconnectHelper(html) {
+  if (!RECONNECT_HELPER_SCRIPT) {
+    return html;
+  }
+
+  // Inject script tag before </body> or </html>, or at end
+  const scriptTag = `<script src="/_proxy/reconnect-helper.js"></script>`;
+
+  if (html.includes('</body>')) {
+    return html.replace('</body>', `${scriptTag}</body>`);
+  } else if (html.includes('</html>')) {
+    return html.replace('</html>', `${scriptTag}</html>`);
+  } else {
+    return html + scriptTag;
+  }
+}
+
+// Intercept proxy responses for session cookies, redirects, and HTML injection
 proxy.on('proxyRes', (proxyRes, req, res) => {
   const statusCode = proxyRes.statusCode;
+  const contentType = proxyRes.headers['content-type'] || '';
+  const isHtml = contentType.includes('text/html');
+
+  // Build response headers
+  const headers = { ...proxyRes.headers };
 
   // Inject session cookie if this is a new session
   if (req._sessionId) {
     const cookieValue = `${SESSION_COOKIE_NAME}=${req._sessionId}; HttpOnly; Path=/; Max-Age=${SESSION_TTL / 1000}; SameSite=Lax`;
 
     // Add Set-Cookie header (preserve existing cookies if any)
-    const existingCookies = proxyRes.headers['set-cookie'] || [];
+    const existingCookies = headers['set-cookie'] || [];
     if (Array.isArray(existingCookies)) {
-      proxyRes.headers['set-cookie'] = [...existingCookies, cookieValue];
+      headers['set-cookie'] = [...existingCookies, cookieValue];
     } else if (existingCookies) {
-      proxyRes.headers['set-cookie'] = [existingCookies, cookieValue];
+      headers['set-cookie'] = [existingCookies, cookieValue];
     } else {
-      proxyRes.headers['set-cookie'] = [cookieValue];
+      headers['set-cookie'] = [cookieValue];
     }
 
     console.log(
@@ -183,9 +222,9 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
     );
   }
 
-  // Only intercept 3xx redirects
-  if (statusCode >= 300 && statusCode < 400 && proxyRes.headers.location) {
-    const location = proxyRes.headers.location;
+  // Handle 3xx redirects
+  if (statusCode >= 300 && statusCode < 400 && headers.location) {
+    const location = headers.location;
 
     try {
       // Parse the redirect location
@@ -209,10 +248,35 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
 
       console.log(`[REDIRECT] ${location} -> ${newLocation}`);
 
-      proxyRes.headers.location = newLocation;
+      headers.location = newLocation;
     } catch (error) {
       console.error('Error rewriting redirect location:', error.message);
     }
+  }
+
+  // For HTML responses, buffer and inject reconnect-helper script
+  if (isHtml && RECONNECT_HELPER_SCRIPT) {
+    const chunks = [];
+
+    proxyRes.on('data', (chunk) => {
+      chunks.push(chunk);
+    });
+
+    proxyRes.on('end', () => {
+      let body = Buffer.concat(chunks).toString('utf8');
+      body = injectReconnectHelper(body);
+
+      // Update content-length for modified body
+      delete headers['content-length'];
+      headers['content-length'] = Buffer.byteLength(body);
+
+      res.writeHead(statusCode, headers);
+      res.end(body);
+    });
+  } else {
+    // For non-HTML responses, just pipe through
+    res.writeHead(statusCode, headers);
+    proxyRes.pipe(res);
   }
 });
 
@@ -1505,8 +1569,37 @@ if (!fs.existsSync(mainMetadataPath)) {
   fs.writeFileSync(mainMetadataPath, JSON.stringify(mainMetadata, null, 2));
 }
 
+/**
+ * Handle proxy internal endpoints (/_proxy/*)
+ * @param {http.IncomingMessage} req - Request object
+ * @param {http.ServerResponse} res - Response object
+ * @returns {boolean} True if request was handled
+ */
+function handleProxyEndpoint(req, res) {
+  // Serve reconnect-helper.js
+  if (req.url === '/_proxy/reconnect-helper.js') {
+    if (RECONNECT_HELPER_SCRIPT) {
+      res.writeHead(200, {
+        'Content-Type': 'application/javascript',
+        'Cache-Control': 'public, max-age=3600',
+      });
+      res.end(RECONNECT_HELPER_SCRIPT);
+    } else {
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      res.end('Not found');
+    }
+    return true;
+  }
+  return false;
+}
+
 // Create HTTP server with activity tracking endpoint support
 const server = http.createServer((req, res) => {
+  // Check for proxy internal endpoints first
+  if (handleProxyEndpoint(req, res)) {
+    return;
+  }
+
   // Check if this is an activity tracking API request
   if (handleActivityEndpoint(req, res)) {
     return;
