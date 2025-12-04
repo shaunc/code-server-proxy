@@ -46,7 +46,7 @@ const PROXY_HOST = '127.0.0.1';
 const MAIN_PORT = 8100;
 const WORKSPACE_PORT_MIN = 8101;
 const WORKSPACE_PORT_MAX = 8199;
-const MAX_CONCURRENT_INSTANCES = 30;
+const MAX_CONCURRENT_INSTANCES = 36;
 const MAX_PROBE_ATTEMPTS = 20;
 const WORKSPACES_DIR = path.join(process.env.HOME, '.code-workspaces');
 const BASE_DIR = path.join(WORKSPACES_DIR, 'instances');
@@ -484,6 +484,100 @@ async function getOrAllocatePort(workspacePath) {
 async function countActiveInstances() {
   const registry = loadRegistry();
   return Object.keys(registry.workspaces).length;
+}
+
+/**
+ * Find the least recently active instance
+ * @returns {{workspacePath: string, instanceId: string, lastActivity: number}|null}
+ */
+function findLeastActiveInstance() {
+  const registry = loadRegistry();
+  const workspaces = Object.entries(registry.workspaces);
+
+  if (workspaces.length === 0) {
+    return null;
+  }
+
+  let leastActive = null;
+  let oldestActivity = Infinity;
+
+  for (const [workspacePath, entry] of workspaces) {
+    const lastActivity = activityTracker.getLastActivity(entry.instanceId);
+    // If no activity recorded, use allocation time from registry (very old)
+    const activityTime = lastActivity || 0;
+
+    if (activityTime < oldestActivity) {
+      oldestActivity = activityTime;
+      leastActive = {
+        workspacePath,
+        instanceId: entry.instanceId,
+        port: entry.currentPort,
+        lastActivity: activityTime,
+      };
+    }
+  }
+
+  return leastActive;
+}
+
+/**
+ * Evict the least recently active instance to make room for a new one
+ * @returns {Promise<boolean>} True if an instance was evicted
+ */
+async function evictLeastActiveInstance() {
+  const target = findLeastActiveInstance();
+
+  if (!target) {
+    console.log('[EVICTION] No instances to evict');
+    return false;
+  }
+
+  const idleSeconds = target.lastActivity
+    ? Math.floor((Date.now() - target.lastActivity) / 1000)
+    : 'unknown';
+  const idleDisplay =
+    idleSeconds === 'unknown'
+      ? 'unknown'
+      : idleSeconds > 86400
+        ? `${Math.floor(idleSeconds / 86400)}d`
+        : idleSeconds > 3600
+          ? `${Math.floor(idleSeconds / 3600)}h`
+          : `${idleSeconds}s`;
+
+  console.log(
+    `[EVICTION] Stopping least active instance: ${target.instanceId.substring(0, 8)} ` +
+      `(idle: ${idleDisplay}, workspace: ${target.workspacePath})`
+  );
+
+  try {
+    // Stop the container (Docker mode) or service (systemd mode)
+    if (USE_DOCKER) {
+      await containerManager.stopContainer(target.instanceId);
+    } else {
+      const serviceName = `code-server-workspace@${target.instanceId}.service`;
+      await execAsync(`systemctl --user stop ${serviceName}`);
+    }
+
+    // Remove from registry
+    const registry = loadRegistry();
+    delete registry.workspaces[target.workspacePath];
+    delete registry.ports[target.port];
+    saveRegistry(registry);
+
+    // Remove from activity tracker
+    activityTracker.removeWorkspace(target.instanceId);
+
+    console.log(
+      `[EVICTION] Successfully evicted instance ${target.instanceId.substring(0, 8)}`
+    );
+    return true;
+  } catch (error) {
+    console.error(
+      `[EVICTION] Failed to evict instance ${target.instanceId.substring(0, 8)}:`,
+      error.message
+    );
+    return false;
+  }
 }
 
 /**
@@ -1128,18 +1222,25 @@ async function handleRequest(req, res) {
         return;
       }
 
-      // Check instance limit
+      // Check instance limit - evict least active if at capacity
       const activeCount = await countActiveInstances();
       const registry = loadRegistry();
       const isExisting = !!registry.workspaces[workspacePath];
 
       if (!isExisting && activeCount >= MAX_CONCURRENT_INSTANCES) {
-        res.writeHead(503, { 'Content-Type': 'text/plain' });
-        res.end(
-          `Service Unavailable: Maximum concurrent instances (${MAX_CONCURRENT_INSTANCES}) reached. ` +
-            'Please stop unused workspace instances before opening new ones.'
+        console.log(
+          `[LIMIT] At capacity (${activeCount}/${MAX_CONCURRENT_INSTANCES}), ` +
+            'evicting least active instance...'
         );
-        return;
+        const evicted = await evictLeastActiveInstance();
+        if (!evicted) {
+          res.writeHead(503, { 'Content-Type': 'text/plain' });
+          res.end(
+            `Service Unavailable: Maximum concurrent instances (${MAX_CONCURRENT_INSTANCES}) reached ` +
+              'and auto-eviction failed. Please stop unused workspace instances manually.'
+          );
+          return;
+        }
       }
 
       const { port, instanceId: allocatedId } =
@@ -1223,18 +1324,25 @@ async function handleRequest(req, res) {
         return;
       }
 
-      // Check instance limit
+      // Check instance limit - evict least active if at capacity
       const activeCount = await countActiveInstances();
       const registry = loadRegistry();
       const isExisting = !!registry.workspaces[workspacePath];
 
       if (!isExisting && activeCount >= MAX_CONCURRENT_INSTANCES) {
-        res.writeHead(503, { 'Content-Type': 'text/plain' });
-        res.end(
-          `Service Unavailable: Maximum concurrent instances (${MAX_CONCURRENT_INSTANCES}) reached. ` +
-            'Please stop unused workspace instances before opening new ones.'
+        console.log(
+          `[LIMIT] At capacity (${activeCount}/${MAX_CONCURRENT_INSTANCES}), ` +
+            'evicting least active instance...'
         );
-        return;
+        const evicted = await evictLeastActiveInstance();
+        if (!evicted) {
+          res.writeHead(503, { 'Content-Type': 'text/plain' });
+          res.end(
+            `Service Unavailable: Maximum concurrent instances (${MAX_CONCURRENT_INSTANCES}) reached ` +
+              'and auto-eviction failed. Please stop unused workspace instances manually.'
+          );
+          return;
+        }
       }
 
       const { port, instanceId: allocatedId } =
