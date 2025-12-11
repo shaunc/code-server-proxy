@@ -13,14 +13,28 @@
 
 echo "[auto-ssh-setup] Initializing auto-SSH configuration..."
 
-# Ensure /run/user/1001 exists for SSH ControlMaster socket
-# This directory is also used by D-Bus but may not exist yet
-if [ ! -d /run/user/1001 ]; then
-    echo "[auto-ssh-setup] Creating /run/user/1001 for SSH control socket..."
-    mkdir -p /run/user/1001
-    chown abc:abc /run/user/1001
-    chmod 700 /run/user/1001
+# Wait for abc user to have correct UID (PUID processing complete)
+# The linuxserver base image changes abc's UID from 911 to PUID during init
+echo "[auto-ssh-setup] Waiting for user abc to have correct UID..."
+for i in {1..30}; do
+    ABC_UID=$(id -u abc 2>/dev/null || echo "911")
+    if [ "$ABC_UID" != "911" ]; then
+        echo "[auto-ssh-setup] User abc has UID $ABC_UID"
+        break
+    fi
+    sleep 0.5
+done
+
+# Ensure /run/user/$ABC_UID exists for SSH ControlMaster socket
+# Use the actual abc UID which may be different from 1001
+RUN_USER_DIR="/run/user/$ABC_UID"
+if [ ! -d "$RUN_USER_DIR" ]; then
+    echo "[auto-ssh-setup] Creating $RUN_USER_DIR for SSH control socket..."
+    mkdir -p "$RUN_USER_DIR"
 fi
+# Always fix ownership in case it was created with wrong UID
+chown abc:abc "$RUN_USER_DIR"
+chmod 700 "$RUN_USER_DIR"
 
 # Wait for /config to be writable by abc user
 for i in {1..30}; do
