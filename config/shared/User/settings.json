@@ -185,6 +185,8 @@
   "diffEditor.hideUnchangedRegions.enabled": true,
   // Disable shell integration to prevent exit-on-error bug
   "terminal.integrated.shellIntegration.enabled": false,
+  // Disable Python terminal activation - host shell has its own environment setup
+  "python.terminal.activateEnvironment": false,
 
   // Terminal profiles for SSH host and container shells
   // Kilo Code uses the default terminal profile for command execution
@@ -199,5 +201,6 @@
       "icon": "terminal-bash"
     }
   },
-  "terminal.integrated.defaultProfile.linux": "Host Shell (SSH)"
+  "terminal.integrated.defaultProfile.linux": "Host Shell (SSH)",
+  "terminal.integrated.enableMultiLinePasteWarning": "never"
 }

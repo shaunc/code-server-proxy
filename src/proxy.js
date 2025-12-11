@@ -522,14 +522,14 @@ function findLeastActiveInstance() {
 
 /**
  * Evict the least recently active instance to make room for a new one
- * @returns {Promise<boolean>} True if an instance was evicted
+ * @returns {Promise<{success: boolean, target: Object|null, error: string|null}>}
  */
 async function evictLeastActiveInstance() {
   const target = findLeastActiveInstance();
 
   if (!target) {
     console.log('[EVICTION] No instances to evict');
-    return false;
+    return { success: false, target: null, error: 'No instances available' };
   }
 
   const idleSeconds = target.lastActivity
@@ -570,13 +570,13 @@ async function evictLeastActiveInstance() {
     console.log(
       `[EVICTION] Successfully evicted instance ${target.instanceId.substring(0, 8)}`
     );
-    return true;
+    return { success: true, target, error: null };
   } catch (error) {
     console.error(
       `[EVICTION] Failed to evict instance ${target.instanceId.substring(0, 8)}:`,
       error.message
     );
-    return false;
+    return { success: false, target, error: error.message };
   }
 }
 
@@ -1232,12 +1232,18 @@ async function handleRequest(req, res) {
           `[LIMIT] At capacity (${activeCount}/${MAX_CONCURRENT_INSTANCES}), ` +
             'evicting least active instance...'
         );
-        const evicted = await evictLeastActiveInstance();
-        if (!evicted) {
+        const evictResult = await evictLeastActiveInstance();
+        if (!evictResult.success) {
+          const targetInfo = evictResult.target
+            ? ` (tried: ${evictResult.target.instanceId.substring(0, 8)}, ` +
+              `workspace: ${evictResult.target.workspacePath})`
+            : '';
           res.writeHead(503, { 'Content-Type': 'text/plain' });
           res.end(
             `Service Unavailable: Maximum concurrent instances (${MAX_CONCURRENT_INSTANCES}) reached ` +
-              'and auto-eviction failed. Please stop unused workspace instances manually.'
+              `and auto-eviction failed${targetInfo}. ` +
+              `Error: ${evictResult.error || 'unknown'}. ` +
+              'Please stop unused workspace instances manually.'
           );
           return;
         }
@@ -1334,12 +1340,18 @@ async function handleRequest(req, res) {
           `[LIMIT] At capacity (${activeCount}/${MAX_CONCURRENT_INSTANCES}), ` +
             'evicting least active instance...'
         );
-        const evicted = await evictLeastActiveInstance();
-        if (!evicted) {
+        const evictResult = await evictLeastActiveInstance();
+        if (!evictResult.success) {
+          const targetInfo = evictResult.target
+            ? ` (tried: ${evictResult.target.instanceId.substring(0, 8)}, ` +
+              `workspace: ${evictResult.target.workspacePath})`
+            : '';
           res.writeHead(503, { 'Content-Type': 'text/plain' });
           res.end(
             `Service Unavailable: Maximum concurrent instances (${MAX_CONCURRENT_INSTANCES}) reached ` +
-              'and auto-eviction failed. Please stop unused workspace instances manually.'
+              `and auto-eviction failed${targetInfo}. ` +
+              `Error: ${evictResult.error || 'unknown'}. ` +
+              'Please stop unused workspace instances manually.'
           );
           return;
         }
