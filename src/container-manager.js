@@ -6,7 +6,7 @@
  * - Complete IPC namespace isolation (prevents terminal stealing)
  * - Terminal persistence via config volumes
  * - Shared extensions volume for disk efficiency
- * - In-container gnome-keyring for VSCode extension secrets
+ * - SSH agent forwarding from host
  */
 
 const Docker = require('dockerode');
@@ -103,9 +103,6 @@ const SHARED_EXTENSIONS_VOLUME =
 const WORKSPACE_VOLUMES_PATH =
   process.env.WORKSPACE_VOLUMES_PATH ||
   path.join(process.env.HOME, '.code-workspaces/volumes');
-const HOST_SECRETS_PATH =
-  process.env.HOST_SECRETS_PATH ||
-  path.join(process.env.HOME, '.local/share/code-server/User/globalStorage');
 const INSTANCES_BASE_PATH =
   process.env.INSTANCES_BASE_PATH ||
   path.join(process.env.HOME, '.code-workspaces/instances');
@@ -293,30 +290,8 @@ async function createContainer(instanceId, workspacePath, port) {
     binds.push('/data/sda:/data/sda:rw');
   }
 
-  // Add host secrets mount if available
-  if (fs.existsSync(HOST_SECRETS_PATH)) {
-    binds.push(`${HOST_SECRETS_PATH}:/host-secrets:ro`);
-    console.log(`  Mounting host secrets from: ${HOST_SECRETS_PATH}`);
-  }
-
-  // Mount host keyrings for kilo-code credentials
-  const hostKeyringsPath = path.join(process.env.HOME, '.local/share/keyrings');
-  if (fs.existsSync(hostKeyringsPath)) {
-    binds.push(`${hostKeyringsPath}:/host-keyrings:ro`);
-    console.log(`  Mounting host keyrings from: ${hostKeyringsPath}`);
-  }
-
-  // Mount keyring password for unlocking (separate mount point to avoid nesting)
-  const keyringPasswordPath = path.join(
-    process.env.HOME,
-    '.ssh/keyring-password'
-  );
-  if (fs.existsSync(keyringPasswordPath)) {
-    binds.push(`${keyringPasswordPath}:/keyring-password:ro`);
-    console.log(`  Mounting keyring password from: ${keyringPasswordPath}`);
-  }
-
   // Mount host .gitconfig for git credentials and settings
+  // Note: gnome-keyring mounts removed - using pass on host instead
   const hostGitconfigPath = path.join(process.env.HOME, '.gitconfig');
   if (fs.existsSync(hostGitconfigPath)) {
     binds.push(`${hostGitconfigPath}:/host-gitconfig:ro`);
@@ -462,7 +437,6 @@ async function createContainer(instanceId, workspacePath, port) {
     `PUID=${uid}`,
     `PGID=${gid}`,
     'TZ=America/New_York',
-    'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus',
     `DEFAULT_WORKSPACE=${workspacePath || '/config/workspace'}`,
   ];
 

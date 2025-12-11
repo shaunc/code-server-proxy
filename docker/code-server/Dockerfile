@@ -1,17 +1,10 @@
 FROM lscr.io/linuxserver/code-server:latest
 
-# Override base image's DBUS_SESSION_BUS_ADDRESS to use session bus instead of system bus
-ENV DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus
-
 # Set ENV for POSIX shells to source .shrc (used for tool environments like CUDA)
 ENV ENV=/config/.shrc
 
-# Install gnome-keyring and dependencies for VSCode extension secrets
+# Install minimal dependencies (gnome-keyring removed - using pass on host)
 RUN apt-get update && apt-get install -y \
-    gnome-keyring \
-    libsecret-1-0 \
-    libsecret-tools \
-    dbus-x11 \
     jq \
     openssh-client \
     && rm -rf /var/lib/apt/lists/*
@@ -38,10 +31,6 @@ RUN mkdir -p /etc/ssh && \
     echo "    ControlPath /run/user/1001/ssh-control-%h" >> /etc/ssh/ssh_config && \
     echo "    ControlPersist 600" >> /etc/ssh/ssh_config
 
-# Copy git credential helper for keyring
-COPY root/usr/local/bin/git-credential-keyring /usr/local/bin/git-credential-keyring
-RUN chmod +x /usr/local/bin/git-credential-keyring
-
 # Copy Claude Code wrapper for kilo-code integration
 COPY root/usr/local/bin/claude-wrapper /usr/local/bin/claude
 RUN chmod +x /usr/local/bin/claude
@@ -65,44 +54,17 @@ RUN cp /bin/dash /bin/dash.real \
 # Create directory structure for initialization
 RUN mkdir -p /etc/cont-init.d
 
-# Copy s6-rc service definitions for dbus and keyring
-# svc-dbus waits for abc UID to be set to PUID before starting
-# This prevents D-Bus from running with wrong UID (911 vs 1001)
-# Copy each file explicitly to avoid Docker caching issues with directory COPY
-RUN mkdir -p /etc/s6-overlay/s6-rc.d/svc-dbus /etc/s6-overlay/s6-rc.d/svc-keyring
-COPY root/etc/s6-overlay/s6-rc.d/svc-dbus/run /etc/s6-overlay/s6-rc.d/svc-dbus/run
-COPY root/etc/s6-overlay/s6-rc.d/svc-dbus/type /etc/s6-overlay/s6-rc.d/svc-dbus/type
-COPY root/etc/s6-overlay/s6-rc.d/svc-keyring/run /etc/s6-overlay/s6-rc.d/svc-keyring/run
-COPY root/etc/s6-overlay/s6-rc.d/svc-keyring/type /etc/s6-overlay/s6-rc.d/svc-keyring/type
-COPY root/etc/s6-overlay/s6-rc.d/user/contents.d/svc-dbus /etc/s6-overlay/s6-rc.d/user/contents.d/svc-dbus
-COPY root/etc/s6-overlay/s6-rc.d/user/contents.d/svc-keyring /etc/s6-overlay/s6-rc.d/user/contents.d/svc-keyring
-RUN chmod +x /etc/s6-overlay/s6-rc.d/svc-dbus/run \
-    && chmod +x /etc/s6-overlay/s6-rc.d/svc-keyring/run \
-    && echo "=== Verifying svc-dbus/run content ===" \
-    && head -20 /etc/s6-overlay/s6-rc.d/svc-dbus/run \
-    && echo "=== End verification ==="
-
 # Copy initialization scripts (90+ to run after base image permission setup)
-# Note: We don't manually start services - s6-overlay auto-starts /etc/services.d/ after init
-COPY root/etc/cont-init.d/91-gnome-keyring /etc/cont-init.d/91-gnome-keyring
-COPY root/etc/cont-init.d/92-sync-secrets /etc/cont-init.d/92-sync-secrets
+# Note: gnome-keyring scripts (91, 92, 94) removed - using pass on host
 COPY root/etc/cont-init.d/93-setup-auto-ssh /etc/cont-init.d/93-setup-auto-ssh
-COPY root/etc/cont-init.d/94-sync-host-keyring /etc/cont-init.d/94-sync-host-keyring
 COPY root/etc/cont-init.d/95-sync-gitconfig /etc/cont-init.d/95-sync-gitconfig
 COPY root/etc/cont-init.d/96-setup-kilocode /etc/cont-init.d/96-setup-kilocode
-RUN chmod +x /etc/cont-init.d/91-gnome-keyring \
-    && chmod +x /etc/cont-init.d/92-sync-secrets \
-    && chmod +x /etc/cont-init.d/93-setup-auto-ssh \
-    && chmod +x /etc/cont-init.d/94-sync-host-keyring \
+RUN chmod +x /etc/cont-init.d/93-setup-auto-ssh \
     && chmod +x /etc/cont-init.d/95-sync-gitconfig \
     && chmod +x /etc/cont-init.d/96-setup-kilocode
 
 # Set SSH agent socket path (host agent is mounted to this location)
 ENV SSH_AUTH_SOCK=/ssh-agent/socket
-
-# Set D-Bus and GNOME Keyring environment variables
-ENV DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus
-ENV GNOME_KEYRING_CONTROL=/config/.cache/keyring-control
 
 # Create symlink for node (bundled with code-server) so extensions like Pyright can find it
 RUN ln -sf /app/code-server/lib/node /usr/local/bin/node
