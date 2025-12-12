@@ -1,32 +1,78 @@
+/* global URLSearchParams, URL */
 /**
- * Reconnect Helper - Client-side script for auto-reload on connection failure
+ * Reconnect Helper - Client-side script for WebSocket routing and auto-reload
  *
  * This script is injected into code-server pages by the proxy.
- * It monitors for VSCode's "Cannot reconnect" dialog and automatically
- * reloads the page to restore the session.
  *
- * Background: When WebSocket connection drops (laptop sleep, network blip),
- * VSCode tries to reconnect with its reconnectionToken. If the server-side
- * session has expired (~60 seconds), VSCode shows "Cannot reconnect" dialog.
- * This script detects that and reloads automatically.
+ * Features:
+ * 1. WebSocket URL rewriting - Adds workspace/folder params to WebSocket URLs
+ *    so the proxy can route connections to the correct backend instance.
+ *    Each tab knows its workspace from window.location.search.
+ *
+ * 2. Auto-reload on disconnect - Monitors for VSCode's "Cannot reconnect"
+ *    dialog and automatically reloads the page to restore the session.
  */
 
 (function () {
   'use strict';
 
-  const RELOAD_DELAY_MS = 1500; // Allow time for any pending saves
   const LOG_PREFIX = '[reconnect-helper]';
+  const RELOAD_DELAY_MS = 1500;
 
-  let reloadScheduled = false;
+  // Extract workspace/folder from current page URL
+  const urlParams = new URLSearchParams(window.location.search);
+  const workspace = urlParams.get('workspace');
+  const folder = urlParams.get('folder');
 
   /**
-   * Check if element contains reconnection failure text
-   * @param {Element} element - DOM element to check
-   * @returns {boolean}
+   * Intercept WebSocket constructor to add workspace routing params
    */
+  if (workspace || folder) {
+    const OriginalWebSocket = window.WebSocket;
+
+    window.WebSocket = function (url, protocols) {
+      try {
+        const wsUrl = new URL(url, window.location.origin);
+
+        // Add workspace/folder param if not already present
+        if (workspace && !wsUrl.searchParams.has('workspace')) {
+          wsUrl.searchParams.set('workspace', workspace);
+        } else if (folder && !wsUrl.searchParams.has('folder')) {
+          wsUrl.searchParams.set('folder', folder);
+        }
+
+        const newUrl = wsUrl.toString();
+        if (newUrl !== url) {
+          console.log(`${LOG_PREFIX} WebSocket URL rewritten for routing`);
+        }
+
+        return new OriginalWebSocket(newUrl, protocols);
+      } catch (e) {
+        // If URL parsing fails, use original
+        console.warn(`${LOG_PREFIX} WebSocket URL rewrite failed:`, e.message);
+        return new OriginalWebSocket(url, protocols);
+      }
+    };
+
+    // Preserve WebSocket properties
+    window.WebSocket.prototype = OriginalWebSocket.prototype;
+    window.WebSocket.CONNECTING = OriginalWebSocket.CONNECTING;
+    window.WebSocket.OPEN = OriginalWebSocket.OPEN;
+    window.WebSocket.CLOSING = OriginalWebSocket.CLOSING;
+    window.WebSocket.CLOSED = OriginalWebSocket.CLOSED;
+
+    console.log(
+      `${LOG_PREFIX} WebSocket routing enabled for ${workspace || folder}`
+    );
+  }
+
+  /**
+   * Auto-reload functionality for connection failures
+   */
+  let reloadScheduled = false;
+
   function isReconnectionFailureDialog(element) {
     const text = element.textContent || '';
-    // VSCode uses these messages for reconnection failures
     return (
       text.includes('Cannot reconnect') ||
       text.includes('Connection to the server was lost') ||
@@ -34,9 +80,6 @@
     );
   }
 
-  /**
-   * Schedule page reload with delay
-   */
   function scheduleReload() {
     if (reloadScheduled) {
       return;
@@ -47,26 +90,19 @@
       `${LOG_PREFIX} Connection failure detected, reloading in ${RELOAD_DELAY_MS}ms...`
     );
 
-    // Brief delay to allow any in-flight save operations
     setTimeout(() => {
       console.log(`${LOG_PREFIX} Reloading page...`);
       window.location.reload();
     }, RELOAD_DELAY_MS);
   }
 
-  /**
-   * Handle DOM mutations - look for reconnection failure dialogs
-   * @param {MutationRecord[]} mutations
-   */
   function handleMutations(mutations) {
     for (const mutation of mutations) {
-      // Check added nodes
       for (const node of mutation.addedNodes) {
         if (node.nodeType !== Node.ELEMENT_NODE) {
           continue;
         }
 
-        // Look for Monaco dialog boxes (VSCode's modal dialogs)
         const dialogs = node.querySelectorAll
           ? [
               ...node.querySelectorAll('.monaco-dialog-box'),
@@ -81,7 +117,6 @@
           }
         }
 
-        // Also check for the notification center messages
         const notifications = node.querySelectorAll
           ? [
               ...node.querySelectorAll('.notification-toast'),
@@ -99,18 +134,13 @@
     }
   }
 
-  /**
-   * Initialize the mutation observer
-   */
   function init() {
-    // Wait for body to be available
     if (!document.body) {
       document.addEventListener('DOMContentLoaded', init);
       return;
     }
 
     const observer = new MutationObserver(handleMutations);
-
     observer.observe(document.body, {
       childList: true,
       subtree: true,
@@ -119,6 +149,5 @@
     console.log(`${LOG_PREFIX} Monitoring for connection failures...`);
   }
 
-  // Start monitoring
   init();
 })();

@@ -54,104 +54,10 @@ const REGISTRY_PATH = path.join(WORKSPACES_DIR, 'port-registry.json');
 const SHARED_SETTINGS_DIR = path.join(WORKSPACES_DIR, 'shared');
 const BACKEND_READY_TIMEOUT = 30000; // 30 seconds
 const BACKEND_READY_POLL_INTERVAL = 500; // 500ms
-const SESSION_COOKIE_NAME = 'code-server-proxy-session';
-const SESSION_TTL = 24 * 60 * 60 * 1000; // 24 hours
 
 // Lock mechanism to prevent concurrent container operations
 // Maps instance ID to promise that resolves when operation completes
 const instanceLocks = new Map();
-
-// Session management for maintaining routing context
-// Maps session ID to workspace routing information
-const sessionMap = new Map();
-
-/**
- * Generate a unique session ID
- * @returns {string} UUID v4 session ID
- */
-function generateSessionId() {
-  return crypto.randomUUID();
-}
-
-/**
- * Extract session cookie from request
- * @param {http.IncomingMessage} req - Request object
- * @returns {string|null} Session ID or null
- */
-function extractSessionCookie(req) {
-  const cookieHeader = req.headers.cookie;
-  if (!cookieHeader) {
-    return null;
-  }
-
-  const cookies = cookieHeader.split(';').map((c) => c.trim());
-  for (const cookie of cookies) {
-    const [name, value] = cookie.split('=');
-    if (name === SESSION_COOKIE_NAME) {
-      return value;
-    }
-  }
-  return null;
-}
-
-/**
- * Create session for workspace routing
- * @param {string} workspacePath - Workspace path
- * @param {string} instanceId - Instance ID
- * @param {number} port - Port number
- * @returns {string} Session ID
- */
-function createSession(workspacePath, instanceId, port) {
-  const sessionId = generateSessionId();
-  sessionMap.set(sessionId, {
-    workspacePath,
-    instanceId,
-    port,
-    created: Date.now(),
-    lastAccess: Date.now(),
-  });
-  return sessionId;
-}
-
-/**
- * Get session information
- * @param {string} sessionId - Session ID
- * @returns {Object|null} Session info or null if expired/not found
- */
-function getSession(sessionId) {
-  if (!sessionId || !sessionMap.has(sessionId)) {
-    return null;
-  }
-
-  const session = sessionMap.get(sessionId);
-  const now = Date.now();
-
-  // Check if session expired
-  if (now - session.lastAccess > SESSION_TTL) {
-    sessionMap.delete(sessionId);
-    return null;
-  }
-
-  // Update last access time
-  session.lastAccess = now;
-  return session;
-}
-
-/**
- * Cleanup expired sessions (run periodically)
- */
-function cleanupExpiredSessions() {
-  const now = Date.now();
-  for (const [sessionId, session] of sessionMap.entries()) {
-    if (now - session.lastAccess > SESSION_TTL) {
-      console.log(`[SESSION] Expired session ${sessionId}`);
-      sessionMap.delete(sessionId);
-    }
-  }
-}
-
-// Cleanup expired sessions every hour
-setInterval(cleanupExpiredSessions, 60 * 60 * 1000);
 
 // Create HTTP proxy with selfHandleResponse for HTML injection
 const proxy = httpProxy.createProxyServer({
@@ -173,28 +79,44 @@ proxy.on('error', (err, req, res) => {
 });
 
 /**
+ * Extract nonce from Content-Security-Policy header
+ * @param {string} csp - CSP header value
+ * @returns {string|null} Nonce value or null
+ */
+function extractCspNonce(csp) {
+  if (!csp) return null;
+  const match = csp.match(/'nonce-([^']+)'/);
+  return match ? match[1] : null;
+}
+
+/**
  * Inject reconnect-helper script into HTML content
+ * Must be injected early (after <head>) to intercept WebSocket before code-server uses it
  * @param {string} html - Original HTML content
+ * @param {string|null} nonce - CSP nonce for inline script
  * @returns {string} Modified HTML with script injected
  */
-function injectReconnectHelper(html) {
+function injectReconnectHelper(html, nonce) {
   if (!RECONNECT_HELPER_SCRIPT) {
     return html;
   }
 
-  // Inject script tag before </body> or </html>, or at end
-  const scriptTag = `<script src="/_proxy/reconnect-helper.js"></script>`;
+  // Inject inline script after <head> to ensure it runs before other scripts
+  // This is critical for WebSocket interception to work
+  // Include nonce if CSP requires it
+  const nonceAttr = nonce ? ` nonce="${nonce}"` : '';
+  const scriptTag = `<script${nonceAttr}>${RECONNECT_HELPER_SCRIPT}</script>`;
 
-  if (html.includes('</body>')) {
-    return html.replace('</body>', `${scriptTag}</body>`);
-  } else if (html.includes('</html>')) {
-    return html.replace('</html>', `${scriptTag}</html>`);
+  if (html.includes('<head>')) {
+    return html.replace('<head>', `<head>${scriptTag}`);
+  } else if (html.includes('<body>')) {
+    return html.replace('<body>', `${scriptTag}<body>`);
   } else {
-    return html + scriptTag;
+    return scriptTag + html;
   }
 }
 
-// Intercept proxy responses for session cookies, redirects, and HTML injection
+// Intercept proxy responses for redirects and HTML injection
 proxy.on('proxyRes', (proxyRes, req, res) => {
   const statusCode = proxyRes.statusCode;
   const contentType = proxyRes.headers['content-type'] || '';
@@ -202,25 +124,6 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
 
   // Build response headers
   const headers = { ...proxyRes.headers };
-
-  // Inject session cookie if this is a new session
-  if (req._sessionId) {
-    const cookieValue = `${SESSION_COOKIE_NAME}=${req._sessionId}; HttpOnly; Path=/; Max-Age=${SESSION_TTL / 1000}; SameSite=Lax`;
-
-    // Add Set-Cookie header (preserve existing cookies if any)
-    const existingCookies = headers['set-cookie'] || [];
-    if (Array.isArray(existingCookies)) {
-      headers['set-cookie'] = [...existingCookies, cookieValue];
-    } else if (existingCookies) {
-      headers['set-cookie'] = [existingCookies, cookieValue];
-    } else {
-      headers['set-cookie'] = [cookieValue];
-    }
-
-    console.log(
-      `[SESSION] Set session cookie: ${req._sessionId.substring(0, 8)}`
-    );
-  }
 
   // Handle 3xx redirects
   if (statusCode >= 300 && statusCode < 400 && headers.location) {
@@ -257,6 +160,9 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
   // For HTML responses, buffer and inject reconnect-helper script
   if (isHtml && RECONNECT_HELPER_SCRIPT) {
     const chunks = [];
+    // Extract nonce from CSP header for inline script
+    const cspHeader = headers['content-security-policy'];
+    const nonce = extractCspNonce(cspHeader);
 
     proxyRes.on('data', (chunk) => {
       chunks.push(chunk);
@@ -264,7 +170,7 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
 
     proxyRes.on('end', () => {
       let body = Buffer.concat(chunks).toString('utf8');
-      body = injectReconnectHelper(body);
+      body = injectReconnectHelper(body, nonce);
 
       // Update headers for buffered response
       // Remove chunked encoding since we're sending complete body
@@ -1087,6 +993,28 @@ function parseWorkspaceHash(params) {
 }
 
 /**
+ * Extract workspace path from referer header
+ * @param {http.IncomingMessage} req - Request object
+ * @returns {{workspace: string|null, folder: string|null}} Extracted paths
+ */
+function extractRefererWorkspace(req) {
+  const referer = req.headers.referer;
+  if (!referer) {
+    return { workspace: null, folder: null };
+  }
+
+  try {
+    const refererUrl = new URL(referer);
+    return {
+      workspace: refererUrl.searchParams.get('workspace'),
+      folder: refererUrl.searchParams.get('folder'),
+    };
+  } catch {
+    return { workspace: null, folder: null };
+  }
+}
+
+/**
  * Handle incoming request and route to appropriate backend
  * @param {http.IncomingMessage} req - Request object
  * @param {http.ServerResponse} res - Response object
@@ -1107,67 +1035,24 @@ async function handleRequest(req, res) {
     let instanceId = 'main';
     let workspacePath = null;
 
-    // Routing logic - check in order of priority
-    // 1. Check for session cookie first (for requests without workspace/folder params)
-    const sessionId = extractSessionCookie(req);
-    let sessionRouted = false;
+    // Routing priority:
+    // 1. URL parameters (?workspace=, ?folder=, ?ew=)
+    // 2. Referer header (for resources loaded by workspace pages)
+    // 3. Default to main instance
+    //
+    // NOTE: Session cookies are NOT used for routing because they are
+    // domain-scoped and cause incorrect routing with multiple tabs.
+    // Each tab overwrites the session cookie, causing requests from
+    // other tabs to route to the wrong workspace.
 
-    if (sessionId && !params.workspace && !params.folder && !params.ew) {
-      const session = getSession(sessionId);
-      if (session) {
-        // Route based on session
-        instanceId = session.instanceId;
-        targetPort = session.port;
-        workspacePath = session.workspacePath;
-        sessionRouted = true;
-        console.log(
-          `[SESSION] Using session ${sessionId.substring(0, 8)} -> instance ${instanceId} on port ${targetPort}`
-        );
+    // Check referer for workspace context (used for assets without URL params)
+    const refererParams = extractRefererWorkspace(req);
 
-        // Ensure instance is running with correct image (checks outdated, exists, running)
-        await launchInstance(instanceId, workspacePath, targetPort);
-
-        // Wait for backend if it was just started
-        if (!(await isPortListening(targetPort))) {
-          console.log(
-            `Waiting for backend on port ${targetPort} to be ready...`
-          );
-          const ready = await waitForBackend(targetPort);
-          if (!ready) {
-            res.writeHead(503, { 'Content-Type': 'text/plain' });
-            res.end(
-              'Service Unavailable: Backend instance failed to start in time'
-            );
-            return;
-          }
-          console.log(`Backend on port ${targetPort} is ready`);
-        }
-      } else {
-        console.log(
-          `[SESSION] Invalid or expired session ${sessionId.substring(0, 8)}`
-        );
-        // Fall through to default routing
-      }
-    }
-
-    // 2. Route based on URL parameters (skip if session routing succeeded)
-    if (!sessionRouted && params.ew) {
+    // 1. Route based on URL parameters first
+    if (params.ew) {
       console.log('[ROUTING] Bare mode request (ew=true) -> main instance');
       targetPort = MAIN_PORT;
       instanceId = 'main';
-
-      // Expire any existing session cookie to prevent subsequent requests from routing to workspace
-      if (sessionId) {
-        console.log(
-          `[SESSION] Expiring session ${sessionId.substring(0, 8)} for bare mode`
-        );
-        sessionMap.delete(sessionId);
-        // Set expired cookie to clear it in browser
-        res.setHeader(
-          'Set-Cookie',
-          `${SESSION_COOKIE_NAME}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax`
-        );
-      }
 
       // Check if container image is outdated (fast cached check - no Docker API)
       const isOutdatedBare =
@@ -1211,8 +1096,8 @@ async function handleRequest(req, res) {
         console.log(`Main instance on port ${targetPort} is ready`);
       }
     }
-    // 3. Workspace mode
-    else if (!sessionRouted && params.workspace) {
+    // 2. Workspace mode (URL param)
+    else if (params.workspace) {
       workspacePath = params.workspace;
       console.log(`[ROUTING] Workspace mode request: ${workspacePath}`);
 
@@ -1309,18 +1194,9 @@ async function handleRequest(req, res) {
         }
         console.log(`Backend on port ${targetPort} is ready`);
       }
-
-      // Create session for this workspace
-      const newSessionId = createSession(workspacePath, instanceId, targetPort);
-      console.log(
-        `[SESSION] Created session ${newSessionId.substring(0, 8)} for workspace ${workspacePath}`
-      );
-
-      // Attach session ID to request so we can set cookie in response
-      req._sessionId = newSessionId;
     }
-    // 4. Folder mode
-    else if (!sessionRouted && params.folder) {
+    // 3. Folder mode (URL param)
+    else if (params.folder) {
       workspacePath = params.folder;
       console.log(`[ROUTING] Folder mode request: ${workspacePath}`);
 
@@ -1416,20 +1292,48 @@ async function handleRequest(req, res) {
         }
         console.log(`Backend on port ${targetPort} is ready`);
       }
+    }
+    // 4. Referer-based routing (for assets loaded by workspace pages)
+    else if (refererParams.workspace || refererParams.folder) {
+      workspacePath = refererParams.workspace || refererParams.folder;
+      console.log(`[ROUTING] Referer-based routing: ${workspacePath}`);
 
-      // Create session for this folder
-      const newSessionId = createSession(workspacePath, instanceId, targetPort);
+      // Get port for this workspace (should already exist in registry)
+      const { port, instanceId: allocatedId } =
+        await getOrAllocatePort(workspacePath);
+      targetPort = port;
+      instanceId = allocatedId;
+
       console.log(
-        `[SESSION] Created session ${newSessionId.substring(0, 8)} for folder ${workspacePath}`
+        `[ROUTING] Referer resolved to port ${targetPort} for instance ${instanceId.substring(0, 8)}`
       );
 
-      // Attach session ID to request so we can set cookie in response
-      req._sessionId = newSessionId;
+      // Ensure instance is running
+      const isListeningReferer = await isPortListening(targetPort);
+      if (!isListeningReferer) {
+        console.log(`Instance not running, launching ${instanceId}...`);
+        // Launch async (don't await) - this is a resource request, not initial page
+        launchInstance(instanceId, workspacePath, targetPort).catch((err) => {
+          console.error(`Failed to launch ${instanceId}:`, err);
+        });
+
+        // Wait for backend
+        console.log(`Waiting for backend on port ${targetPort} to be ready...`);
+        const ready = await waitForBackend(targetPort);
+        if (!ready) {
+          res.writeHead(503, { 'Content-Type': 'text/plain' });
+          res.end(
+            'Service Unavailable: Backend instance failed to start in time'
+          );
+          return;
+        }
+        console.log(`Backend on port ${targetPort} is ready`);
+      }
     }
-    // 5. Default to main instance (if no session and no params)
-    else if (!sessionRouted) {
+    // 5. Default to main instance
+    else {
       console.log(
-        '[ROUTING] Default request (no workspace/folder) -> main instance'
+        '[ROUTING] Default request (no workspace/folder/referer) -> main instance'
       );
       targetPort = MAIN_PORT;
       instanceId = 'main';
@@ -1569,51 +1473,31 @@ async function handleUpgrade(req, socket, head) {
     // Determine target port
     let targetPort = MAIN_PORT;
     let instanceId = 'main';
-    let workspacePath = null;
 
-    // Routing logic - check in order of priority
-    // 1. Check for session cookie first (WebSocket upgrades include cookies!)
-    const sessionId = extractSessionCookie(req);
-    let sessionRouted = false;
-
-    if (sessionId && !params.workspace && !params.folder && !params.ew) {
-      const session = getSession(sessionId);
-      if (session) {
-        // Route based on session
-        instanceId = session.instanceId;
-        targetPort = session.port;
-        workspacePath = session.workspacePath;
-        sessionRouted = true;
-        console.log(
-          `[WS-SESSION] Using session ${sessionId.substring(0, 8)} -> instance ${instanceId} on port ${targetPort}`
-        );
-      } else {
-        console.log(
-          `[WS-SESSION] Invalid or expired session ${sessionId.substring(0, 8)}`
-        );
-        // Fall through to default routing
-      }
-    }
-
-    // 2. Route based on URL params - direct path routing with direct mounting
-    if (!sessionRouted && params.ew) {
+    // Routing priority:
+    // 1. URL parameters (?workspace=, ?folder=, ?ew=)
+    // 2. Referer header (already extracted into params above)
+    // 3. Default to main instance
+    //
+    // NOTE: Session cookies are NOT used for routing because they are
+    // domain-scoped and cause incorrect routing with multiple tabs.
+    if (params.ew) {
       targetPort = MAIN_PORT;
       instanceId = 'main';
-    } else if (!sessionRouted && params.workspace) {
+    } else if (params.workspace) {
       const { port, instanceId: allocatedId } = await getOrAllocatePort(
         params.workspace
       );
       targetPort = port;
       instanceId = allocatedId;
-      workspacePath = params.workspace;
-    } else if (!sessionRouted && params.folder) {
+    } else if (params.folder) {
       const { port, instanceId: allocatedId } = await getOrAllocatePort(
         params.folder
       );
       targetPort = port;
       instanceId = allocatedId;
-      workspacePath = params.folder;
     }
+    // If no params (and no referer extracted above), defaults to main instance
 
     // Update last-access timestamp
     updateLastAccess(instanceId);
