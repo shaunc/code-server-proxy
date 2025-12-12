@@ -29,6 +29,9 @@ const activityTracker = require('./activity-tracker');
 // Settings sync service (only in Docker mode)
 const settingsSync = USE_DOCKER ? require('./settings-sync') : null;
 
+// WebSocket proxy with ping/pong keepalive
+const wsProxy = require('./ws-proxy');
+
 // Load reconnect-helper script for injection into HTML pages
 const RECONNECT_HELPER_PATH = path.join(__dirname, 'reconnect-helper.js');
 const RECONNECT_HELPER_SCRIPT = fs.existsSync(RECONNECT_HELPER_PATH)
@@ -1511,12 +1514,12 @@ async function handleUpgrade(req, socket, head) {
     // Store original URL for potential redirect handling
     req._originalUrl = req.url;
 
-    // Proxy the WebSocket
-    const target = `http://127.0.0.1:${targetPort}`;
-    console.log(`[WEBSOCKET] Proxying WebSocket upgrade -> ${target}`);
+    // Proxy the WebSocket with ping/pong keepalive
+    const targetWsUrl = `ws://127.0.0.1:${targetPort}${req.url}`;
+    console.log(`[WEBSOCKET] Proxying WebSocket upgrade -> ${targetWsUrl}`);
     console.log(`[WEBSOCKET] Instance: ${instanceId}, Port: ${targetPort}`);
     console.log('='.repeat(80));
-    proxy.ws(req, socket, head, { target });
+    wsProxy.proxyWebSocket(req, socket, head, targetWsUrl, instanceId);
   } catch (error) {
     console.error('Error handling WebSocket upgrade:', error);
     socket.destroy();
@@ -1816,6 +1819,10 @@ async function cleanupSharedTmp(maxAgeMs = 60 * 60 * 1000) {
 process.on('SIGINT', async () => {
   console.log('\nShutting down proxy server...');
 
+  // Cleanup WebSocket connections
+  console.log('Closing WebSocket connections...');
+  wsProxy.cleanupAllConnections();
+
   // Save activity tracker state
   console.log('Saving activity tracker state...');
   activityTracker.shutdown();
@@ -1837,6 +1844,10 @@ process.on('SIGINT', async () => {
 
 process.on('SIGTERM', async () => {
   console.log('\nShutting down proxy server...');
+
+  // Cleanup WebSocket connections
+  console.log('Closing WebSocket connections...');
+  wsProxy.cleanupAllConnections();
 
   // Save activity tracker state
   console.log('Saving activity tracker state...');
