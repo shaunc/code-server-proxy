@@ -63,9 +63,12 @@ const BACKEND_READY_POLL_INTERVAL = 500; // 500ms
 const instanceLocks = new Map();
 
 // Create HTTP proxy with selfHandleResponse for HTML injection
+// Extended timeouts to survive network pauses (5 minutes)
 const proxy = httpProxy.createProxyServer({
   ws: true,
   selfHandleResponse: true,
+  timeout: 300000, // 5 minute connection timeout
+  proxyTimeout: 300000, // 5 minute proxy timeout
 });
 
 // Handle proxy errors

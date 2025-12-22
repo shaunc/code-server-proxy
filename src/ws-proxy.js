@@ -1,21 +1,23 @@
 /**
- * WebSocket Proxy with Ping/Pong Keepalive
+ * WebSocket Proxy with Keepalive
  *
  * Proxies WebSocket connections between client and backend with periodic
- * ping/pong to detect stale connections early.
+ * pings to generate traffic and keep connections alive through NAT/firewalls.
+ *
+ * Note: Pings are for keepalive only - we do NOT close connections on missed
+ * pongs. Connections stay alive until explicitly closed by either end.
  */
 
 const WebSocket = require('ws');
 
-// Configuration
-const PING_INTERVAL = 30000; // Send ping every 30 seconds
-const PONG_TIMEOUT = 10000; // Wait 10 seconds for pong response
+// Configuration - ping interval for keepalive traffic generation
+const PING_INTERVAL = parseInt(process.env.WS_PING_INTERVAL) || 30000; // 30s
 
 // Track active connections for cleanup
-const activeConnections = new Set();
+const activeConnections = new Map(); // clientId -> { startTime, ... }
 
 /**
- * Proxy a WebSocket connection to a backend with ping/pong keepalive
+ * Proxy a WebSocket connection to a backend with keepalive pings
  * @param {http.IncomingMessage} req - Upgrade request
  * @param {net.Socket} socket - Client socket
  * @param {Buffer} head - First packet
@@ -25,6 +27,12 @@ const activeConnections = new Set();
 function proxyWebSocket(req, socket, head, targetUrl, instanceId) {
   const shortId = instanceId.substring(0, 8);
   const clientId = `${shortId}-${Date.now().toString(36)}`;
+  const startTime = Date.now();
+
+  // Enable TCP keepalive on the client socket
+  if (socket.setKeepAlive) {
+    socket.setKeepAlive(true, 30000);
+  }
 
   // Create WebSocket server to handle the client connection
   const wss = new WebSocket.Server({ noServer: true });
@@ -52,14 +60,11 @@ function proxyWebSocket(req, socket, head, targetUrl, instanceId) {
       headers: backendHeaders,
     });
 
-    let isAlive = true;
     let pingInterval = null;
-    let pongTimeout = null;
 
     const cleanup = () => {
       activeConnections.delete(clientId);
       if (pingInterval) clearInterval(pingInterval);
-      if (pongTimeout) clearTimeout(pongTimeout);
 
       if (clientWs.readyState === WebSocket.OPEN) {
         clientWs.close(1000, 'Connection closed');
@@ -69,39 +74,20 @@ function proxyWebSocket(req, socket, head, targetUrl, instanceId) {
       }
     };
 
-    activeConnections.add(clientId);
+    activeConnections.set(clientId, { startTime });
 
     // Backend connection handlers
     backendWs.on('open', () => {
       console.log(`[WS-PROXY] Backend connected: ${clientId}`);
 
-      // Start ping/pong keepalive on backend
+      // Start periodic pings for keepalive (traffic generation only)
+      // We do NOT close on missed pongs - this is purely to keep
+      // NAT mappings and firewalls happy
       pingInterval = setInterval(() => {
-        if (!isAlive) {
-          console.log(`[WS-PROXY] Backend unresponsive, closing: ${clientId}`);
-          cleanup();
-          return;
+        if (backendWs.readyState === WebSocket.OPEN) {
+          backendWs.ping();
         }
-
-        isAlive = false;
-        backendWs.ping();
-
-        // Set timeout for pong response
-        pongTimeout = setTimeout(() => {
-          if (!isAlive) {
-            console.log(`[WS-PROXY] Pong timeout, closing: ${clientId}`);
-            cleanup();
-          }
-        }, PONG_TIMEOUT);
       }, PING_INTERVAL);
-    });
-
-    backendWs.on('pong', () => {
-      isAlive = true;
-      if (pongTimeout) {
-        clearTimeout(pongTimeout);
-        pongTimeout = null;
-      }
     });
 
     backendWs.on('message', (data, isBinary) => {
@@ -111,8 +97,9 @@ function proxyWebSocket(req, socket, head, targetUrl, instanceId) {
     });
 
     backendWs.on('close', (code, reason) => {
+      const duration = Math.round((Date.now() - startTime) / 1000);
       console.log(
-        `[WS-PROXY] Backend closed: ${clientId} (${code} ${reason || ''})`
+        `[WS-PROXY] Backend closed: ${clientId} after ${duration}s (${code} ${reason || ''})`
       );
       cleanup();
     });
@@ -130,8 +117,9 @@ function proxyWebSocket(req, socket, head, targetUrl, instanceId) {
     });
 
     clientWs.on('close', (code, reason) => {
+      const duration = Math.round((Date.now() - startTime) / 1000);
       console.log(
-        `[WS-PROXY] Client closed: ${clientId} (${code} ${reason || ''})`
+        `[WS-PROXY] Client closed: ${clientId} after ${duration}s (${code} ${reason || ''})`
       );
       cleanup();
     });
@@ -180,5 +168,4 @@ module.exports = {
   getActiveConnectionCount,
   cleanupAllConnections,
   PING_INTERVAL,
-  PONG_TIMEOUT,
 };
