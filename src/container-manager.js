@@ -450,6 +450,9 @@ async function createContainer(instanceId, workspacePath, port) {
   }
   envVars.push(`HOST_USER=${process.env.USER}`);
 
+  // Expose instance ID for tmux session naming (cs-<instanceId>)
+  envVars.push(`INSTANCE_ID=${instanceId}`);
+
   // Don't use DEFAULT_WORKSPACE - we'll pass workspace as command line arg instead
   // (like systemd mode did)
 
@@ -663,6 +666,16 @@ async function stopContainer(instanceId, timeout = 10) {
   const containerName = `code-server-${instanceId}`;
   console.log(`Stopping container: ${containerName}`);
 
+  // Kill all tmux sessions for this instance (one per terminal pane)
+  try {
+    execSync(`cs-tmux-window cleanup ${instanceId}`, {
+      timeout: 5000,
+    });
+    console.log(`Cleaned up tmux sessions for: ${instanceId}`);
+  } catch {
+    // No sessions or cs-tmux-window not installed — that's fine
+  }
+
   try {
     const container = docker.getContainer(containerName);
     await container.stop({ t: timeout });
@@ -674,6 +687,48 @@ async function stopContainer(instanceId, timeout = 10) {
     }
     console.error(`Failed to stop container ${containerName}:`, error.message);
     throw new Error(`Container stop failed: ${error.message}`);
+  }
+}
+
+/**
+ * Kill orphaned tmux sessions (cs-* sessions with no matching container).
+ * Runs periodically as a safety net for sessions that weren't cleaned
+ * up on container stop (e.g., if the proxy crashed).
+ */
+function cleanOrphanedTmuxSessions() {
+  try {
+    const sessions = execSync(
+      "tmux list-sessions -F '#{session_name}' 2>/dev/null",
+      { encoding: 'utf-8', timeout: 5000 }
+    )
+      .trim()
+      .split('\n')
+      .filter((s) => s.startsWith('cs-'));
+
+    for (const session of sessions) {
+      const instanceId = session.slice(3); // strip 'cs-' prefix
+      const containerName = `code-server-${instanceId}`;
+      try {
+        // Check if container exists and is running
+        execSync(
+          `docker inspect --format='{{.State.Running}}' ${containerName} 2>/dev/null`,
+          {
+            encoding: 'utf-8',
+            timeout: 5000,
+          }
+        );
+      } catch {
+        // Container doesn't exist — kill the orphaned session
+        try {
+          execSync(`tmux kill-session -t ${session}`, { timeout: 5000 });
+          console.log(`[TMUX-CLEANUP] Killed orphaned session: ${session}`);
+        } catch {
+          // Session may have been killed between list and kill
+        }
+      }
+    }
+  } catch {
+    // tmux not running or no sessions — nothing to clean
   }
 }
 
@@ -1691,5 +1746,6 @@ module.exports = {
   findOrphanedContainers,
   cleanupOrphanedContainers,
   getActivityTracker,
+  cleanOrphanedTmuxSessions,
   reloadConfig,
 };

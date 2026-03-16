@@ -1747,6 +1747,14 @@ server.listen(PROXY_PORT, PROXY_HOST, async () => {
       2 * 60 * 1000
     ); // 2 minutes
 
+    // Clean orphaned tmux sessions every 5 minutes
+    setInterval(
+      () => {
+        containerManager.cleanOrphanedTmuxSessions();
+      },
+      5 * 60 * 1000
+    );
+
     // Run initial image check after 10 seconds (let containers settle first)
     setTimeout(async () => {
       console.log('[IMAGE-CHECK] Running initial container image check...');

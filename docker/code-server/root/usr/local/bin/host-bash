@@ -1,43 +1,100 @@
 #!/bin/bash
 # Host bash wrapper - forwards shell commands to host via SSH
-# Used as SHELL for Kilo Code to execute commands on host instead of container
-# SSH config is in /etc/ssh/ssh_config (StrictHostKeyChecking, known_hosts, etc.)
+# Interactive terminals use tmux for persistence across disconnects.
+# Each terminal pane gets its own tmux session (independent view).
+# Non-interactive commands go direct (no tmux needed).
+# SSH config is in /etc/ssh/ssh_config (ControlMaster, known_hosts, etc.)
 
 if [ -z "$HOST_USER" ]; then
-    # Fallback to container bash if HOST_USER not set
     exec /bin/bash "$@"
 fi
 
-# Check SSH mux health - clean up stale control socket if master
-# is unresponsive or wedged, so ControlMaster auto can establish
-# a fresh one.  -O check only tests if the master process is alive;
-# a wedged master passes that but can't forward new sessions.
-# An end-to-end "true" through the mux catches both cases.
+SSH_DEST="$HOST_USER@host.docker.internal"
+# INSTANCE_ID from env (container-manager), fallback to file (injected)
+if [ -z "$INSTANCE_ID" ] && [ -f /run/instance-id ]; then
+    INSTANCE_ID=$(cat /run/instance-id)
+fi
+IID="${INSTANCE_ID:-default}"
+WORKDIR="${WORKSPACE_PATH:-.}"
+shrc_source=". ~/.shrc 2>/dev/null || true; "
+
+# --- Non-interactive: direct SSH, no tmux ---
+if [ ! -t 0 ]; then
+    cd_cmd=""
+    [ -n "$WORKSPACE_PATH" ] && cd_cmd="cd '$WORKSPACE_PATH' && "
+    exec ssh "$SSH_DEST" "${shrc_source}${cd_cmd}bash" "$@"
+fi
+
+# --- Interactive: tmux-backed terminal with reconnection loop ---
+
+# Check SSH mux health before session creation
 CONTROL_SOCKET="/run/user/1001/ssh-control-host.docker.internal"
 if [ -S "$CONTROL_SOCKET" ]; then
     if ! timeout 3 ssh -o BatchMode=yes \
-        "$HOST_USER@host.docker.internal" true \
-        >/dev/null 2>&1; then
+        "$SSH_DEST" true >/dev/null 2>&1; then
         rm -f "$CONTROL_SOCKET"
     fi
 fi
 
-# Build cd prefix if WORKSPACE_PATH is set
-cd_cmd=""
-if [ -n "$WORKSPACE_PATH" ]; then
-    cd_cmd="cd '$WORKSPACE_PATH' && "
+# Create or reattach to a tmux session for this pane.
+# TMUX_PANE_ID is set by the extension for pane-to-session mapping.
+if [ -n "$TMUX_PANE_ID" ]; then
+    TMUX_SESSION=$(ssh -o ConnectTimeout=10 -o BatchMode=yes \
+        "$SSH_DEST" \
+        "${shrc_source}cs-tmux-window attach-or-create \
+            '$IID' '$TMUX_PANE_ID' '$WORKDIR'")
+else
+    TMUX_SESSION=$(ssh -o ConnectTimeout=10 -o BatchMode=yes \
+        "$SSH_DEST" \
+        "${shrc_source}cs-tmux-window create '$IID' '$WORKDIR'")
 fi
 
-# Source .shrc for tool environments (CUDA, etc.)
-shrc_source=". ~/.shrc 2>/dev/null || true; "
-
-# SSH config provides ControlMaster auto / ControlPath / ControlPersist.
-# First connection becomes the mux master; subsequent ones multiplex.
-if [ -t 0 ]; then
-    exec ssh -t "$HOST_USER@host.docker.internal" \
-        "${shrc_source}${cd_cmd}exec bash" "$@"
+if [ $? -ne 0 ] || [ -z "$TMUX_SESSION" ]; then
+    echo "Failed to create tmux session" >&2
+    exit 1
 fi
 
-# Non-interactive: no PTY needed
-exec ssh "$HOST_USER@host.docker.internal" \
-    "${shrc_source}${cd_cmd}bash" "$@"
+# Attach loop — reconnect to same session on SSH drop
+MAX_RETRIES=60
+RETRY_DELAY=2
+retries=0
+
+while true; do
+    ssh -t \
+        -o ServerAliveInterval=10 \
+        -o ServerAliveCountMax=3 \
+        "$SSH_DEST" \
+        "tmux attach-session -t '$TMUX_SESSION'"
+    exit_code=$?
+
+    case $exit_code in
+        0)
+            # Clean exit: user typed 'exit' or session destroyed
+            break
+            ;;
+        255)
+            # SSH connection error — reconnect
+            retries=$((retries + 1))
+            if [ $retries -ge $MAX_RETRIES ]; then
+                echo "SSH reconnection failed after $retries attempts" >&2
+                exit 1
+            fi
+            echo "[reconnecting... attempt $retries]" >&2
+            sleep $RETRY_DELAY
+            ;;
+        *)
+            # tmux error — check if session still exists
+            if ssh -o ConnectTimeout=5 -o BatchMode=yes \
+                "$SSH_DEST" \
+                "tmux has-session -t '$TMUX_SESSION'" \
+                2>/dev/null; then
+                retries=$((retries + 1))
+                [ $retries -ge $MAX_RETRIES ] && break
+                sleep $RETRY_DELAY
+            else
+                # Session gone — terminal is done
+                break
+            fi
+            ;;
+    esac
+done

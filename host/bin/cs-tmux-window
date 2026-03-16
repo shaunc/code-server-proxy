@@ -1,0 +1,153 @@
+#!/bin/bash
+# cs-tmux-window — manage tmux sessions for code-server terminal panes
+#
+# Model: one tmux SESSION per terminal pane (not one session per workspace).
+# Sessions are named cs-{instanceId}-{N} where N is auto-incremented.
+# Each pane gets a fully independent tmux session with one window.
+#
+# Usage:
+#   cs-tmux-window create <instance-id> [working-dir]
+#     Create a new tmux session for a terminal pane.
+#     Prints the full session name.
+#
+#   cs-tmux-window attach-or-create <instance-id> <pane-id> [working-dir]
+#     Look up pane-id in the mapping file. If found and the session
+#     still exists, print its name. Otherwise create a new session
+#     and save the mapping.
+#
+#   cs-tmux-window list <instance-id>
+#     List session names for an instance.
+#
+#   cs-tmux-window cleanup <instance-id>
+#     Kill all sessions for an instance.
+#
+# Environment:
+#   CS_TMUX_CONF     — tmux config (default: ~/.config/code-server-proxy/tmux.conf)
+#   CS_TMUX_MAPPINGS — mapping dir (default: ~/.config/code-server-proxy/mappings)
+
+set -euo pipefail
+
+TMUX_CONF="${CS_TMUX_CONF:-$HOME/.config/code-server-proxy/tmux.conf}"
+MAPPING_DIR="${CS_TMUX_MAPPINGS:-$HOME/.config/code-server-proxy/mappings}"
+LOCK_DIR="${MAPPING_DIR}/.locks"
+
+TMUX_ARGS=()
+[ -f "$TMUX_CONF" ] && TMUX_ARGS=(-f "$TMUX_CONF")
+
+. ~/.shrc 2>/dev/null || true
+
+# Find the next available session index for an instance.
+next_index() {
+    local prefix="cs-$1-"
+    local max=-1
+    while IFS= read -r name; do
+        local n="${name#"$prefix"}"
+        if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt "$max" ]; then
+            max="$n"
+        fi
+    done < <(tmux "${TMUX_ARGS[@]}" list-sessions -F '#{session_name}' 2>/dev/null \
+        | grep "^${prefix}")
+    echo $((max + 1))
+}
+
+# Create a new session for this instance, print its name.
+create_session() {
+    local iid="$1" workdir="${2:-.}"
+    local idx
+    idx=$(next_index "$iid")
+    local session="cs-${iid}-${idx}"
+    tmux "${TMUX_ARGS[@]}" new-session -d -s "$session" -c "$workdir"
+    echo "$session"
+}
+
+# Read pane-id → session mapping.
+read_mapping() {
+    local map_file="$1" pane_id="$2"
+    [ -f "$map_file" ] || return 1
+    python3 -c "
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    v = d.get(sys.argv[2], '')
+    if v:
+        print(v)
+        sys.exit(0)
+    sys.exit(1)
+except Exception:
+    sys.exit(1)
+" "$map_file" "$pane_id"
+}
+
+# Write pane-id → session mapping (atomic).
+write_mapping() {
+    local map_file="$1" pane_id="$2" session="$3"
+    mkdir -p "$(dirname "$map_file")"
+    mkdir -p "$LOCK_DIR"
+    (
+        flock 9
+        python3 -c "
+import json, sys, os
+map_file, pane_id, session = sys.argv[1], sys.argv[2], sys.argv[3]
+tmp = map_file + '.tmp'
+d = {}
+if os.path.exists(map_file):
+    try:
+        d = json.load(open(map_file))
+    except Exception:
+        pass
+d[pane_id] = session
+with open(tmp, 'w') as f:
+    json.dump(d, f)
+os.rename(tmp, map_file)
+" "$map_file" "$pane_id" "$session"
+    ) 9>"$LOCK_DIR/$(basename "$map_file").lock"
+}
+
+case "${1:-}" in
+    create)
+        [ $# -lt 2 ] && { echo "Usage: cs-tmux-window create <instance-id> [workdir]" >&2; exit 1; }
+        create_session "$2" "${3:-.}"
+        ;;
+
+    attach-or-create)
+        [ $# -lt 3 ] && { echo "Usage: cs-tmux-window attach-or-create <instance-id> <pane-id> [workdir]" >&2; exit 1; }
+        iid="$2"; pane_id="$3"; workdir="${4:-.}"
+        map_file="$MAPPING_DIR/cs-${iid}.json"
+
+        # Check if pane_id has a saved session mapping
+        if saved_session=$(read_mapping "$map_file" "$pane_id"); then
+            # Verify session still exists
+            if tmux "${TMUX_ARGS[@]}" has-session -t "$saved_session" \
+                2>/dev/null; then
+                echo "$saved_session"
+                exit 0
+            fi
+        fi
+
+        # No mapping or session gone — create new
+        session=$(create_session "$iid" "$workdir")
+        write_mapping "$map_file" "$pane_id" "$session"
+        echo "$session"
+        ;;
+
+    list)
+        [ $# -lt 2 ] && { echo "Usage: cs-tmux-window list <instance-id>" >&2; exit 1; }
+        tmux "${TMUX_ARGS[@]}" list-sessions -F '#{session_name}' 2>/dev/null \
+            | grep "^cs-${2}-" || true
+        ;;
+
+    cleanup)
+        [ $# -lt 2 ] && { echo "Usage: cs-tmux-window cleanup <instance-id>" >&2; exit 1; }
+        tmux "${TMUX_ARGS[@]}" list-sessions -F '#{session_name}' 2>/dev/null \
+            | grep "^cs-${2}-" | while IFS= read -r s; do
+                tmux "${TMUX_ARGS[@]}" kill-session -t "$s" 2>/dev/null || true
+            done
+        # Clean mapping file
+        rm -f "$MAPPING_DIR/cs-${2}.json"
+        ;;
+
+    *)
+        echo "Usage: cs-tmux-window {create|attach-or-create|list|cleanup} ..." >&2
+        exit 1
+        ;;
+esac
