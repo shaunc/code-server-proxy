@@ -180,7 +180,8 @@
     "**/.venv/**",
     "**/venv/**",
     "**/__pycache__/**",
-    "**/node_modules/**"
+    "**/node_modules/**",
+    "**/tmp/**"
   ],
   "diffEditor.hideUnchangedRegions.enabled": true,
   // Disable shell integration to prevent exit-on-error bug

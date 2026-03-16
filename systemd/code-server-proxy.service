@@ -1,6 +1,7 @@
 [Unit]
 Description=Code-Server Workspace Isolation Proxy
-After=network.target
+After=network.target ssh-agent.service
+Requires=ssh-agent.service
 
 [Service]
 Type=simple
