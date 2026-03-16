@@ -706,7 +706,12 @@ function cleanOrphanedTmuxSessions() {
       .filter((s) => s.startsWith('cs-'));
 
     for (const session of sessions) {
-      const instanceId = session.slice(3); // strip 'cs-' prefix
+      // Session names are cs-{instanceId}-{N} — extract instanceId
+      // by stripping 'cs-' prefix and '-{N}' pane suffix
+      const withoutPrefix = session.slice(3);
+      const lastDash = withoutPrefix.lastIndexOf('-');
+      if (lastDash === -1) continue; // not a session-per-pane name
+      const instanceId = withoutPrefix.slice(0, lastDash);
       const containerName = `code-server-${instanceId}`;
       try {
         // Check if container exists and is running
