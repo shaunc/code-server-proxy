@@ -51,13 +51,24 @@ next_index() {
 }
 
 # Create a new session for this instance, print its name.
+# Retries on name collision (concurrent creation race).
 create_session() {
     local iid="$1" workdir="${2:-.}"
-    local idx
-    idx=$(next_index "$iid")
-    local session="cs-${iid}-${idx}"
-    tmux "${TMUX_ARGS[@]}" new-session -d -s "$session" -c "$workdir"
-    echo "$session"
+    local attempts=0
+    while [ $attempts -lt 20 ]; do
+        local idx
+        idx=$(next_index "$iid")
+        local session="cs-${iid}-${idx}"
+        if tmux "${TMUX_ARGS[@]}" new-session -d -s "$session" \
+            -c "$workdir" 2>/dev/null; then
+            echo "$session"
+            return 0
+        fi
+        # Name collision — another process won the race, retry
+        attempts=$((attempts + 1))
+    done
+    echo "create_session: failed after $attempts attempts" >&2
+    return 1
 }
 
 # Read pane-id → session mapping.
