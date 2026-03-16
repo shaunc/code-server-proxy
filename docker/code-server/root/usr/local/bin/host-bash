@@ -8,6 +8,20 @@ if [ -z "$HOST_USER" ]; then
     exec /bin/bash "$@"
 fi
 
+# Check SSH mux health - clean up stale control socket if master
+# is unresponsive or wedged, so ControlMaster auto can establish
+# a fresh one.  -O check only tests if the master process is alive;
+# a wedged master passes that but can't forward new sessions.
+# An end-to-end "true" through the mux catches both cases.
+CONTROL_SOCKET="/run/user/1001/ssh-control-host.docker.internal"
+if [ -S "$CONTROL_SOCKET" ]; then
+    if ! timeout 3 ssh -o BatchMode=yes \
+        "$HOST_USER@host.docker.internal" true \
+        >/dev/null 2>&1; then
+        rm -f "$CONTROL_SOCKET"
+    fi
+fi
+
 # Build cd prefix if WORKSPACE_PATH is set
 cd_cmd=""
 if [ -n "$WORKSPACE_PATH" ]; then
@@ -17,10 +31,13 @@ fi
 # Source .shrc for tool environments (CUDA, etc.)
 shrc_source=". ~/.shrc 2>/dev/null || true; "
 
-# If stdin is a TTY, allocate PTY for SSH
+# SSH config provides ControlMaster auto / ControlPath / ControlPersist.
+# First connection becomes the mux master; subsequent ones multiplex.
 if [ -t 0 ]; then
-    exec ssh -t "$HOST_USER@host.docker.internal" "${shrc_source}${cd_cmd}exec bash" "$@"
+    exec ssh -t "$HOST_USER@host.docker.internal" \
+        "${shrc_source}${cd_cmd}exec bash" "$@"
 fi
 
 # Non-interactive: no PTY needed
-exec ssh "$HOST_USER@host.docker.internal" "${shrc_source}${cd_cmd}bash" "$@"
+exec ssh "$HOST_USER@host.docker.internal" \
+    "${shrc_source}${cd_cmd}bash" "$@"
