@@ -36,17 +36,26 @@ if [ -S "$CONTROL_SOCKET" ]; then
     fi
 fi
 
-# Create or reattach to a tmux session for this pane.
-# TMUX_PANE_ID is set by the extension for pane-to-session mapping.
-if [ -n "$TMUX_PANE_ID" ]; then
+# Determine tmux session to attach to.
+# Priority: TMUX_SESSION (direct, from extension)
+#         > TMUX_PANE_ID (mapped, from extension profile)
+#         > grab first unattached session (reconnect on reload)
+#         > create new session
+if [ -n "$TMUX_SESSION" ]; then
+    # Extension told us exactly which session — use it directly
+    true
+elif [ -n "$TMUX_PANE_ID" ]; then
     TMUX_SESSION=$(ssh -o ConnectTimeout=10 -o BatchMode=yes \
         "$SSH_DEST" \
         "${shrc_source}cs-tmux-window attach-or-create \
             '$IID' '$TMUX_PANE_ID' '$WORKDIR'")
 else
+    # Try to grab an unattached session for this instance.
+    # On reload, code-server recreates terminals — each host-bash
+    # grabs one unattached session instead of creating a new one.
     TMUX_SESSION=$(ssh -o ConnectTimeout=10 -o BatchMode=yes \
         "$SSH_DEST" \
-        "${shrc_source}cs-tmux-window create '$IID' '$WORKDIR'")
+        "${shrc_source}cs-tmux-window grab '$IID' '$WORKDIR'")
 fi
 
 if [ $? -ne 0 ] || [ -z "$TMUX_SESSION" ]; then

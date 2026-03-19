@@ -141,6 +141,50 @@ case "${1:-}" in
         echo "$session"
         ;;
 
+    grab)
+        # Grab an unattached session for this instance, or create new.
+        # Used by host-bash on reload: each terminal grabs one session.
+        # Uses flock + claim files to prevent two terminals grabbing
+        # the same session (tmux doesn't show "attached" until the
+        # actual tmux attach runs, which is after this returns).
+        [ $# -lt 2 ] && { echo "Usage: cs-tmux-window grab <instance-id> [workdir]" >&2; exit 1; }
+        iid="$2"; workdir="${3:-.}"
+        claim_dir="$LOCK_DIR/claims-${iid}"
+        mkdir -p "$claim_dir"
+        (
+            flock 9
+            prefix="cs-${iid}-"
+            # Find first unattached AND unclaimed session
+            grabbed=""
+            while IFS=' ' read -r name attached; do
+                [ "$attached" != "0" ] && continue
+                # Check claim file (skip if claimed within last 30s)
+                claim_file="$claim_dir/$name"
+                if [ -f "$claim_file" ]; then
+                    claim_age=$(( $(date +%s) - $(stat -c %Y "$claim_file") ))
+                    [ "$claim_age" -lt 30 ] && continue
+                fi
+                grabbed="$name"
+                break
+            done < <(tmux "${TMUX_ARGS[@]}" list-sessions \
+                -F '#{session_name} #{session_attached}' 2>/dev/null \
+                | grep "^${prefix}")
+
+            if [ -n "$grabbed" ]; then
+                touch "$claim_dir/$grabbed"
+                echo "$grabbed"
+            else
+                # No unattached sessions — create new
+                session=$(create_session "$iid" "$workdir")
+                touch "$claim_dir/$session"
+                echo "$session"
+            fi
+        ) 9>"$LOCK_DIR/grab-${iid}.lock"
+
+        # Clean old claim files (>60s) in background
+        find "$claim_dir" -maxdepth 1 -type f -mmin +1 -delete 2>/dev/null &
+        ;;
+
     list)
         [ $# -lt 2 ] && { echo "Usage: cs-tmux-window list <instance-id>" >&2; exit 1; }
         tmux "${TMUX_ARGS[@]}" list-sessions -F '#{session_name}' 2>/dev/null \
