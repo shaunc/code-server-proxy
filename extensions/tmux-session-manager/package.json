@@ -1,0 +1,50 @@
+{
+  "name": "tmux-session-manager",
+  "displayName": "tmux Session Manager",
+  "description": "Maps VS Code terminal panes to tmux sessions for persistence across disconnects",
+  "version": "0.1.0",
+  "publisher": "code-server-proxy",
+  "engines": {
+    "vscode": "^1.93.0"
+  },
+  "extensionKind": [
+    "workspace"
+  ],
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "*"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "terminal": {
+      "profiles": [
+        {
+          "id": "tmuxSessionManager.hostShell",
+          "title": "Host Shell (tmux)"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "tmuxSessionManager.reconnectAll",
+        "title": "tmux: Reconnect All Terminals"
+      },
+      {
+        "command": "tmuxSessionManager.showSessions",
+        "title": "tmux: Show Active Sessions"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npx @vscode/vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.93.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}
