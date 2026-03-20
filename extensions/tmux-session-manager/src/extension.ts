@@ -114,6 +114,50 @@ function generatePaneId(): string {
   return crypto.randomUUID();
 }
 
+/**
+ * Find the viewColumn for a terminal by scanning tab groups.
+ * Returns 0 if not found (terminal might be in panel or not yet visible).
+ */
+function getTerminalViewColumn(terminal: vscode.Terminal): number {
+  for (const group of vscode.window.tabGroups.all) {
+    for (const tab of group.tabs) {
+      if (
+        tab.input instanceof vscode.TabInputTerminal &&
+        tab.label === terminal.name
+      ) {
+        return group.viewColumn;
+      }
+    }
+  }
+  return 0;
+}
+
+/**
+ * Update the viewColumn for a tracked terminal in the mapping.
+ */
+function updatePaneViewColumn(terminal: vscode.Terminal): void {
+  const paneId = terminalToPaneId.get(terminal);
+  if (!paneId || !mapping.panes[paneId]) {
+    return;
+  }
+  const vc = getTerminalViewColumn(terminal);
+  if (vc > 0 && mapping.panes[paneId].viewColumn !== vc) {
+    mapping.panes[paneId].viewColumn = vc;
+    persistMapping(mapping, mappingFilePath);
+  }
+}
+
+/**
+ * Convert a saved viewColumn number to a TerminalEditorLocationOptions.
+ * ViewColumn values: 1=One, 2=Two, 3=Three, etc.
+ */
+function viewColumnToLocation(
+  viewColumn: number,
+): vscode.TerminalEditorLocationOptions {
+  // vscode.ViewColumn enum: 1=One, 2=Two, 3=Three, ...
+  return { viewColumn: viewColumn as vscode.ViewColumn };
+}
+
 function createTerminalForPane(
   paneId: string,
   paneInfo: PaneMapping,
@@ -124,11 +168,15 @@ function createTerminalForPane(
   if (paneInfo.tmuxSession) {
     env.TMUX_SESSION = paneInfo.tmuxSession;
   }
+  const location =
+    paneInfo.viewColumn > 0
+      ? viewColumnToLocation(paneInfo.viewColumn)
+      : vscode.TerminalLocation.Editor;
   const terminal = vscode.window.createTerminal({
     name: paneInfo.name || "Host Shell (tmux)",
     shellPath: "/usr/local/bin/host-bash",
     env,
-    location: vscode.TerminalLocation.Editor,
+    location,
   });
   terminalToPaneId.set(terminal, paneId);
   paneIdToTerminal.set(paneId, terminal);
@@ -400,6 +448,25 @@ export function activate(context: vscode.ExtensionContext): void {
         removePaneFromMapping(paneId);
       }
       // On shutdown/unknown, keep the mapping for reconnection
+    }),
+  );
+
+  // Track viewColumn changes — update mapping when terminals move
+  context.subscriptions.push(
+    vscode.window.onDidChangeActiveTerminal((terminal) => {
+      if (terminal) {
+        // Delay slightly — tab group info may not be updated yet
+        setTimeout(() => updatePaneViewColumn(terminal), 200);
+      }
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.window.tabGroups.onDidChangeTabGroups(() => {
+      // A tab was moved/split — update viewColumn for all tracked terminals
+      for (const [terminal] of terminalToPaneId) {
+        updatePaneViewColumn(terminal);
+      }
     }),
   );
 
