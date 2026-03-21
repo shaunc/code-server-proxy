@@ -202,6 +202,6 @@
       "icon": "terminal-bash"
     }
   },
-  "terminal.integrated.defaultProfile.linux": "Host Shell (SSH)",
+  "terminal.integrated.defaultProfile.linux": "Host Shell (tmux)",
   "terminal.integrated.enableMultiLinePasteWarning": "never"
 }

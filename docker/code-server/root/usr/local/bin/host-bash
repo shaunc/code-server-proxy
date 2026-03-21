@@ -63,6 +63,15 @@ if [ $? -ne 0 ] || [ -z "$TMUX_SESSION" ]; then
     exit 1
 fi
 
+# When VS Code closes the terminal pane, host-bash receives SIGHUP/SIGTERM.
+# Kill the tmux session so it doesn't persist as an orphan.
+cleanup_session() {
+    ssh -o ConnectTimeout=3 -o BatchMode=yes "$SSH_DEST" \
+        "tmux kill-session -t '$TMUX_SESSION'" 2>/dev/null
+    exit 0
+}
+trap cleanup_session HUP TERM
+
 # Attach loop — reconnect to same session on SSH drop
 MAX_RETRIES=60
 RETRY_DELAY=2
