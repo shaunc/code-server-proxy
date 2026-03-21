@@ -141,6 +141,9 @@
     }
   },
   "security.workspace.trust.untrustedFiles": "open",
+  // Don't follow symlinks in search — prevents runaway rg from
+  // circular symlinks in tmp/ directories across workspaces
+  "search.followSymlinks": false,
   // File watcher exclusions - prevent watching huge directories
   "files.watcherExclude": {
     "**/.git/objects/**": true,
