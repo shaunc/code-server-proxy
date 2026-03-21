@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily 6am restart of leaky code-server extension hosts
+
+[Timer]
+OnCalendar=*-*-* 06:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

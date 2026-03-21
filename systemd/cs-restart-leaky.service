@@ -1,0 +1,6 @@
+[Unit]
+Description=Restart code-server containers with leaking extension hosts
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/cs-restart-leaky-containers 1024

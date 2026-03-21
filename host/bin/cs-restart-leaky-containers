@@ -1,0 +1,40 @@
+#!/bin/bash
+# cs-restart-leaky-containers — restart containers whose extension host
+# exceeds a memory threshold. Designed to run via systemd timer at 6am.
+#
+# The extension host leaks native malloc'd memory (not V8 JS heap)
+# over time when Python extensions are active. Restarting the container
+# restarts the extension host with a fresh heap. tmux sessions survive
+# the restart, so terminals reconnect automatically.
+
+set -euo pipefail
+
+THRESHOLD_MB="${1:-1024}"  # default 1GB
+
+restarted=0
+skipped=0
+
+for pid in $(pgrep -f "type=extensionHost" 2>/dev/null); do
+    rss_kb=$(ps -p "$pid" -o rss= 2>/dev/null) || continue
+    rss_mb=$((rss_kb / 1024))
+
+    if [ "$rss_mb" -lt "$THRESHOLD_MB" ]; then
+        skipped=$((skipped + 1))
+        continue
+    fi
+
+    # Find the container for this extension host
+    cid=$(grep -oP '[a-f0-9]{64}' /proc/"$pid"/cgroup 2>/dev/null | head -1)
+    [ -z "$cid" ] && continue
+
+    cname=$(docker inspect --format '{{.Name}}' "$cid" 2>/dev/null | sed 's|^/||')
+    [ -z "$cname" ] && continue
+
+    ws=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$cid" 2>/dev/null \
+        | grep WORKSPACE_PATH | cut -d= -f2 | sed 's|.*/||')
+
+    echo "[$(date '+%H:%M:%S')] Restarting $cname ($ws): extension host ${rss_mb}MB > ${THRESHOLD_MB}MB"
+    docker restart "$cname" --time 10 2>/dev/null && restarted=$((restarted + 1))
+done
+
+echo "[$(date '+%H:%M:%S')] Done: restarted=$restarted skipped=$skipped"
