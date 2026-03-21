@@ -311,35 +311,41 @@ async function reconnectMapped(): Promise<number> {
 }
 
 /**
- * Adopt unattached, unmapped tmux sessions.
- * Only adopts sessions that are NOT already attached (host-bash's
- * grab already reconnected attached ones on reload).
+ * Adopt unmapped tmux sessions that don't have a visible terminal.
+ * A session may be "attached" in tmux (stale host-bash from a
+ * previous browser session) but have no visible VS Code terminal
+ * pane — these should be adopted too.
  */
 async function reconnectAll(): Promise<number> {
   // First reconnect mapped panes
   const reconnected = await reconnectMapped();
 
-  // Then adopt unmapped AND unattached sessions only.
-  // Attached sessions were already grabbed by host-bash on reload —
-  // don't create duplicate terminals for them.
-  const liveSessions = listTmuxSessions(instanceId);
-  const mappedSessions = new Set(
+  // Build set of tmux sessions that have a visible VS Code terminal.
+  // A session is "visible" if the extension tracks a terminal for it.
+  const visibleSessions = new Set(
     Object.values(mapping.panes)
       .map((p) => p.tmuxSession)
       .filter((s) => s),
   );
 
+  // Also include sessions for terminals we track in memory
+  // (may not be in mapping yet if just created this activation)
+  for (const [terminal] of terminalToPaneId) {
+    const paneId = terminalToPaneId.get(terminal);
+    if (paneId && mapping.panes[paneId]?.tmuxSession) {
+      visibleSessions.add(mapping.panes[paneId].tmuxSession);
+    }
+  }
+
+  const liveSessions = listTmuxSessions(instanceId);
   let adopted = 0;
   for (const session of liveSessions) {
-    if (mappedSessions.has(session.name)) {
-      continue;
-    }
-    if (session.attached) {
-      // Already attached by a code-server terminal via grab
+    if (visibleSessions.has(session.name)) {
       continue;
     }
     console.log(
-      `[tmux-session-manager] Adopting unmapped session: ${session.name}`,
+      `[tmux-session-manager] Adopting session: ${session.name}` +
+        ` (attached=${session.attached})`,
     );
     createTerminalForSession(session.name);
     adopted++;
