@@ -63,21 +63,16 @@ if [ $? -ne 0 ] || [ -z "$TMUX_SESSION" ]; then
     exit 1
 fi
 
-# When VS Code closes the terminal pane, host-bash receives SIGHUP/SIGTERM.
-# Kill the tmux session only if we can confirm we're the last client.
-# Default to NOT killing if the check fails (SSH broken during shutdown).
+# On SIGHUP/SIGTERM (user closes pane, or container stops):
+# Kill the tmux session ONLY if SSH to host still works (user action).
+# During container stop, SSH fails → session preserved for reconnect.
 cleanup_session() {
-    attached=$(ssh -o ConnectTimeout=2 -o BatchMode=yes \
+    if ssh -o ConnectTimeout=1 -o BatchMode=yes \
         -o ControlMaster=no "$SSH_DEST" \
-        "tmux display-message -t '$TMUX_SESSION' -p '#{session_attached}'" \
-        2>/dev/null) || true
-    # Only kill if we got a definitive answer of 0 or 1 attached.
-    # If SSH failed, attached is empty — default to safe (don't kill).
-    case "$attached" in
-        0|1) ssh -o ConnectTimeout=2 -o BatchMode=yes \
-                -o ControlMaster=no "$SSH_DEST" \
-                "tmux kill-session -t '$TMUX_SESSION'" 2>/dev/null ;;
-    esac
+        "tmux kill-session -t '$TMUX_SESSION'" 2>/dev/null; then
+        true  # killed — user closed the pane
+    fi
+    # If SSH failed, container is stopping — session preserved
     exit 0
 }
 trap cleanup_session HUP TERM
