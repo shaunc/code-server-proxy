@@ -213,9 +213,15 @@ async function createConfigVolume(instanceId) {
  * @param {number} port - Host port to bind
  * @returns {Promise<Object>} Container object
  */
-async function createContainer(instanceId, workspacePath, port) {
+async function createContainer(
+  instanceId,
+  workspacePath,
+  port,
+  { configVolumeOverride } = {}
+) {
   const containerName = `code-server-${instanceId}`;
-  const configVolume = `code-server-${instanceId}-config`;
+  const configVolume =
+    configVolumeOverride || `code-server-${instanceId}-config`;
 
   console.log(`Creating container: ${containerName}`);
   console.log(`  Workspace: ${workspacePath}`);
@@ -749,6 +755,28 @@ function cleanOrphanedTmuxSessions() {
     }
   } catch {
     // tmux not running or no sessions — nothing to clean
+  }
+}
+
+/**
+ * Rename a container (works on running containers)
+ * @param {string} currentInstanceId - Current instance ID (suffix)
+ * @param {string} newInstanceId - New instance ID (suffix)
+ * @returns {Promise<void>}
+ */
+async function renameContainer(currentInstanceId, newInstanceId) {
+  const currentName = `code-server-${currentInstanceId}`;
+  const newName = `code-server-${newInstanceId}`;
+  try {
+    const container = docker.getContainer(currentName);
+    await container.rename({ name: newName });
+    console.log(`Container renamed: ${currentName} → ${newName}`);
+  } catch (error) {
+    console.error(
+      `Failed to rename ${currentName} → ${newName}:`,
+      error.message
+    );
+    throw error;
   }
 }
 
@@ -1750,6 +1778,7 @@ module.exports = {
   createWorkspaceSymlink,
   stopContainer,
   removeContainer,
+  renameContainer,
   isContainerRunning,
   inspectContainer,
   isContainerImageOutdated,

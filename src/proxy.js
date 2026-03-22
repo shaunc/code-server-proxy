@@ -595,6 +595,121 @@ async function waitForBackend(port, timeout = BACKEND_READY_TIMEOUT) {
 }
 
 /**
+ * Update the port for a workspace in the registry.
+ * Atomically rewrites the bidirectional mapping.
+ * @param {string} workspacePath - Workspace path
+ * @param {number} newPort - New port number
+ */
+function updatePortInRegistry(workspacePath, newPort) {
+  const registry = loadRegistry();
+  const entry = registry.workspaces[workspacePath];
+  if (!entry) return;
+
+  // Remove old port mapping
+  delete registry.ports[String(entry.currentPort)];
+
+  // Update to new port
+  entry.currentPort = newPort;
+  registry.ports[String(newPort)] = {
+    workspacePath,
+    instanceId: entry.instanceId,
+  };
+
+  saveRegistry(registry);
+  console.log(
+    `[BLUE-GREEN] Updated registry: ${workspacePath} → port ${newPort}`
+  );
+}
+
+/**
+ * Blue-green container recreation: create new container, wait for ready,
+ * swap port in registry, rename, stop old. Minimizes downtime to ~1-2s
+ * WebSocket reconnection instead of 15-30s full restart.
+ *
+ * @param {string} instanceId - Instance ID
+ * @param {string} workspacePath - Workspace path
+ * @param {number} currentPort - Current port (will be freed)
+ * @returns {Promise<boolean>} True if successful
+ */
+async function blueGreenRecreate(instanceId, workspacePath, currentPort) {
+  const tempPort = currentPort + 100; // 8200-8299 range
+  const tempInstanceId = `${instanceId}-new`;
+  const configVolume = `code-server-${instanceId}-config`;
+
+  console.log(
+    `[BLUE-GREEN] Starting recreation of ${instanceId.substring(0, 8)} ` +
+      `(${workspacePath})`
+  );
+
+  try {
+    // 1. Remove any leftover temp container from a previous attempt
+    try {
+      await containerManager.removeContainer(tempInstanceId, true);
+    } catch {
+      // Doesn't exist, fine
+    }
+
+    // 2. Create new container on temp port, sharing the config volume
+    console.log(`[BLUE-GREEN] Creating temp container on port ${tempPort}`);
+    await containerManager.createContainer(
+      tempInstanceId,
+      workspacePath,
+      tempPort,
+      { configVolumeOverride: configVolume }
+    );
+    await containerManager.startContainer(tempInstanceId);
+
+    // 3. Wait for new container to be ready
+    console.log(`[BLUE-GREEN] Waiting for new container to be ready...`);
+    const ready = await waitForBackend(tempPort, 60000); // 60s timeout
+    if (!ready) {
+      console.error(`[BLUE-GREEN] New container failed to start, aborting`);
+      try {
+        await containerManager.stopContainer(tempInstanceId, 5);
+        await containerManager.removeContainer(tempInstanceId, true);
+      } catch {
+        // cleanup best-effort
+      }
+      return false;
+    }
+
+    // 4. Swap port in registry (new requests go to new container)
+    console.log(`[BLUE-GREEN] New container ready, swapping...`);
+    updatePortInRegistry(workspacePath, tempPort);
+
+    // 5. Rename containers (works on running containers)
+    await containerManager.renameContainer(instanceId, `${instanceId}-old`);
+    await containerManager.renameContainer(tempInstanceId, instanceId);
+
+    // 6. Stop and remove old container
+    try {
+      await containerManager.stopContainer(`${instanceId}-old`, 10);
+      await containerManager.removeContainer(`${instanceId}-old`, true);
+    } catch {
+      // Old container may already be gone
+    }
+
+    containerManager.clearOutdatedCache(instanceId);
+    console.log(
+      `[BLUE-GREEN] Recreation complete for ${instanceId.substring(0, 8)}`
+    );
+    return true;
+  } catch (error) {
+    console.error(
+      `[BLUE-GREEN] Failed for ${instanceId.substring(0, 8)}: ${error.message}`
+    );
+    // Cleanup temp container on failure
+    try {
+      await containerManager.stopContainer(tempInstanceId, 5);
+      await containerManager.removeContainer(tempInstanceId, true);
+    } catch {
+      // best-effort
+    }
+    return false;
+  }
+}
+
+/**
  * Launch code-server instance (Docker or systemd) - internal implementation
  * @param {string} instanceId - Instance ID
  * @param {string} workspacePath - Workspace path (required for Docker mode)
@@ -1715,24 +1830,45 @@ server.listen(PROXY_PORT, PROXY_HOST, async () => {
       async () => {
         await containerManager.checkAllContainersForOutdatedImages();
 
-        // Recreate idle outdated containers (no active connections)
+        // Recreate outdated containers:
+        // - Idle (no connections): simple stop→remove (will restart on next request)
+        // - Active (has connections): blue-green swap (zero-downtime)
+        const registry = loadRegistry();
         for (const [iid, info] of containerManager.getOutdatedContainers()) {
           if (!info.outdated) continue;
-          if (wsProxy.hasActiveConnections(iid)) {
-            continue; // skip active containers
+
+          // Find workspace path for this instance
+          let wsPath = null;
+          for (const [wp, entry] of Object.entries(registry.workspaces)) {
+            if (entry.instanceId === iid) {
+              wsPath = wp;
+              break;
+            }
           }
-          console.log(
-            `[IMAGE-CHECK] Recreating idle outdated container ${iid.substring(0, 8)}`
-          );
-          try {
-            await containerManager.stopContainer(iid);
-            await containerManager.removeContainer(iid);
-            containerManager.clearOutdatedCache(iid);
-          } catch (err) {
-            console.error(
-              `[IMAGE-CHECK] Failed to recreate ${iid.substring(0, 8)}:`,
-              err.message
+
+          if (wsProxy.hasActiveConnections(iid)) {
+            // Active container: blue-green swap
+            if (wsPath) {
+              const entry = registry.workspaces[wsPath];
+              console.log(
+                `[IMAGE-CHECK] Blue-green recreating active container ${iid.substring(0, 8)}`
+              );
+              await blueGreenRecreate(iid, wsPath, entry.currentPort);
+            }
+          } else {
+            // Idle container: simple stop→remove
+            console.log(
+              `[IMAGE-CHECK] Recreating idle container ${iid.substring(0, 8)}`
             );
+            try {
+              await containerManager.stopContainer(iid);
+              await containerManager.removeContainer(iid);
+              containerManager.clearOutdatedCache(iid);
+            } catch (err) {
+              console.error(
+                `[IMAGE-CHECK] Failed: ${iid.substring(0, 8)}: ${err.message}`
+              );
+            }
           }
         }
       },
