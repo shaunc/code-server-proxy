@@ -63,19 +63,17 @@ if [ $? -ne 0 ] || [ -z "$TMUX_SESSION" ]; then
     exit 1
 fi
 
-# On SIGHUP/SIGTERM (user closes pane, or container stops):
-# Kill the tmux session ONLY if SSH to host still works (user action).
-# During container stop, SSH fails → session preserved for reconnect.
-cleanup_session() {
-    if ssh -o ConnectTimeout=1 -o BatchMode=yes \
-        -o ControlMaster=no "$SSH_DEST" \
-        "tmux kill-session -t '$TMUX_SESSION'" 2>/dev/null; then
-        true  # killed — user closed the pane
-    fi
-    # If SSH failed, container is stopping — session preserved
-    exit 0
-}
-trap cleanup_session HUP TERM
+# On SIGHUP/SIGTERM, just exit. Do NOT kill the tmux session.
+# We cannot reliably distinguish "user closed pane" from "container
+# stopping" — SSH to host works briefly during container stop, so
+# any SSH-based check is a race condition.
+#
+# tmux sessions are cleaned up by:
+# - User typing 'exit' (shell exits → tmux auto-destroys session)
+# - Extension's removePaneFromMapping (for tracked terminals)
+# - Container eviction (cs-tmux-window cleanup in stopContainer)
+# - Periodic orphan sweep (5-minute interval)
+trap 'exit 0' HUP TERM
 
 # Attach loop — reconnect to same session on SSH drop
 MAX_RETRIES=60
