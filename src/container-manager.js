@@ -949,6 +949,14 @@ function clearOutdatedCache(instanceId) {
 }
 
 /**
+ * Get all entries from the outdated containers cache
+ * @returns {Map} instanceId -> { outdated, containerImageId, checkedAt }
+ */
+function getOutdatedContainers() {
+  return outdatedContainersCache;
+}
+
+/**
  * Get container logs
  * @param {string} instanceId - Instance ID
  * @param {number} tail - Number of lines to retrieve
@@ -1733,6 +1741,7 @@ module.exports = {
   checkAllContainersForOutdatedImages,
   isContainerOutdatedCached,
   clearOutdatedCache,
+  getOutdatedContainers,
   getContainerLogs,
   getContainerPort,
   createConfigVolume,

@@ -74,7 +74,7 @@ function proxyWebSocket(req, socket, head, targetUrl, instanceId) {
       }
     };
 
-    activeConnections.set(clientId, { startTime });
+    activeConnections.set(clientId, { startTime, instanceId });
 
     // Backend connection handlers
     backendWs.on('open', () => {
@@ -153,6 +153,18 @@ function getActiveConnectionCount() {
 }
 
 /**
+ * Check if an instance has any active WebSocket connections
+ * @param {string} instanceId - Instance ID
+ * @returns {boolean}
+ */
+function hasActiveConnections(instanceId) {
+  for (const conn of activeConnections.values()) {
+    if (conn.instanceId === instanceId) return true;
+  }
+  return false;
+}
+
+/**
  * Cleanup all active connections (for shutdown)
  */
 function cleanupAllConnections() {
@@ -166,6 +178,7 @@ function cleanupAllConnections() {
 module.exports = {
   proxyWebSocket,
   getActiveConnectionCount,
+  hasActiveConnections,
   cleanupAllConnections,
   PING_INTERVAL,
 };

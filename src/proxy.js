@@ -609,21 +609,17 @@ async function launchInstanceUnsafe(instanceId, workspacePath, port) {
       // Check if container exists
       let containerExists = await containerManager.inspectContainer(instanceId);
 
-      // Check if container is using outdated image and needs recreation
+      // If container is outdated, DON'T recreate in the request path —
+      // that drops active connections for 15-30s. Background check
+      // handles idle containers. Active ones update at 6am or on
+      // next fresh load after being closed.
       if (containerExists) {
         const isOutdated =
           await containerManager.isContainerImageOutdated(instanceId);
         if (isOutdated) {
           console.log(
-            `Container ${instanceId} is using outdated image, recreating...`
+            `Container ${instanceId.substring(0, 8)} is outdated (will update when idle)`
           );
-          // Clear outdated cache immediately to prevent other requests from
-          // triggering concurrent recreation attempts during the slow stop/remove
-          containerManager.clearOutdatedCache(instanceId);
-          await containerManager.stopContainer(instanceId);
-          await containerManager.removeContainer(instanceId);
-          // Container removed, will be recreated below
-          containerExists = false;
         }
       }
 
@@ -1060,20 +1056,12 @@ async function handleRequest(req, res) {
       targetPort = MAIN_PORT;
       instanceId = 'main';
 
-      // Check if container image is outdated (fast cached check - no Docker API)
-      const isOutdatedBare =
-        containerManager.isContainerOutdatedCached(instanceId);
       const isListeningBare = await isPortListening(targetPort);
 
-      // If outdated or not running, need to launch/relaunch
-      if (isOutdatedBare || !isListeningBare) {
-        if (isOutdatedBare) {
-          console.log(
-            `Instance ${instanceId.substring(0, 8)} using outdated image, recreating...`
-          );
-        } else {
-          console.log(`Main instance not running, launching ${instanceId}...`);
-        }
+      // If not running, launch. Outdated-but-running containers update
+      // when idle (background check) or at 6am (leak restart).
+      if (!isListeningBare) {
+        console.log(`Main instance not running, launching ${instanceId}...`);
 
         // Launch async (don't await)
         launchInstance(instanceId, null, targetPort).catch((err) => {
@@ -1160,15 +1148,9 @@ async function handleRequest(req, res) {
         containerManager.isContainerOutdatedCached(instanceId);
       const isListeningWorkspace = await isPortListening(targetPort);
 
-      // If outdated or not running, need to launch/relaunch
-      if (isOutdatedWorkspace || !isListeningWorkspace) {
-        if (isOutdatedWorkspace) {
-          console.log(
-            `Instance ${instanceId.substring(0, 8)} using outdated image, recreating...`
-          );
-        } else {
-          console.log(`Instance not running, launching ${instanceId}...`);
-        }
+      // If not running, launch. If outdated but running, skip.
+      if (!isListeningWorkspace) {
+        console.log(`Instance not running, launching ${instanceId}...`);
 
         // Launch async (don't await)
         launchInstance(instanceId, workspacePath, targetPort).catch((err) => {
@@ -1259,15 +1241,9 @@ async function handleRequest(req, res) {
         containerManager.isContainerOutdatedCached(instanceId);
       const isListeningFolder = await isPortListening(targetPort);
 
-      // If outdated or not running, need to launch/relaunch
-      if (isOutdatedFolder || !isListeningFolder) {
-        if (isOutdatedFolder) {
-          console.log(
-            `Instance ${instanceId.substring(0, 8)} using outdated image, recreating...`
-          );
-        } else {
-          console.log(`Instance not running, launching ${instanceId}...`);
-        }
+      // If not running, launch. If outdated but running, skip.
+      if (!isListeningFolder) {
+        console.log(`Instance not running, launching ${instanceId}...`);
 
         // Launch async (don't await)
         launchInstance(instanceId, workspacePath, targetPort).catch((err) => {
@@ -1349,15 +1325,9 @@ async function handleRequest(req, res) {
         containerManager.isContainerOutdatedCached(instanceId);
       const isListeningDefault = await isPortListening(targetPort);
 
-      // If outdated or not running, need to launch/relaunch
-      if (isOutdatedDefault || !isListeningDefault) {
-        if (isOutdatedDefault) {
-          console.log(
-            `Instance ${instanceId.substring(0, 8)} using outdated image, recreating...`
-          );
-        } else {
-          console.log(`Main instance not running, launching ${instanceId}...`);
-        }
+      // If not running, launch. If outdated but running, skip.
+      if (!isListeningDefault) {
+        console.log(`Main instance not running, launching ${instanceId}...`);
 
         // Launch async (don't await)
         launchInstance(instanceId, null, targetPort).catch((err) => {
@@ -1738,11 +1708,33 @@ server.listen(PROXY_PORT, PROXY_HOST, async () => {
       60 * 60 * 1000
     ); // 1 hour
 
-    // Check for outdated container images every 2 minutes
-    // This runs in background to avoid Docker API calls on hot request path
+    // Check for outdated container images every 2 minutes.
+    // Only recreates containers with NO active WebSocket connections.
+    // Active containers stay on old image until idle/6am/manual restart.
     setInterval(
       async () => {
         await containerManager.checkAllContainersForOutdatedImages();
+
+        // Recreate idle outdated containers (no active connections)
+        for (const [iid, info] of containerManager.getOutdatedContainers()) {
+          if (!info.outdated) continue;
+          if (wsProxy.hasActiveConnections(iid)) {
+            continue; // skip active containers
+          }
+          console.log(
+            `[IMAGE-CHECK] Recreating idle outdated container ${iid.substring(0, 8)}`
+          );
+          try {
+            await containerManager.stopContainer(iid);
+            await containerManager.removeContainer(iid);
+            containerManager.clearOutdatedCache(iid);
+          } catch (err) {
+            console.error(
+              `[IMAGE-CHECK] Failed to recreate ${iid.substring(0, 8)}:`,
+              err.message
+            );
+          }
+        }
       },
       2 * 60 * 1000
     ); // 2 minutes
