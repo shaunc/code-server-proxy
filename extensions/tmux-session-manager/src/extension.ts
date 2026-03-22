@@ -311,41 +311,40 @@ async function reconnectMapped(): Promise<number> {
 }
 
 /**
- * Adopt unmapped tmux sessions that don't have a visible terminal.
- * A session may be "attached" in tmux (stale host-bash from a
- * previous browser session) but have no visible VS Code terminal
- * pane — these should be adopted too.
+ * Adopt only UNATTACHED tmux sessions.
+ *
+ * Attached sessions already have a host-bash connected — either from
+ * a terminal in this browser session (via grab on reload) or from
+ * a terminal the extension created. Creating another terminal for
+ * an attached session produces a duplicate viewing the same tmux.
+ *
+ * Unattached sessions are from a previous browser session where the
+ * terminal was lost but tmux persisted. These are safe to adopt.
  */
 async function reconnectAll(): Promise<number> {
   // First reconnect mapped panes
   const reconnected = await reconnectMapped();
 
-  // Build set of tmux sessions that have a visible VS Code terminal.
-  // A session is "visible" if the extension tracks a terminal for it.
-  const visibleSessions = new Set(
+  const liveSessions = listTmuxSessions(instanceId);
+  const mappedSessions = new Set(
     Object.values(mapping.panes)
       .map((p) => p.tmuxSession)
       .filter((s) => s),
   );
 
-  // Also include sessions for terminals we track in memory
-  // (may not be in mapping yet if just created this activation)
-  for (const [terminal] of terminalToPaneId) {
-    const paneId = terminalToPaneId.get(terminal);
-    if (paneId && mapping.panes[paneId]?.tmuxSession) {
-      visibleSessions.add(mapping.panes[paneId].tmuxSession);
-    }
-  }
-
-  const liveSessions = listTmuxSessions(instanceId);
   let adopted = 0;
   for (const session of liveSessions) {
-    if (visibleSessions.has(session.name)) {
+    // Skip sessions we already track
+    if (mappedSessions.has(session.name)) {
+      continue;
+    }
+    // Only adopt UNATTACHED sessions — attached ones already
+    // have a terminal connected (via grab or direct creation)
+    if (session.attached) {
       continue;
     }
     console.log(
-      `[tmux-session-manager] Adopting session: ${session.name}` +
-        ` (attached=${session.attached})`,
+      `[tmux-session-manager] Adopting unattached session: ${session.name}`,
     );
     createTerminalForSession(session.name);
     adopted++;
