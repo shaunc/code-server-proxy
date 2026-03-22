@@ -217,7 +217,7 @@ async function createContainer(
   instanceId,
   workspacePath,
   port,
-  { configVolumeOverride } = {}
+  { configVolumeOverride, instanceIdOverride } = {}
 ) {
   const containerName = `code-server-${instanceId}`;
   const configVolume =
@@ -456,8 +456,10 @@ async function createContainer(
   }
   envVars.push(`HOST_USER=${process.env.USER}`);
 
-  // Expose instance ID for tmux session naming (cs-<instanceId>)
-  envVars.push(`INSTANCE_ID=${instanceId}`);
+  // Expose instance ID for tmux session naming (cs-<instanceId>).
+  // instanceIdOverride is used by blue-green to give the temp container
+  // the ORIGINAL instance ID, so grab reconnects to existing sessions.
+  envVars.push(`INSTANCE_ID=${instanceIdOverride || instanceId}`);
 
   // Don't use DEFAULT_WORKSPACE - we'll pass workspace as command line arg instead
   // (like systemd mode did)
@@ -734,12 +736,17 @@ function cleanOrphanedTmuxSessions() {
     }
 
     for (const session of sessions) {
-      // Session names are cs-{instanceId}-{N} — extract instanceId
-      // by stripping 'cs-' prefix and '-{N}' pane suffix
-      const withoutPrefix = session.slice(3);
-      const lastDash = withoutPrefix.lastIndexOf('-');
-      if (lastDash === -1) continue; // not a session-per-pane name
-      const instanceId = withoutPrefix.slice(0, lastDash);
+      // Session names: cs-{instanceId}-{N} or cs-{instanceId}-new-{N}
+      // Instance IDs are 64-char hex strings (SHA256) or 'main'.
+      // Extract by matching the 64-char hex pattern after 'cs-'.
+      const withoutPrefix = session.slice(3); // strip 'cs-'
+      const hexMatch = withoutPrefix.match(/^([a-f0-9]{64})/);
+      const instanceId = hexMatch
+        ? hexMatch[1]
+        : withoutPrefix === 'main' || withoutPrefix.startsWith('main-')
+          ? 'main'
+          : null;
+      if (!instanceId) continue;
 
       // If the instance is in the port registry, it's a known
       // workspace — don't kill even if container is temporarily down
