@@ -655,7 +655,7 @@ async function blueGreenRecreate(instanceId, workspacePath, currentPort) {
       tempInstanceId,
       workspacePath,
       tempPort,
-      { configVolumeOverride: configVolume }
+      { configVolumeOverride: configVolume, instanceIdOverride: instanceId }
     );
     await containerManager.startContainer(tempInstanceId);
 

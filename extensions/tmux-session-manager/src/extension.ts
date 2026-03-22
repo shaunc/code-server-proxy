@@ -511,11 +511,41 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
   );
 
-  // On activation, only reconnect previously-mapped panes.
-  // Unmapped sessions are left alone (use "Reconnect All" to adopt).
-  reconnectMapped().catch((err) => {
+  // On activation, reconnect mapped panes + adopt unattached sessions.
+  reconnectAll().catch((err) => {
     console.error("[tmux-session-manager] Reconnection failed:", err);
   });
+
+  // Periodically adopt unattached sessions (every 30s).
+  // Sessions become unattached when: user closes a pane (trap doesn't
+  // kill), container restarts, or browser reloads. Auto-adopting makes
+  // them visible so the user can decide to keep or 'exit' them.
+  // This prevents invisible resource consumption (e.g., Claude sessions
+  // running in orphaned tmux sessions).
+  const adoptInterval = setInterval(async () => {
+    try {
+      const liveSessions = listTmuxSessions(instanceId);
+      const mappedSessions = new Set(
+        Object.values(mapping.panes)
+          .map((p) => p.tmuxSession)
+          .filter((s) => s),
+      );
+
+      for (const session of liveSessions) {
+        if (mappedSessions.has(session.name)) continue;
+        if (session.attached) continue;
+
+        console.log(
+          `[tmux-session-manager] Auto-adopting unattached session: ${session.name}`,
+        );
+        createTerminalForSession(session.name);
+      }
+    } catch {
+      // Ignore errors in periodic check
+    }
+  }, 30000);
+
+  context.subscriptions.push({ dispose: () => clearInterval(adoptInterval) });
 }
 
 export function deactivate(): void {
