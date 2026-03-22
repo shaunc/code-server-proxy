@@ -10,11 +10,13 @@ if [ -z "$HOST_USER" ]; then
 fi
 
 SSH_DEST="$HOST_USER@host.docker.internal"
-# INSTANCE_ID from env (container-manager), fallback to file (injected)
+# INSTANCE_ID from env (container-manager), fallback to file (injected).
+# Strip '-new' suffix left by pre-fix blue-green containers.
 if [ -z "$INSTANCE_ID" ] && [ -f /run/instance-id ]; then
     INSTANCE_ID=$(cat /run/instance-id)
 fi
-IID="${INSTANCE_ID:-default}"
+IID="${INSTANCE_ID%-new}"
+IID="${IID:-default}"
 WORKDIR="${WORKSPACE_PATH:-.}"
 shrc_source=". ~/.shrc 2>/dev/null || true; "
 
