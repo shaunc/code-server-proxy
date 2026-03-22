@@ -694,6 +694,9 @@ async function stopContainer(instanceId, timeout = 10) {
  * Kill orphaned tmux sessions (cs-* sessions with no matching container).
  * Runs periodically as a safety net for sessions that weren't cleaned
  * up on container stop (e.g., if the proxy crashed).
+ *
+ * Uses port registry (not docker inspect) to check if a workspace is
+ * known — containers may be temporarily absent during recreation.
  */
 function cleanOrphanedTmuxSessions() {
   try {
@@ -705,6 +708,25 @@ function cleanOrphanedTmuxSessions() {
       .split('\n')
       .filter((s) => s.startsWith('cs-'));
 
+    // Load port registry to check if instances are known
+    let knownInstances = new Set();
+    try {
+      const registryPath = path.join(
+        process.env.HOME || '/root',
+        '.code-workspaces',
+        'port-registry.json'
+      );
+      const registry = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
+      for (const entry of Object.values(registry.workspaces || {})) {
+        knownInstances.add(entry.instanceId);
+      }
+      // Also add 'main' instance
+      knownInstances.add('main');
+    } catch {
+      // Can't read registry — skip cleanup to be safe
+      return;
+    }
+
     for (const session of sessions) {
       // Session names are cs-{instanceId}-{N} — extract instanceId
       // by stripping 'cs-' prefix and '-{N}' pane suffix
@@ -712,24 +734,17 @@ function cleanOrphanedTmuxSessions() {
       const lastDash = withoutPrefix.lastIndexOf('-');
       if (lastDash === -1) continue; // not a session-per-pane name
       const instanceId = withoutPrefix.slice(0, lastDash);
-      const containerName = `code-server-${instanceId}`;
+
+      // If the instance is in the port registry, it's a known
+      // workspace — don't kill even if container is temporarily down
+      if (knownInstances.has(instanceId)) continue;
+
+      // Unknown instance — truly orphaned, kill it
       try {
-        // Check if container exists and is running
-        execSync(
-          `docker inspect --format='{{.State.Running}}' ${containerName} 2>/dev/null`,
-          {
-            encoding: 'utf-8',
-            timeout: 5000,
-          }
-        );
+        execSync(`tmux kill-session -t ${session}`, { timeout: 5000 });
+        console.log(`[TMUX-CLEANUP] Killed orphaned session: ${session}`);
       } catch {
-        // Container doesn't exist — kill the orphaned session
-        try {
-          execSync(`tmux kill-session -t ${session}`, { timeout: 5000 });
-          console.log(`[TMUX-CLEANUP] Killed orphaned session: ${session}`);
-        } catch {
-          // Session may have been killed between list and kill
-        }
+        // Session may have been killed between list and kill
       }
     }
   } catch {
