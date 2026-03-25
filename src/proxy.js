@@ -681,12 +681,42 @@ async function blueGreenRecreate(instanceId, workspacePath, currentPort) {
     await containerManager.renameContainer(instanceId, `${instanceId}-old`);
     await containerManager.renameContainer(tempInstanceId, instanceId);
 
-    // 6. Stop and remove old container
+    // 6. Stop and remove old container (frees canonical port)
     try {
       await containerManager.stopContainer(`${instanceId}-old`, 10);
       await containerManager.removeContainer(`${instanceId}-old`, true);
     } catch {
       // Old container may already be gone
+    }
+
+    // 7. Move new container from temp port to canonical port.
+    //    Stop → remove → create fresh on canonical port → start.
+    //    Brief disconnect (~3s) but no boot wait (already warmed).
+    console.log(`[BLUE-GREEN] Moving to canonical port ${currentPort}...`);
+    try {
+      await containerManager.stopContainer(instanceId, 5);
+      await containerManager.removeContainer(instanceId, true);
+      await containerManager.createContainer(
+        instanceId,
+        workspacePath,
+        currentPort
+      );
+      await containerManager.startContainer(instanceId);
+      updatePortInRegistry(workspacePath, currentPort);
+
+      // Wait for the final container to be ready
+      const finalReady = await waitForBackend(currentPort, 60000);
+      if (!finalReady) {
+        console.error(
+          `[BLUE-GREEN] Final container on canonical port not ready`
+        );
+      }
+    } catch (portErr) {
+      console.error(
+        `[BLUE-GREEN] Failed to move to canonical port: ${portErr.message}`
+      );
+      // Container may still be running on temp port — that's OK,
+      // proxy routes via registry which still points to temp port
     }
 
     containerManager.clearOutdatedCache(instanceId);
