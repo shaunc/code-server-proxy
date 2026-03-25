@@ -21,7 +21,11 @@ WORKDIR="${WORKSPACE_PATH:-.}"
 shrc_source=". ~/.shrc 2>/dev/null || true; "
 
 # --- Non-interactive: direct SSH, no tmux ---
-if [ ! -t 0 ]; then
+# Skip tmux if: stdin is not a TTY, OR invoked with arguments
+# (e.g., host-bash -c 'cmd', host-bash -ilc 'cmd' from VS Code's
+# shell environment resolver). Only bare 'host-bash' with no args
+# and a TTY should enter the tmux attach loop.
+if [ ! -t 0 ] || [ $# -gt 0 ]; then
     cd_cmd=""
     [ -n "$WORKSPACE_PATH" ] && cd_cmd="cd '$WORKSPACE_PATH' && "
     exec ssh "$SSH_DEST" "${shrc_source}${cd_cmd}bash" "$@"
