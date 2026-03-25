@@ -934,6 +934,12 @@ async function checkAllContainersForOutdatedImages() {
     for (const containerInfo of containers) {
       // Extract instanceId from container name
       const instanceId = containerInfo.Names[0].replace('/code-server-', '');
+
+      // Skip blue-green transient containers (-old, -new)
+      if (instanceId.endsWith('-old') || instanceId.endsWith('-new')) {
+        continue;
+      }
+
       const containerImageId = containerInfo.ImageID;
       const isOutdated = containerImageId !== currentImageId;
 
