@@ -632,7 +632,14 @@ function updatePortInRegistry(workspacePath, newPort) {
  * @returns {Promise<boolean>} True if successful
  */
 async function blueGreenRecreate(instanceId, workspacePath, currentPort) {
-  const tempPort = currentPort + 100; // 8200-8299 range
+  // Find a free temp port — can't use currentPort (old container still on it)
+  // or currentPort+100 (may be in use from a previous swap)
+  let tempPort = 8300;
+  while (tempPort < 8400) {
+    const free = await isPortListening(tempPort).then((l) => !l);
+    if (free) break;
+    tempPort++;
+  }
   const tempInstanceId = `${instanceId}-new`;
   const configVolume = `code-server-${instanceId}-config`;
 
