@@ -697,22 +697,32 @@ async function blueGreenRecreate(instanceId, workspacePath, currentPort) {
     }
 
     // 7. Move new container from temp port to canonical port.
-    //    Stop → remove → create fresh on canonical port → start.
-    //    Brief disconnect (~3s) but no boot wait (already warmed).
-    console.log(`[BLUE-GREEN] Moving to canonical port ${currentPort}...`);
+    //    Stop → remove → reallocate port → create → start.
+    //    Both old and temp containers are gone, so allocatePort
+    //    gets a clean registry and returns the canonical port.
     try {
       await containerManager.stopContainer(instanceId, 5);
       await containerManager.removeContainer(instanceId, true);
+
+      // Remove temp port from registry before allocating
+      const preRegistry = loadRegistry();
+      delete preRegistry.ports[String(tempPort)];
+      delete preRegistry.workspaces[workspacePath];
+      saveRegistry(preRegistry);
+
+      // Reallocate — gets canonical port (hash-based, no collisions now)
+      const { port: canonicalPort } = await getOrAllocatePort(workspacePath);
+      console.log(`[BLUE-GREEN] Moving to canonical port ${canonicalPort}...`);
+
       await containerManager.createContainer(
         instanceId,
         workspacePath,
-        currentPort
+        canonicalPort
       );
       await containerManager.startContainer(instanceId);
-      updatePortInRegistry(workspacePath, currentPort);
 
       // Wait for the final container to be ready
-      const finalReady = await waitForBackend(currentPort, 60000);
+      const finalReady = await waitForBackend(canonicalPort, 60000);
       if (!finalReady) {
         console.error(
           `[BLUE-GREEN] Final container on canonical port not ready`
