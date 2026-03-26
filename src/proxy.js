@@ -594,6 +594,9 @@ async function waitForBackend(port, timeout = BACKEND_READY_TIMEOUT) {
   return false;
 }
 
+// Instances currently being recreated — orphan sweep must not touch these.
+const recreatingInstances = new Set();
+
 /**
  * Update the port for a workspace in the registry.
  * Atomically rewrites the bidirectional mapping.
@@ -704,13 +707,16 @@ async function blueGreenRecreate(instanceId, workspacePath, currentPort) {
       await containerManager.stopContainer(instanceId, 5);
       await containerManager.removeContainer(instanceId, true);
 
-      // Remove temp port from registry before allocating
+      // Block orphan sweep from killing this instance's sessions
+      // during the registry gap between delete and re-create.
+      recreatingInstances.add(instanceId);
+
       const preRegistry = loadRegistry();
       delete preRegistry.ports[String(tempPort)];
       delete preRegistry.workspaces[workspacePath];
       saveRegistry(preRegistry);
 
-      // Reallocate — gets canonical port (hash-based, no collisions now)
+      // Reallocate — gets canonical port (hash-based, no collisions)
       const { port: canonicalPort } = await getOrAllocatePort(workspacePath);
       console.log(`[BLUE-GREEN] Moving to canonical port ${canonicalPort}...`);
 
@@ -736,12 +742,14 @@ async function blueGreenRecreate(instanceId, workspacePath, currentPort) {
       // proxy routes via registry which still points to temp port
     }
 
+    recreatingInstances.delete(instanceId);
     containerManager.clearOutdatedCache(instanceId);
     console.log(
       `[BLUE-GREEN] Recreation complete for ${instanceId.substring(0, 8)}`
     );
     return true;
   } catch (error) {
+    recreatingInstances.delete(instanceId);
     console.error(
       `[BLUE-GREEN] Failed for ${instanceId.substring(0, 8)}: ${error.message}`
     );
@@ -1907,6 +1915,7 @@ server.listen(PROXY_PORT, PROXY_HOST, async () => {
             console.log(
               `[IMAGE-CHECK] Recreating idle container ${iid.substring(0, 8)}`
             );
+            recreatingInstances.add(iid);
             try {
               await containerManager.stopContainer(iid);
               await containerManager.removeContainer(iid);
@@ -1916,6 +1925,7 @@ server.listen(PROXY_PORT, PROXY_HOST, async () => {
                 `[IMAGE-CHECK] Failed: ${iid.substring(0, 8)}: ${err.message}`
               );
             }
+            recreatingInstances.delete(iid);
           }
         }
       },
@@ -1925,7 +1935,7 @@ server.listen(PROXY_PORT, PROXY_HOST, async () => {
     // Clean orphaned tmux sessions every 5 minutes
     setInterval(
       () => {
-        containerManager.cleanOrphanedTmuxSessions();
+        containerManager.cleanOrphanedTmuxSessions(recreatingInstances);
       },
       5 * 60 * 1000
     );

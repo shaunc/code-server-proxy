@@ -699,14 +699,14 @@ async function stopContainer(instanceId, timeout = 10) {
 }
 
 /**
- * Kill orphaned tmux sessions (cs-* sessions with no matching container).
+ * Kill orphaned tmux sessions (cs-* sessions with no matching workspace).
  * Runs periodically as a safety net for sessions that weren't cleaned
  * up on container stop (e.g., if the proxy crashed).
  *
  * Uses port registry (not docker inspect) to check if a workspace is
  * known — containers may be temporarily absent during recreation.
  */
-function cleanOrphanedTmuxSessions() {
+function cleanOrphanedTmuxSessions(recreatingInstances = new Set()) {
   try {
     const sessions = execSync(
       "tmux list-sessions -F '#{session_name}' 2>/dev/null",
@@ -751,6 +751,10 @@ function cleanOrphanedTmuxSessions() {
       // If the instance is in the port registry, it's a known
       // workspace — don't kill even if container is temporarily down
       if (knownInstances.has(instanceId)) continue;
+
+      // If the instance is being recreated (blue-green or idle),
+      // it's temporarily absent from the registry — don't kill
+      if (recreatingInstances.has(instanceId)) continue;
 
       // Unknown instance — truly orphaned, kill it
       try {
