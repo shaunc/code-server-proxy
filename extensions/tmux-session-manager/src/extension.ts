@@ -203,14 +203,43 @@ function savePaneToMapping(
   persistMapping(mapping, mappingFilePath);
 }
 
+/**
+ * Look up the tmux session name for a pane via cs-tmux-window resolve.
+ * The extension's own mapping file does not know the session name
+ * (host-bash chooses it); cs-tmux-window maintains the pane→session
+ * mapping on the host. Returns null if no mapping or SSH failure.
+ */
+function resolveSession(paneId: string): string | null {
+  try {
+    const sshDest = `${process.env.HOST_USER}@host.docker.internal`;
+    const shrc = ". ~/.shrc 2>/dev/null || true; ";
+    const out = execSync(
+      `ssh -o ConnectTimeout=5 -o BatchMode=yes ${sshDest} ` +
+        `"${shrc}cs-tmux-window resolve '${instanceId}' '${paneId}'"`,
+      { encoding: "utf-8", timeout: 10000 },
+    ).trim();
+    return out.length > 0 ? out : null;
+  } catch {
+    return null;
+  }
+}
+
 function removePaneFromMapping(paneId: string): void {
-  const paneInfo = mapping.panes[paneId];
   delete mapping.panes[paneId];
   persistMapping(mapping, mappingFilePath);
 
-  // Kill the tmux session on the host so it doesn't get re-adopted
-  if (paneInfo?.tmuxSession) {
-    killTmuxSession(paneInfo.tmuxSession);
+  // Resolve the session name via the host-side mapping and kill it.
+  // Cannot rely on paneInfo.tmuxSession — it is never populated
+  // because host-bash chooses the session via cs-tmux-window without
+  // informing the extension.
+  const session = resolveSession(paneId);
+  if (session) {
+    killTmuxSession(session);
+  } else {
+    debugChannel.appendLine(
+      `[${new Date().toISOString()}] removePaneFromMapping: ` +
+        `no host-side session for pane ${paneId}`,
+    );
   }
 }
 
@@ -223,11 +252,14 @@ function killTmuxSession(tmuxSession: string): void {
         `"${shrc}tmux kill-session -t '${tmuxSession}'"`,
       { encoding: "utf-8", timeout: 10000 },
     );
-    console.log(
-      `[tmux-session-manager] Killed tmux session: ${tmuxSession}`,
+    debugChannel.appendLine(
+      `[${new Date().toISOString()}] killed tmux session: ${tmuxSession}`,
     );
-  } catch {
-    // Session may already be gone
+  } catch (e) {
+    debugChannel.appendLine(
+      `[${new Date().toISOString()}] killTmuxSession failed for ` +
+        `${tmuxSession}: ${(e as Error).message}`,
+    );
   }
 }
 
@@ -292,17 +324,27 @@ async function reconnectMapped(): Promise<number> {
       continue;
     }
 
-    // Check if the tmux session is still alive
-    if (!liveSessionNames.has(paneInfo.tmuxSession)) {
+    // Resolve session name via cs-tmux-window (paneInfo.tmuxSession
+    // is a legacy field that was never populated). Fall back to any
+    // legacy value if resolve fails.
+    const sessionName =
+      resolveSession(paneId) || paneInfo.tmuxSession || "";
+
+    if (!sessionName || !liveSessionNames.has(sessionName)) {
       // tmux session gone — clean up mapping
       delete mapping.panes[paneId];
       persistMapping(mapping, mappingFilePath);
       continue;
     }
 
-    // tmux session alive but no VS Code terminal — recreate
-    console.log(
-      `[tmux-session-manager] Reconnecting to ${paneInfo.tmuxSession}`,
+    // Cache the resolved name so createTerminalForPane can pass it
+    // directly to host-bash for fast reattach
+    paneInfo.tmuxSession = sessionName;
+    persistMapping(mapping, mappingFilePath);
+
+    debugChannel.appendLine(
+      `[${new Date().toISOString()}] reconnecting pane ${paneId} ` +
+        `to ${sessionName}`,
     );
     createTerminalForPane(paneId, paneInfo);
     reconnected++;
@@ -354,31 +396,39 @@ async function reconnectAll(): Promise<number> {
 
 // --- Activation ---
 
+let debugChannel: vscode.OutputChannel;
+
 export function activate(context: vscode.ExtensionContext): void {
+  debugChannel = vscode.window.createOutputChannel("tmux Session Manager");
+  context.subscriptions.push(debugChannel);
+  debugChannel.appendLine(
+    `[${new Date().toISOString()}] activate() — extension loaded`,
+  );
   instanceId = getInstanceId();
   const storageUri = context.storageUri;
 
-  if (!storageUri) {
+  if (storageUri) {
+    mappingFilePath = getMappingPath(storageUri);
+    mapping =
+      loadMapping(mappingFilePath) ?? createEmptyMapping(instanceId);
+
+    // Ensure mapping instanceId matches (container may have been recreated)
+    if (mapping.instanceId !== instanceId) {
+      mapping = createEmptyMapping(instanceId);
+      persistMapping(mapping, mappingFilePath);
+    }
+  } else {
     console.warn(
-      "[tmux-session-manager] No storage URI — cannot persist mapping",
+      "[tmux-session-manager] No storage URI — mapping persistence disabled",
     );
-    return;
-  }
-
-  mappingFilePath = getMappingPath(storageUri);
-  mapping = loadMapping(mappingFilePath) ?? createEmptyMapping(instanceId);
-
-  // Ensure mapping instanceId matches (container may have been recreated)
-  if (mapping.instanceId !== instanceId) {
     mapping = createEmptyMapping(instanceId);
-    persistMapping(mapping, mappingFilePath);
   }
 
   console.log(
     `[tmux-session-manager] Activated for instance ${instanceId.slice(0, 12)}...`,
   );
 
-  // Register terminal profile provider
+  // Register terminal profile provider (must happen regardless of storage)
   const profileProvider: vscode.TerminalProfileProvider = {
     provideTerminalProfile(): vscode.ProviderResult<vscode.TerminalProfile> {
       const paneId = generatePaneId();
@@ -403,6 +453,18 @@ export function activate(context: vscode.ExtensionContext): void {
   // Track terminal opens
   context.subscriptions.push(
     vscode.window.onDidOpenTerminal((terminal) => {
+      const opts0 = terminal.creationOptions;
+      const hasEnv =
+        "env" in opts0 && opts0.env && typeof opts0.env === "object";
+      const envPaneId = hasEnv
+        ? (opts0.env as Record<string, string>).TMUX_PANE_ID
+        : undefined;
+      debugChannel.appendLine(
+        `[${new Date().toISOString()}] onDidOpenTerminal ` +
+          `name=${terminal.name} preTracked=${terminalToPaneId.has(terminal)} ` +
+          `envPaneId=${envPaneId ?? "-"}`,
+      );
+
       // If this terminal was created by us, it's already tracked.
       if (terminalToPaneId.has(terminal)) {
         return;
@@ -436,14 +498,39 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.window.onDidCloseTerminal((terminal) => {
       const paneId = terminalToPaneId.get(terminal);
+      const reason = terminal.exitStatus?.reason;
+      const code = terminal.exitStatus?.code;
+
+      // Instrumentation for tmux-leak investigation: log every close
+      // with its exit reason so we can see what code-server emits on
+      // tab-X close, browser reload, etc. Remove once H1 is confirmed
+      // or ruled out. Reason values: 0=Unknown, 1=Shutdown, 2=Process,
+      // 3=User, 4=Extension.
+      const reasonName =
+        reason === vscode.TerminalExitReason.Unknown
+          ? "Unknown"
+          : reason === vscode.TerminalExitReason.Shutdown
+            ? "Shutdown"
+            : reason === vscode.TerminalExitReason.Process
+              ? "Process"
+              : reason === vscode.TerminalExitReason.User
+                ? "User"
+                : reason === vscode.TerminalExitReason.Extension
+                  ? "Extension"
+                  : `raw(${String(reason)})`;
+      const msg =
+        `[${new Date().toISOString()}] onDidCloseTerminal ` +
+        `name=${terminal.name} tracked=${paneId ? "yes" : "no"} ` +
+        `paneId=${paneId ?? "-"} reason=${reasonName} code=${code ?? "-"}`;
+      console.log(`[tmux-session-manager] ${msg}`);
+      debugChannel.appendLine(msg);
+
       if (!paneId) {
         return;
       }
 
       terminalToPaneId.delete(terminal);
       paneIdToTerminal.delete(paneId);
-
-      const reason = terminal.exitStatus?.reason;
 
       // User closed or process exited normally — remove mapping
       if (

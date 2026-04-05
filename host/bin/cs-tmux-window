@@ -18,6 +18,10 @@
 #   cs-tmux-window list <instance-id>
 #     List session names for an instance.
 #
+#   cs-tmux-window resolve <instance-id> <pane-id>
+#     Print the tmux session name currently mapped to this pane-id.
+#     Exit 0 if found, non-zero if not mapped.
+#
 #   cs-tmux-window cleanup <instance-id>
 #     Kill all sessions for an instance.
 #
@@ -189,6 +193,24 @@ case "${1:-}" in
         [ $# -lt 2 ] && { echo "Usage: cs-tmux-window list <instance-id>" >&2; exit 1; }
         tmux "${TMUX_ARGS[@]}" list-sessions -F '#{session_name}' 2>/dev/null \
             | grep "^cs-${2}-" || true
+        ;;
+
+    resolve)
+        # Look up the session name mapped to a pane-id.
+        # Used by the extension to find which session to kill on pane
+        # close, since the extension's own mapping file does not know
+        # the session name (host-bash chooses it via attach-or-create).
+        [ $# -lt 3 ] && { echo "Usage: cs-tmux-window resolve <instance-id> <pane-id>" >&2; exit 1; }
+        iid="$2"; pane_id="$3"
+        map_file="$MAPPING_DIR/cs-${iid}.json"
+        if session=$(read_mapping "$map_file" "$pane_id"); then
+            # Verify the session actually exists before returning it
+            if tmux "${TMUX_ARGS[@]}" has-session -t "$session" 2>/dev/null; then
+                echo "$session"
+                exit 0
+            fi
+        fi
+        exit 1
         ;;
 
     cleanup)
