@@ -31,6 +31,12 @@
 
 set -euo pipefail
 
+# Raise soft fd limit so the tmux server (which inherits our limit
+# on first session creation) can handle many sessions. The default
+# systemd user session soft limit is 1024, which is ~340 sessions
+# before fork/open failures. The hard limit is typically 524288.
+ulimit -n 65536 2>/dev/null || true
+
 TMUX_CONF="${CS_TMUX_CONF:-$HOME/.config/code-server-proxy/tmux.conf}"
 MAPPING_DIR="${CS_TMUX_MAPPINGS:-$HOME/.config/code-server-proxy/mappings}"
 LOCK_DIR="${MAPPING_DIR}/.locks"
