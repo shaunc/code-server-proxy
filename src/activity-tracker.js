@@ -9,17 +9,16 @@
 
 const fs = require('fs');
 const path = require('path');
+const config = require('./config');
 
 // Configuration
-const INSTANCES_BASE_PATH =
-  process.env.INSTANCES_BASE_PATH ||
-  path.join(process.env.HOME, '.code-workspaces', 'instances');
+const INSTANCES_BASE_PATH = config.paths.instancesDir;
 const ACTIVITY_FILE = path.join(
   path.dirname(INSTANCES_BASE_PATH),
   '.activity.json'
 );
-const SAVE_INTERVAL = 5 * 60 * 1000; // Save every 5 minutes
-const SAVE_DEBOUNCE = 30 * 1000; // Debounce 30s after change
+const SAVE_INTERVAL = config.timers.activitySaveInterval;
+const SAVE_DEBOUNCE = config.timers.activitySaveDebounce;
 
 class ActivityTracker {
   constructor() {

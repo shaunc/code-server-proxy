@@ -19,8 +19,10 @@ const { URL } = require('url');
 
 const execAsync = promisify(exec);
 
+const config = require('./config');
+
 // Docker support
-const USE_DOCKER = process.env.USE_DOCKER === 'true';
+const USE_DOCKER = config.docker.enabled;
 const containerManager = USE_DOCKER ? require('./container-manager') : null;
 
 // Activity tracking for idle detection
@@ -43,20 +45,20 @@ if (RECONNECT_HELPER_SCRIPT) {
   console.warn('[INIT] reconnect-helper.js not found, auto-reload disabled');
 }
 
-// Configuration
-const PROXY_PORT = 8083;
-const PROXY_HOST = '127.0.0.1';
-const MAIN_PORT = 8100;
-const WORKSPACE_PORT_MIN = 8101;
-const WORKSPACE_PORT_MAX = 8199;
-const MAX_CONCURRENT_INSTANCES = 36;
-const MAX_PROBE_ATTEMPTS = 20;
-const WORKSPACES_DIR = path.join(process.env.HOME, '.code-workspaces');
-const BASE_DIR = path.join(WORKSPACES_DIR, 'instances');
-const REGISTRY_PATH = path.join(WORKSPACES_DIR, 'port-registry.json');
-const SHARED_SETTINGS_DIR = path.join(WORKSPACES_DIR, 'shared');
-const BACKEND_READY_TIMEOUT = 30000; // 30 seconds
-const BACKEND_READY_POLL_INTERVAL = 500; // 500ms
+// Configuration (from centralized config.js)
+const PROXY_PORT = config.proxy.port;
+const PROXY_HOST = config.proxy.host;
+const MAIN_PORT = config.proxy.mainPort;
+const WORKSPACE_PORT_MIN = config.ports.min;
+const WORKSPACE_PORT_MAX = config.ports.max;
+const MAX_CONCURRENT_INSTANCES = config.instances.maxConcurrent;
+const MAX_PROBE_ATTEMPTS = config.ports.maxProbeAttempts;
+const WORKSPACES_DIR = config.paths.workspacesDir;
+const BASE_DIR = config.paths.instancesDir;
+const REGISTRY_PATH = config.paths.registryFile;
+const SHARED_SETTINGS_DIR = config.paths.sharedSettingsDir;
+const BACKEND_READY_TIMEOUT = config.instances.backendReadyTimeout;
+const BACKEND_READY_POLL_INTERVAL = config.instances.backendReadyPollInterval;
 
 // Lock mechanism to prevent concurrent container operations
 // Maps instance ID to promise that resolves when operation completes

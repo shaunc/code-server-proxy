@@ -15,13 +15,12 @@
 
 const fs = require('fs');
 const path = require('path');
+const config = require('./config');
 
 // Configuration
-const INSTANCES_BASE_PATH =
-  process.env.INSTANCES_BASE_PATH ||
-  path.join(process.env.HOME, '.code-workspaces/instances');
-const DEBOUNCE_DELAY = 100; // milliseconds
-const SCAN_INTERVAL = 30000; // 30 seconds - check for new instances
+const INSTANCES_BASE_PATH = config.paths.instancesDir;
+const DEBOUNCE_DELAY = config.timers.settingsDebounceDelay;
+const SCAN_INTERVAL = config.timers.settingsScanInterval;
 
 // Files in the User directory to sync
 const SYNCED_FILES = ['settings.json', 'keybindings.json'];

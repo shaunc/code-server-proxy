@@ -9,9 +9,10 @@
  */
 
 const WebSocket = require('ws');
+const config = require('./config');
 
 // Configuration - ping interval for keepalive traffic generation
-const PING_INTERVAL = parseInt(process.env.WS_PING_INTERVAL) || 30000; // 30s
+const PING_INTERVAL = config.timers.wsPingInterval;
 
 // Track active connections for cleanup
 const activeConnections = new Map(); // clientId -> { startTime, ... }

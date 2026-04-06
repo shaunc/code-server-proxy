@@ -14,11 +14,11 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const { execSync } = require('child_process');
+const config = require('./config');
 const activityTracker = require('./activity-tracker');
 
 // Config file path
-const CONFIG_DIR = path.join(__dirname, '..', 'config');
-const MOUNTS_CONFIG_PATH = path.join(CONFIG_DIR, 'mounts.json');
+const MOUNTS_CONFIG_PATH = config.paths.mountsConfig;
 
 // Cached mounts config (reloaded on SIGHUP)
 let mountsConfig = null;
@@ -30,8 +30,8 @@ let mountsConfig = null;
 function loadMountsConfig() {
   try {
     if (fs.existsSync(MOUNTS_CONFIG_PATH)) {
-      const config = JSON.parse(fs.readFileSync(MOUNTS_CONFIG_PATH, 'utf8'));
-      mountsConfig = config.binds || [];
+      const mounts = JSON.parse(fs.readFileSync(MOUNTS_CONFIG_PATH, 'utf8'));
+      mountsConfig = mounts.binds || [];
       console.log(
         `[Config] Loaded ${mountsConfig.length} mounts from ${MOUNTS_CONFIG_PATH}`
       );
@@ -81,44 +81,29 @@ function isNvidiaRuntimeAvailable() {
 // Check NVIDIA availability at module load
 const NVIDIA_AVAILABLE = isNvidiaRuntimeAvailable();
 
-// Configuration
-const DOCKER_IMAGE = process.env.DOCKER_IMAGE || 'code-server-proxy:latest';
+// Configuration (from centralized config.js)
+const DOCKER_IMAGE = config.docker.image;
 
 // Cache current image ID (refreshed periodically)
 let cachedImageId = null;
 let cacheTimestamp = 0;
-const IMAGE_CACHE_TTL = 60000; // 1 minute
+const IMAGE_CACHE_TTL = config.timers.imageCacheTtl;
 
 // Cache for outdated container detection (background periodic check)
 // instanceId -> { outdated: boolean, containerImageId: string, checkedAt: timestamp }
 const outdatedContainersCache = new Map();
-const OUTDATED_CHECK_INTERVAL = 2 * 60 * 1000; // 2 minutes
-const OUTDATED_CACHE_TTL = 5 * 60 * 1000; // 5 minutes (safety margin)
-const DOCKER_MEMORY_LIMIT = process.env.DOCKER_MEMORY_LIMIT || '4g';
-const DOCKER_CPU_LIMIT = parseFloat(process.env.DOCKER_CPU_LIMIT || '3.0');
-const SHARED_EXTENSIONS_VOLUME =
-  process.env.SHARED_EXTENSIONS_VOLUME || 'code-server-extensions';
-// Configuration constant for potential future use
-// Reserved for volume backup/restore paths
-const WORKSPACE_VOLUMES_PATH =
-  process.env.WORKSPACE_VOLUMES_PATH ||
-  path.join(process.env.HOME, '.code-workspaces/volumes');
-const INSTANCES_BASE_PATH =
-  process.env.INSTANCES_BASE_PATH ||
-  path.join(process.env.HOME, '.code-workspaces/instances');
+const OUTDATED_CHECK_INTERVAL = config.timers.outdatedCheckInterval;
+const OUTDATED_CACHE_TTL = config.timers.outdatedCacheTtl;
+const DOCKER_MEMORY_LIMIT = config.docker.memoryLimit;
+const DOCKER_CPU_LIMIT = config.docker.cpuLimit;
+const SHARED_EXTENSIONS_VOLUME = config.docker.sharedExtensionsVolume;
+const WORKSPACE_VOLUMES_PATH = config.paths.volumesDir;
+const INSTANCES_BASE_PATH = config.paths.instancesDir;
 
 // Idle monitoring configuration
-const IDLE_THRESHOLD_DAYS = parseInt(
-  process.env.IDLE_THRESHOLD_DAYS || '3',
-  10
-);
-const IDLE_GRACE_PERIOD_DAYS = parseInt(
-  process.env.IDLE_GRACE_PERIOD_DAYS || '7',
-  10
-);
-const IDLE_WHITELIST = process.env.IDLE_WHITELIST
-  ? process.env.IDLE_WHITELIST.split(',')
-  : [];
+const IDLE_THRESHOLD_DAYS = config.idle.thresholdDays;
+const IDLE_GRACE_PERIOD_DAYS = config.idle.gracePeriodDays;
+const IDLE_WHITELIST = config.idle.whitelist;
 
 /**
  * Parse memory limit string to bytes
@@ -229,14 +214,14 @@ async function createContainer(
   console.log(`  Image: ${DOCKER_IMAGE}`);
 
   // Check if auto-SSH is enabled
-  const autoSshEnabled = process.env.ENABLE_AUTO_SSH === 'true';
+  const autoSshEnabled = config.docker.enableAutoSsh;
   if (autoSshEnabled) {
     console.log(`  Auto-SSH: enabled`);
   }
 
   // Check if GPU passthrough is enabled
-  const enableGpu = process.env.ENABLE_GPU === 'true' && NVIDIA_AVAILABLE;
-  if (process.env.ENABLE_GPU === 'true') {
+  const enableGpu = config.docker.enableGpu && NVIDIA_AVAILABLE;
+  if (config.docker.enableGpu) {
     console.log(`  GPU passthrough: requested`);
     console.log(`  NVIDIA runtime available: ${NVIDIA_AVAILABLE}`);
     if (!NVIDIA_AVAILABLE) {
@@ -298,7 +283,7 @@ async function createContainer(
 
   // Mount host .gitconfig for git credentials and settings
   // Note: gnome-keyring mounts removed - using pass on host instead
-  const hostGitconfigPath = path.join(process.env.HOME, '.gitconfig');
+  const hostGitconfigPath = path.join(config.paths.home, '.gitconfig');
   if (fs.existsSync(hostGitconfigPath)) {
     binds.push(`${hostGitconfigPath}:/host-gitconfig:ro`);
     console.log(`  Mounting host .gitconfig from: ${hostGitconfigPath}`);
@@ -426,7 +411,7 @@ async function createContainer(
   console.log(`  Mounting instance User directory: ${instanceUserDir}`);
 
   // Mount SSH agent socket if available (for claude wrapper and auto-SSH)
-  const sshAuthSock = process.env.SSH_AUTH_SOCK;
+  const sshAuthSock = config.host.sshAuthSock;
   if (sshAuthSock && fs.existsSync(sshAuthSock)) {
     binds.push(`${sshAuthSock}:/ssh-agent/socket:ro`);
     console.log(`  Mounting SSH agent: ${sshAuthSock}`);
@@ -449,12 +434,12 @@ async function createContainer(
   // SSH_AUTH_SOCK is set in Dockerfile, mount is configured above
 
   // Set HOST_USER for SSH operations (claude wrapper, auto-SSH)
-  if (!process.env.USER) {
+  if (!config.host.user) {
     throw new Error(
       'USER environment variable not set - required for SSH operations'
     );
   }
-  envVars.push(`HOST_USER=${process.env.USER}`);
+  envVars.push(`HOST_USER=${config.host.user}`);
 
   // Expose instance ID for tmux session naming (cs-<instanceId>).
   // instanceIdOverride is used by blue-green to give the temp container
@@ -799,11 +784,7 @@ function cleanOrphanedTmuxSessions(recreatingInstances = new Set()) {
   // Load port registry to check if instances are known
   let knownInstances = new Set();
   try {
-    const registryPath = path.join(
-      process.env.HOME || '/root',
-      '.code-workspaces',
-      'port-registry.json'
-    );
+    const registryPath = config.paths.registryFile;
     const registry = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
     for (const entry of Object.values(registry.workspaces || {})) {
       knownInstances.add(entry.instanceId);
