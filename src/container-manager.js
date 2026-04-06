@@ -735,6 +735,67 @@ function cleanOrphanedTmuxSessions(recreatingInstances = new Set()) {
     );
   }
 
+  // Check tmux server fd pressure
+  try {
+    const tmuxPid = execSync("pgrep -f 'tmux.*new-session' | head -1", {
+      encoding: 'utf-8',
+      timeout: 3000,
+    }).trim();
+    if (tmuxPid) {
+      const limits = execSync(`cat /proc/${tmuxPid}/limits`, {
+        encoding: 'utf-8',
+        timeout: 3000,
+      });
+      const match = limits.match(/Max open files\s+(\d+)\s+(\d+)/);
+      if (match) {
+        const softLimit = parseInt(match[1], 10);
+        const fdCount = parseInt(
+          execSync(`ls /proc/${tmuxPid}/fd | wc -l`, {
+            encoding: 'utf-8',
+            timeout: 3000,
+          }).trim(),
+          10
+        );
+        const pct = Math.round((fdCount / softLimit) * 100);
+        if (pct > 80) {
+          console.error(
+            `[TMUX-CLEANUP] CRITICAL: tmux server fd usage ` +
+              `${fdCount}/${softLimit} (${pct}%) — ` +
+              `approaching limit, sessions will fail`
+          );
+        } else if (pct > 50) {
+          console.warn(
+            `[TMUX-CLEANUP] tmux server fd usage ` +
+              `${fdCount}/${softLimit} (${pct}%)`
+          );
+        }
+      }
+    }
+  } catch {
+    // Non-critical — tmux server may not be running
+  }
+
+  // Per-instance session counts — warn if any container looks leaky
+  const perInstance = new Map();
+  for (const session of sessions) {
+    const without = session.slice(3);
+    const hex = without.match(/^([a-f0-9]{64})/);
+    const iid = hex
+      ? hex[1]
+      : without === 'main' || without.startsWith('main-')
+        ? 'main'
+        : null;
+    if (iid) perInstance.set(iid, (perInstance.get(iid) || 0) + 1);
+  }
+  for (const [iid, count] of perInstance) {
+    if (count > 8) {
+      console.warn(
+        `[TMUX-CLEANUP] Instance ${iid.slice(0, 12)}… has ${count} ` +
+          `tmux sessions (possible leak)`
+      );
+    }
+  }
+
   // Load port registry to check if instances are known
   let knownInstances = new Set();
   try {
