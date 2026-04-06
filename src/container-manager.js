@@ -707,65 +707,84 @@ async function stopContainer(instanceId, timeout = 10) {
  * known — containers may be temporarily absent during recreation.
  */
 function cleanOrphanedTmuxSessions(recreatingInstances = new Set()) {
+  let sessions;
   try {
-    const sessions = execSync(
-      "tmux list-sessions -F '#{session_name}' 2>/dev/null",
-      { encoding: 'utf-8', timeout: 5000 }
-    )
+    sessions = execSync("tmux list-sessions -F '#{session_name}' 2>/dev/null", {
+      encoding: 'utf-8',
+      timeout: 5000,
+    })
       .trim()
       .split('\n')
       .filter((s) => s.startsWith('cs-'));
+  } catch (err) {
+    // tmux not running (exit 1, no server) is normal — don't log.
+    // But if the server exists and list-sessions fails (fd exhaustion,
+    // timeout), that's a problem worth surfacing.
+    const stderr = err.stderr?.toString() || '';
+    if (stderr.includes('no server running')) return;
+    console.error(
+      `[TMUX-CLEANUP] tmux list-sessions failed: ${stderr || err.message}`
+    );
+    return;
+  }
 
-    // Load port registry to check if instances are known
-    let knownInstances = new Set();
+  if (sessions.length > 200) {
+    console.warn(
+      `[TMUX-CLEANUP] WARNING: ${sessions.length} tmux sessions — ` +
+        `possible leak (fd pressure risk above ~340)`
+    );
+  }
+
+  // Load port registry to check if instances are known
+  let knownInstances = new Set();
+  try {
+    const registryPath = path.join(
+      process.env.HOME || '/root',
+      '.code-workspaces',
+      'port-registry.json'
+    );
+    const registry = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
+    for (const entry of Object.values(registry.workspaces || {})) {
+      knownInstances.add(entry.instanceId);
+    }
+    // Also add 'main' instance
+    knownInstances.add('main');
+  } catch (err) {
+    console.error(
+      `[TMUX-CLEANUP] Cannot read port-registry.json: ${err.message} ` +
+        `— skipping orphan cleanup`
+    );
+    return;
+  }
+
+  for (const session of sessions) {
+    // Session names: cs-{instanceId}-{N} or cs-{instanceId}-new-{N}
+    // Instance IDs are 64-char hex strings (SHA256) or 'main'.
+    // Extract by matching the 64-char hex pattern after 'cs-'.
+    const withoutPrefix = session.slice(3); // strip 'cs-'
+    const hexMatch = withoutPrefix.match(/^([a-f0-9]{64})/);
+    const instanceId = hexMatch
+      ? hexMatch[1]
+      : withoutPrefix === 'main' || withoutPrefix.startsWith('main-')
+        ? 'main'
+        : null;
+    if (!instanceId) continue;
+
+    // If the instance is in the port registry, it's a known
+    // workspace — don't kill even if container is temporarily down
+    if (knownInstances.has(instanceId)) continue;
+
+    // If the instance is being recreated (blue-green or idle),
+    // it's temporarily absent from the registry — don't kill
+    if (recreatingInstances.has(instanceId)) continue;
+
+    // Unknown instance — truly orphaned, kill it
     try {
-      const registryPath = path.join(
-        process.env.HOME || '/root',
-        '.code-workspaces',
-        'port-registry.json'
-      );
-      const registry = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
-      for (const entry of Object.values(registry.workspaces || {})) {
-        knownInstances.add(entry.instanceId);
-      }
-      // Also add 'main' instance
-      knownInstances.add('main');
+      execSync(`tmux kill-session -t '${session}'`, { timeout: 5000 });
+      console.log(`[TMUX-CLEANUP] Killed orphaned session: ${session}`);
     } catch {
-      // Can't read registry — skip cleanup to be safe
-      return;
+      // Session may have been killed between list and kill
     }
-
-    for (const session of sessions) {
-      // Session names: cs-{instanceId}-{N} or cs-{instanceId}-new-{N}
-      // Instance IDs are 64-char hex strings (SHA256) or 'main'.
-      // Extract by matching the 64-char hex pattern after 'cs-'.
-      const withoutPrefix = session.slice(3); // strip 'cs-'
-      const hexMatch = withoutPrefix.match(/^([a-f0-9]{64})/);
-      const instanceId = hexMatch
-        ? hexMatch[1]
-        : withoutPrefix === 'main' || withoutPrefix.startsWith('main-')
-          ? 'main'
-          : null;
-      if (!instanceId) continue;
-
-      // If the instance is in the port registry, it's a known
-      // workspace — don't kill even if container is temporarily down
-      if (knownInstances.has(instanceId)) continue;
-
-      // If the instance is being recreated (blue-green or idle),
-      // it's temporarily absent from the registry — don't kill
-      if (recreatingInstances.has(instanceId)) continue;
-
-      // Unknown instance — truly orphaned, kill it
-      try {
-        execSync(`tmux kill-session -t ${session}`, { timeout: 5000 });
-        console.log(`[TMUX-CLEANUP] Killed orphaned session: ${session}`);
-      } catch {
-        // Session may have been killed between list and kill
-      }
-    }
-  } catch {
-    // tmux not running or no sessions — nothing to clean
   }
 }
 
