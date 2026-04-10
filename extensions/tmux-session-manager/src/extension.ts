@@ -353,20 +353,16 @@ async function reconnectMapped(): Promise<number> {
 }
 
 /**
- * Adopt only UNATTACHED tmux sessions.
+ * Adopt tmux sessions that are not tracked by the extension.
  *
- * Attached sessions already have a host-bash connected — either from
- * a terminal in this browser session (via grab on reload) or from
- * a terminal the extension created. Creating another terminal for
- * an attached session produces a duplicate viewing the same tmux.
- *
- * Unattached sessions are from a previous browser session where the
- * terminal was lost but tmux persisted. These are safe to adopt.
+ * A session is adoptable if the extension has no pane mapped to it,
+ * regardless of whether it's "attached" in tmux. Zombie host-bash
+ * reconnect loops (from before the pane-close fix) keep sessions
+ * marked "attached" even though no VS Code terminal exists. These
+ * are safe to adopt: tmux allows multiple clients, and the zombie's
+ * output goes nowhere (its original PTY is dead).
  */
-async function reconnectAll(): Promise<number> {
-  // First reconnect mapped panes
-  const reconnected = await reconnectMapped();
-
+function adoptUnmappedSessions(): number {
   const liveSessions = listTmuxSessions(instanceId);
   const mappedSessions = new Set(
     Object.values(mapping.panes)
@@ -376,21 +372,22 @@ async function reconnectAll(): Promise<number> {
 
   let adopted = 0;
   for (const session of liveSessions) {
-    // Skip sessions we already track
     if (mappedSessions.has(session.name)) {
       continue;
     }
-    // Only adopt UNATTACHED sessions — attached ones already
-    // have a terminal connected (via grab or direct creation)
-    if (session.attached) {
-      continue;
-    }
-    console.log(
-      `[tmux-session-manager] Adopting unattached session: ${session.name}`,
+    debugChannel.appendLine(
+      `[${new Date().toISOString()}] adopting session: ${session.name} ` +
+        `(attached=${session.attached})`,
     );
     createTerminalForSession(session.name);
     adopted++;
   }
+  return adopted;
+}
+
+async function reconnectAll(): Promise<number> {
+  const reconnected = await reconnectMapped();
+  const adopted = adoptUnmappedSessions();
   return reconnected + adopted;
 }
 
@@ -603,30 +600,14 @@ export function activate(context: vscode.ExtensionContext): void {
     console.error("[tmux-session-manager] Reconnection failed:", err);
   });
 
-  // Periodically adopt unattached sessions (every 30s).
-  // Sessions become unattached when: user closes a pane (trap doesn't
-  // kill), container restarts, or browser reloads. Auto-adopting makes
-  // them visible so the user can decide to keep or 'exit' them.
-  // This prevents invisible resource consumption (e.g., Claude sessions
-  // running in orphaned tmux sessions).
-  const adoptInterval = setInterval(async () => {
+  // Periodically adopt unmapped sessions (every 30s).
+  // Sessions become unmapped when: extension mapping is wiped by old code,
+  // user closes a pane (trap doesn't kill), container restarts, or browser
+  // reloads. Auto-adopting makes them visible so the user can decide to
+  // keep or 'exit' them.
+  const adoptInterval = setInterval(() => {
     try {
-      const liveSessions = listTmuxSessions(instanceId);
-      const mappedSessions = new Set(
-        Object.values(mapping.panes)
-          .map((p) => p.tmuxSession)
-          .filter((s) => s),
-      );
-
-      for (const session of liveSessions) {
-        if (mappedSessions.has(session.name)) continue;
-        if (session.attached) continue;
-
-        console.log(
-          `[tmux-session-manager] Auto-adopting unattached session: ${session.name}`,
-        );
-        createTerminalForSession(session.name);
-      }
+      adoptUnmappedSessions();
     } catch {
       // Ignore errors in periodic check
     }
