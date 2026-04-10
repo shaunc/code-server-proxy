@@ -225,14 +225,15 @@ function resolveSession(paneId: string): string | null {
 }
 
 function removePaneFromMapping(paneId: string): void {
+  const paneInfo = mapping.panes[paneId];
   delete mapping.panes[paneId];
   persistMapping(mapping, mappingFilePath);
 
-  // Resolve the session name via the host-side mapping and kill it.
-  // Cannot rely on paneInfo.tmuxSession — it is never populated
-  // because host-bash chooses the session via cs-tmux-window without
-  // informing the extension.
-  const session = resolveSession(paneId);
+  // Use the cached session name if available (set by adoption or
+  // reconnectMapped), then fall back to host-side resolve (for panes
+  // created via the profile provider, where host-bash chose the
+  // session via cs-tmux-window without informing the extension).
+  const session = paneInfo?.tmuxSession || resolveSession(paneId);
   if (session) {
     killTmuxSession(session);
   } else {
