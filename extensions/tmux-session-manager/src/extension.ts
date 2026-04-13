@@ -746,10 +746,15 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   // Initial pass: identify sessions for all already-present terminals
-  // (code-server may have surfaced them before activation),
-  // populate sessionCache, dedup, then adopt orphans. Sequencing
-  // matters: we must identify BEFORE adoptOrphans so it sees them
-  // as covered and doesn't create duplicates.
+  // and register keepers. Does NOT adopt orphans — that's left to
+  // the periodic interval. Reason: externally-created host-bash
+  // terminals (e.g. spawned by another extension) arrive shortly
+  // after activation with no identifying env; their host-bash runs
+  // cs-tmux-window grab to pick an unattached session. If we adopt
+  // the unattached session ourselves during initial pass, we
+  // attach it, forcing grab to create a NEW session instead —
+  // unbounded growth per reload. Waiting defers adoption until
+  // mystery terminals have had a chance to grab.
   (async () => {
     try {
       for (const terminal of vscode.window.terminals) {
@@ -761,14 +766,8 @@ export function activate(context: vscode.ExtensionContext): void {
             paneIdToTerminal.set(env.TMUX_PANE_ID, terminal);
           }
         }
-        // Prime the cache and register the keeper. First terminal
-        // to claim each session wins; subsequent ones dispose
-        // themselves via claimOrDispose (not shown here — happens
-        // naturally because sessionKeeper already holds the first).
         await claimOrDispose(terminal);
       }
-      // Adopt sessions still without a keeper.
-      await adoptOrphans();
     } catch (err) {
       console.error("[tmux-session-manager] initial pass failed:", err);
     }
