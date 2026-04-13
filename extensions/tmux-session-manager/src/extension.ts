@@ -307,6 +307,77 @@ function createTerminalForSession(tmuxSession: string): vscode.Terminal {
 }
 
 /**
+ * Normalize the extension mapping so every entry has its
+ * tmuxSession populated, no entries reference dead sessions, and
+ * no two entries share the same session. This is the source of
+ * truth the rest of the extension relies on. Called before
+ * reconnectMapped and adoptUnmappedSessions so they see a
+ * consistent state even if past runs or crashes left duplicates.
+ */
+function canonicalizeMapping(liveSessionNames: Set<string>): void {
+  let changed = false;
+
+  // Populate missing tmuxSession via host-side resolve; drop entries
+  // whose session is gone or unresolvable.
+  for (const [paneId, paneInfo] of Object.entries(mapping.panes)) {
+    if (!paneInfo.tmuxSession) {
+      const resolved = resolveSession(paneId);
+      if (resolved) {
+        paneInfo.tmuxSession = resolved;
+        changed = true;
+      }
+    }
+    if (!paneInfo.tmuxSession || !liveSessionNames.has(paneInfo.tmuxSession)) {
+      debugChannel.appendLine(
+        `[${new Date().toISOString()}] canonicalize: ` +
+          `drop pane ${paneId} (session ${paneInfo.tmuxSession || "<none>"} ` +
+          `gone)`,
+      );
+      delete mapping.panes[paneId];
+      changed = true;
+    }
+  }
+
+  // Dedup: if multiple panes point to the same session, keep the
+  // first and drop the rest. Prefer an entry that has a live VS
+  // Code terminal if one exists.
+  const claimedBy = new Map<string, string>(); // session -> paneId
+  // First, give preference to panes with live terminals
+  for (const paneId of Object.keys(mapping.panes)) {
+    if (paneIdToTerminal.has(paneId)) {
+      const session = mapping.panes[paneId].tmuxSession;
+      if (session && !claimedBy.has(session)) {
+        claimedBy.set(session, paneId);
+      }
+    }
+  }
+  // Then fill in any unclaimed sessions with the first pane seen
+  for (const [paneId, paneInfo] of Object.entries(mapping.panes)) {
+    if (!paneInfo.tmuxSession) continue;
+    if (!claimedBy.has(paneInfo.tmuxSession)) {
+      claimedBy.set(paneInfo.tmuxSession, paneId);
+    }
+  }
+  // Drop duplicates
+  for (const [paneId, paneInfo] of Object.entries(mapping.panes)) {
+    if (
+      paneInfo.tmuxSession &&
+      claimedBy.get(paneInfo.tmuxSession) !== paneId
+    ) {
+      debugChannel.appendLine(
+        `[${new Date().toISOString()}] canonicalize: ` +
+          `dedup pane ${paneId} (session ${paneInfo.tmuxSession} already ` +
+          `claimed by ${claimedBy.get(paneInfo.tmuxSession)})`,
+      );
+      delete mapping.panes[paneId];
+      changed = true;
+    }
+  }
+
+  if (changed) persistMapping(mapping, mappingFilePath);
+}
+
+/**
  * Reconnect mapped panes to their tmux sessions.
  * Called automatically on activation.
  * Only handles panes the extension previously tracked — does NOT
@@ -327,9 +398,8 @@ async function reconnectMapped(): Promise<number> {
   // Index existing terminals by their TMUX_PANE_ID. At activation
   // time, code-server may surface restored terminals BEFORE firing
   // onDidOpenTerminal for them, so the Map is empty for restored
-  // ones. Extract paneId from creationOptions.env as a fallback,
-  // register the terminal, and cache its session in paneInfo so
-  // adoptUnmappedSessions doesn't treat it as orphaned.
+  // ones. Extract paneId from creationOptions.env as a fallback
+  // and register the terminal.
   const existingPaneIds = new Set<string>();
   for (const terminal of liveTerminals) {
     let paneId = terminalToPaneId.get(terminal);
@@ -353,50 +423,21 @@ async function reconnectMapped(): Promise<number> {
         }
       }
     }
-    if (paneId) {
-      existingPaneIds.add(paneId);
-      // Ensure paneInfo.tmuxSession is populated for restored
-      // terminals so they show up in mappedSessions and avoid being
-      // "adopted" as duplicates.
-      const paneInfo = mapping.panes[paneId];
-      if (paneInfo && !paneInfo.tmuxSession) {
-        const resolved = resolveSession(paneId);
-        if (resolved && liveSessionNames.has(resolved)) {
-          paneInfo.tmuxSession = resolved;
-          persistMapping(mapping, mappingFilePath);
-        }
-      }
-    }
+    if (paneId) existingPaneIds.add(paneId);
   }
+
+  // Canonicalize: populate tmuxSession via host-side resolve, drop
+  // gone sessions, dedup entries that resolve to the same session.
+  canonicalizeMapping(liveSessionNames);
 
   let reconnected = 0;
   for (const [paneId, paneInfo] of Object.entries(mapping.panes)) {
     // Skip if terminal already exists in VS Code
-    if (existingPaneIds.has(paneId)) {
-      continue;
-    }
-
-    // Resolve session name via cs-tmux-window (paneInfo.tmuxSession
-    // is a legacy field that was never populated). Fall back to any
-    // legacy value if resolve fails.
-    const sessionName =
-      resolveSession(paneId) || paneInfo.tmuxSession || "";
-
-    if (!sessionName || !liveSessionNames.has(sessionName)) {
-      // tmux session gone — clean up mapping
-      delete mapping.panes[paneId];
-      persistMapping(mapping, mappingFilePath);
-      continue;
-    }
-
-    // Cache the resolved name so createTerminalForPane can pass it
-    // directly to host-bash for fast reattach
-    paneInfo.tmuxSession = sessionName;
-    persistMapping(mapping, mappingFilePath);
+    if (existingPaneIds.has(paneId)) continue;
 
     debugChannel.appendLine(
       `[${new Date().toISOString()}] reconnecting pane ${paneId} ` +
-        `to ${sessionName}`,
+        `to ${paneInfo.tmuxSession}`,
     );
     createTerminalForPane(paneId, paneInfo);
     reconnected++;
@@ -416,6 +457,13 @@ async function reconnectMapped(): Promise<number> {
  */
 function adoptUnmappedSessions(): number {
   const liveSessions = listTmuxSessions(instanceId);
+  const liveSessionNames = new Set(liveSessions.map((s) => s.name));
+
+  // Canonicalize first so mappedSessions accurately reflects every
+  // pane's session (including entries where tmuxSession was left
+  // empty by the profile provider path).
+  canonicalizeMapping(liveSessionNames);
+
   const mappedSessions = new Set(
     Object.values(mapping.panes)
       .map((p) => p.tmuxSession)
@@ -424,9 +472,7 @@ function adoptUnmappedSessions(): number {
 
   let adopted = 0;
   for (const session of liveSessions) {
-    if (mappedSessions.has(session.name)) {
-      continue;
-    }
+    if (mappedSessions.has(session.name)) continue;
     debugChannel.appendLine(
       `[${new Date().toISOString()}] adopting session: ${session.name} ` +
         `(attached=${session.attached})`,
