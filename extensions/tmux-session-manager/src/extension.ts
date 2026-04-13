@@ -348,60 +348,87 @@ function createTerminalForSession(tmuxSession: string): vscode.Terminal {
   return terminal;
 }
 
+// Tracks the current "keeper" terminal per tmux session. At most
+// one entry per session; subsequent terminals that open on the
+// same session are disposed rather than added here.
+const sessionKeeper = new Map<string, vscode.Terminal>();
+
 /**
- * Dispose the given terminal if another terminal is already viewing
- * the same tmux session. Returns true if disposed.
+ * Claim a session for the given terminal, or dispose the terminal
+ * if another already holds the session. This is the core dedup
+ * primitive — "first terminal to claim a session wins, rest lose".
  *
- * Identifies the terminal's session via identifySession (which
- * falls back to /proc when creationOptions.env is stripped).
+ * Called from onDidOpenTerminal (per event) and from the initial
+ * activation scan (in insertion order).
  */
-async function disposeIfDuplicate(
+async function claimOrDispose(
   terminal: vscode.Terminal,
 ): Promise<boolean> {
   const session = await identifySession(terminal);
   if (!session) return false;
-  for (const other of vscode.window.terminals) {
-    if (other === terminal) continue;
-    const otherSession = await identifySession(other);
-    if (otherSession === session) {
-      debugChannel.appendLine(
-        `[${new Date().toISOString()}] dispose duplicate terminal for ` +
-          `session ${session}`,
-      );
-      terminal.dispose();
-      return true;
-    }
+  const existing = sessionKeeper.get(session);
+  if (existing && existing !== terminal) {
+    debugChannel.appendLine(
+      `[${new Date().toISOString()}] dispose duplicate for ${session} ` +
+        `(keeper already registered)`,
+    );
+    terminal.dispose();
+    return true;
   }
+  if (!existing) sessionKeeper.set(session, terminal);
   return false;
+}
+
+/**
+ * Release a terminal's claim on its session, if it was the keeper.
+ * Called from onDidCloseTerminal so the next open on that session
+ * (e.g. from adoption) becomes the new keeper.
+ */
+function releaseSessionClaim(terminal: vscode.Terminal): void {
+  const session = sessionCache.get(terminal);
+  if (!session) return;
+  if (sessionKeeper.get(session) === terminal) {
+    sessionKeeper.delete(session);
+  }
 }
 
 /**
  * Adopt tmux sessions that are live but have no VS Code terminal
  * viewing them. Called periodically (every 30s) to surface orphans.
+ *
+ * Uses sessionKeeper (authoritative "this session is covered") as
+ * the coverage source, not a re-scan of vscode.window.terminals —
+ * this avoids races where a just-created terminal is in
+ * window.terminals but hasn't fired onDidOpenTerminal yet.
  */
 async function adoptOrphans(): Promise<number> {
-  const liveSessions = listTmuxSessions(instanceId);
-  const terminals = vscode.window.terminals;
-
-  const covered = new Set<string>();
-  for (const t of terminals) {
+  // First prime keepers for any terminal that arrived without
+  // firing onDidOpenTerminal (rare but possible). This is idempotent.
+  for (const t of vscode.window.terminals) {
     const s = await identifySession(t);
-    if (s) covered.add(s);
+    if (s && !sessionKeeper.has(s)) sessionKeeper.set(s, t);
   }
 
+  const liveSessions = listTmuxSessions(instanceId);
   debugChannel.appendLine(
     `[${new Date().toISOString()}] adoptOrphans: ` +
-      `${liveSessions.length} live sessions, ${terminals.length} terminals, ` +
-      `${covered.size} sessions covered`,
+      `${liveSessions.length} live sessions, ` +
+      `${vscode.window.terminals.length} terminals, ` +
+      `${sessionKeeper.size} sessions covered`,
   );
 
   let adopted = 0;
   for (const session of liveSessions) {
-    if (covered.has(session.name)) continue;
+    if (sessionKeeper.has(session.name)) continue;
     debugChannel.appendLine(
       `[${new Date().toISOString()}] adopting orphan session: ${session.name}`,
     );
-    createTerminalForSession(session.name);
+    const terminal = createTerminalForSession(session.name);
+    // Eagerly register as keeper so subsequent adoptOrphans in the
+    // same tick don't double-adopt while onDidOpenTerminal is
+    // still pending.
+    sessionCache.set(terminal, session.name);
+    sessionKeeper.set(session.name, terminal);
     adopted++;
   }
   return adopted;
@@ -528,9 +555,9 @@ export function activate(context: vscode.ExtensionContext): void {
         paneIdToTerminal.set(envPaneId, terminal);
       }
 
-      // Dedup against existing terminals on the same session. Async
-      // because we may need to read /proc for restored terminals.
-      void disposeIfDuplicate(terminal);
+      // Claim the session for this terminal, or dispose if another
+      // terminal is already registered as the keeper for it.
+      void claimOrDispose(terminal);
     }),
   );
 
@@ -569,11 +596,17 @@ export function activate(context: vscode.ExtensionContext): void {
         paneIdToTerminal.delete(paneId);
       }
 
-      // On shutdown, preserve state for reconnection on next launch.
-      // For all other close reasons, decide whether to kill the tmux
-      // session based on whether any other VS Code terminal is still
-      // viewing it (refcount guard).
-      if (reason === vscode.TerminalExitReason.Shutdown) {
+      // Release session claim so a future open on this session
+      // (e.g. adoption) can become the new keeper.
+      releaseSessionClaim(terminal);
+
+      // Extension disposal (dedup) is NOT user-driven; never kill
+      // the session in that case. Real user close paths use User
+      // or Process.
+      if (
+        reason === vscode.TerminalExitReason.Shutdown ||
+        reason === vscode.TerminalExitReason.Extension
+      ) {
         return;
       }
 
@@ -618,10 +651,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(
       "tmuxSessionManager.reconnectAll",
       async () => {
-        // Manual full pass: dedup existing + adopt orphans.
+        // Manual full pass: claim/dispose existing + adopt orphans.
         let disposed = 0;
         for (const t of vscode.window.terminals) {
-          if (await disposeIfDuplicate(t)) disposed++;
+          if (await claimOrDispose(t)) disposed++;
         }
         const adopted = await adoptOrphans();
         vscode.window.showInformationMessage(
@@ -674,15 +707,13 @@ export function activate(context: vscode.ExtensionContext): void {
             paneIdToTerminal.set(env.TMUX_PANE_ID, terminal);
           }
         }
-        // Prime the cache; this is where /proc fallback happens for
-        // restored terminals whose creationOptions.env was stripped.
-        await identifySession(terminal);
+        // Prime the cache and register the keeper. First terminal
+        // to claim each session wins; subsequent ones dispose
+        // themselves via claimOrDispose (not shown here — happens
+        // naturally because sessionKeeper already holds the first).
+        await claimOrDispose(terminal);
       }
-      // Dedup based on identified sessions.
-      for (const terminal of vscode.window.terminals) {
-        await disposeIfDuplicate(terminal);
-      }
-      // Now adopt anything still uncovered.
+      // Adopt sessions still without a keeper.
       await adoptOrphans();
     } catch (err) {
       console.error("[tmux-session-manager] initial pass failed:", err);
