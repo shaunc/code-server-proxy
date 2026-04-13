@@ -266,13 +266,15 @@ function sessionFromSshChild(hostBashPid: number): string | null {
           `/proc/${childPid}/cmdline`,
           "utf-8",
         );
-        // cmdline is null-separated; look for
-        // "tmux\0attach-session\0-t\0<session>\0"
+        // host-bash invokes ssh as:
+        //   ssh -t ... HOST "tmux attach-session -t 'SESSION'"
+        // The remote-command string is ONE argv entry containing
+        // spaces and quotes — not multiple null-delimited args. We
+        // must match across the whole string.
         const parts = cmd.split("\0");
-        const tIdx = parts.indexOf("-t");
-        if (tIdx > 0 && parts[tIdx - 1] === "attach-session") {
-          const sess = parts[tIdx + 1];
-          if (sess && sess.startsWith("cs-")) return sess;
+        for (const arg of parts) {
+          const m = arg.match(/attach-session\s+-t\s+'([^']+)'/);
+          if (m && m[1].startsWith("cs-")) return m[1];
         }
       } catch {
         // child may have exited between listing and reading
