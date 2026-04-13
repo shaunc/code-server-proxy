@@ -279,88 +279,68 @@ function createTerminalForSession(tmuxSession: string): vscode.Terminal {
 }
 
 /**
- * Reconcile VS Code terminals with live tmux sessions. Source of
- * truth: vscode.window.terminals. Invariant enforced:
+ * Dispose the given terminal if another terminal is already viewing
+ * the same tmux session. Returns true if disposed.
  *
- *   At most one VS Code terminal per live tmux session.
- *
- * - Duplicate terminals on the same session: dispose excess,
- *   keeping the first (which triggers onDidCloseTerminal; the
- *   refcount guard there prevents killing the session).
- * - Live tmux sessions with no VS Code terminal: adopt.
- *
- * Called on activation (after a short delay to let code-server
- * surface restored terminals) and every 30s.
+ * Called per-terminal from onDidOpenTerminal and from the initial
+ * activate() scan for already-restored terminals. Enforces the
+ * invariant "at most one VS Code terminal per live tmux session"
+ * without needing batch reconciliation or debouncing.
  */
-function reconcile(): { adopted: number; disposed: number } {
+function disposeIfDuplicate(terminal: vscode.Terminal): boolean {
+  const session = terminalSession(terminal);
+  if (!session) return false;
+  for (const other of vscode.window.terminals) {
+    if (other === terminal) continue;
+    if (terminalSession(other) === session) {
+      debugChannel.appendLine(
+        `[${new Date().toISOString()}] dispose duplicate terminal for ` +
+          `session ${session} (another terminal already viewing it)`,
+      );
+      terminal.dispose();
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Adopt tmux sessions that are live but have no VS Code terminal
+ * viewing them. Called periodically (every 30s) to surface orphans.
+ */
+function adoptOrphans(): number {
   const liveSessions = listTmuxSessions(instanceId);
-  const liveSessionNames = new Set(liveSessions.map((s) => s.name));
   const terminals = vscode.window.terminals;
 
-  // Group terminals by session name. Terminals not on any of our
-  // sessions are ignored (plain bash, other extensions' terminals).
-  const bySession = new Map<string, vscode.Terminal[]>();
-  let untracked = 0;
-  for (const terminal of terminals) {
-    const session = terminalSession(terminal);
-    if (!session) {
-      untracked++;
-      continue;
-    }
-    // Only care about sessions for THIS instance's live list —
-    // terminals pointing to dead sessions will exit naturally.
-    if (!liveSessionNames.has(session)) continue;
-    const list = bySession.get(session) || [];
-    list.push(terminal);
-    bySession.set(session, list);
+  const covered = new Set<string>();
+  for (const t of terminals) {
+    const s = terminalSession(t);
+    if (s) covered.add(s);
   }
 
-  debugChannel.appendLine(
-    `[${new Date().toISOString()}] reconcile: ` +
-      `${liveSessions.length} live sessions, ${terminals.length} terminals ` +
-      `(${untracked} not host-shell), ${bySession.size} sessions covered`,
-  );
-  for (const [session, list] of bySession) {
-    debugChannel.appendLine(
-      `  session ${session}: ${list.length} terminal(s)`,
-    );
-  }
-
-  // Dispose duplicates. Prefer keeping a terminal that is tracked
-  // in the current mapping (if any); otherwise keep the first.
-  let disposed = 0;
-  for (const [session, list] of bySession) {
-    if (list.length <= 1) continue;
-    // Prefer terminal whose paneId is in our current mapping
-    let keepIdx = list.findIndex((t) => {
-      const pid = terminalToPaneId.get(t);
-      return pid !== undefined && mapping.panes[pid] !== undefined;
-    });
-    if (keepIdx < 0) keepIdx = 0;
-    for (let i = 0; i < list.length; i++) {
-      if (i === keepIdx) continue;
-      debugChannel.appendLine(
-        `[${new Date().toISOString()}] disposing duplicate terminal ` +
-          `for session ${session} (keeping index ${keepIdx})`,
-      );
-      list[i].dispose();
-      disposed++;
-    }
-  }
-
-  // Adopt sessions with no terminal.
   let adopted = 0;
   for (const session of liveSessions) {
-    if (bySession.has(session.name)) continue;
+    if (covered.has(session.name)) continue;
     debugChannel.appendLine(
-      `[${new Date().toISOString()}] adopting session: ${session.name} ` +
-        `(attached=${session.attached})`,
+      `[${new Date().toISOString()}] adopting orphan session: ${session.name}`,
     );
     createTerminalForSession(session.name);
     adopted++;
   }
+  return adopted;
+}
 
-  return { adopted, disposed };
+/**
+ * Find an unattached tmux session for this instance, to be used by
+ * the profile provider during a restore to reattach rather than
+ * create a new session. Returns null if all are attached.
+ */
+function findUnattachedSession(): string | null {
+  const live = listTmuxSessions(instanceId);
+  for (const s of live) {
+    if (!s.attached) return s.name;
+  }
+  return null;
 }
 
 // --- Activation ---
@@ -397,12 +377,38 @@ export function activate(context: vscode.ExtensionContext): void {
     `[tmux-session-manager] Activated for instance ${instanceId.slice(0, 12)}...`,
   );
 
-  // Register terminal profile provider (must happen regardless of storage)
+  // Register terminal profile provider. code-server invokes this
+  // both for explicit user-created terminals AND during restore of
+  // previously-opened terminals. Naive behavior (always generate a
+  // fresh paneId) forces host-bash into attach-or-create, which
+  // creates a NEW tmux session on every restore. Intercept by
+  // reusing unattached sessions when available.
   const profileProvider: vscode.TerminalProfileProvider = {
     provideTerminalProfile(): vscode.ProviderResult<vscode.TerminalProfile> {
+      const reusable = findUnattachedSession();
+      if (reusable) {
+        debugChannel.appendLine(
+          `[${new Date().toISOString()}] profile provider: reusing ` +
+            `unattached session ${reusable}`,
+        );
+        const paneId = generatePaneId();
+        savePaneToMapping(paneId, "Host Shell (tmux)", 1);
+        return new vscode.TerminalProfile({
+          name: "Host Shell (tmux)",
+          shellPath: "/usr/local/bin/host-bash",
+          env: { TMUX_PANE_ID: paneId, TMUX_SESSION: reusable },
+          location: vscode.TerminalLocation.Editor,
+        });
+      }
+
+      // No unattached session to reuse — fresh paneId, host-bash
+      // will run cs-tmux-window grab/attach-or-create.
       const paneId = generatePaneId();
       savePaneToMapping(paneId, "Host Shell (tmux)", 1);
-
+      debugChannel.appendLine(
+        `[${new Date().toISOString()}] profile provider: fresh paneId ` +
+          `${paneId} (no unattached session available)`,
+      );
       return new vscode.TerminalProfile({
         name: "Host Shell (tmux)",
         shellPath: "/usr/local/bin/host-bash",
@@ -419,47 +425,34 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
   );
 
-  // Track terminal opens
+  // Track terminal opens. Two jobs:
+  // 1. Register the terminal's paneId in our in-memory maps so
+  //    onDidCloseTerminal can find the pane later.
+  // 2. Enforce "at most one VS Code terminal per tmux session" by
+  //    disposing the new terminal if another is already viewing
+  //    the same session.
   context.subscriptions.push(
     vscode.window.onDidOpenTerminal((terminal) => {
-      const opts0 = terminal.creationOptions;
+      const opts = terminal.creationOptions;
       const hasEnv =
-        "env" in opts0 && opts0.env && typeof opts0.env === "object";
-      const envPaneId = hasEnv
-        ? (opts0.env as Record<string, string>).TMUX_PANE_ID
-        : undefined;
+        "env" in opts && opts.env && typeof opts.env === "object";
+      const env = hasEnv ? (opts.env as Record<string, string>) : {};
+      const envPaneId = env.TMUX_PANE_ID;
+      const envSession = env.TMUX_SESSION;
+
       debugChannel.appendLine(
         `[${new Date().toISOString()}] onDidOpenTerminal ` +
-          `name=${terminal.name} preTracked=${terminalToPaneId.has(terminal)} ` +
-          `envPaneId=${envPaneId ?? "-"}`,
+          `name=${terminal.name} paneId=${envPaneId ?? "-"} ` +
+          `session=${envSession ?? "-"}`,
       );
 
-      // If this terminal was created by us, it's already tracked.
-      if (terminalToPaneId.has(terminal)) {
-        return;
+      if (envPaneId && !terminalToPaneId.has(terminal)) {
+        terminalToPaneId.set(terminal, envPaneId);
+        paneIdToTerminal.set(envPaneId, terminal);
       }
 
-      // Check if the terminal's creation options have our env var.
-      // This handles terminals created via the profile provider.
-      const opts = terminal.creationOptions;
-      if (
-        "env" in opts &&
-        opts.env &&
-        typeof opts.env === "object" &&
-        "TMUX_PANE_ID" in opts.env
-      ) {
-        const paneId = (opts.env as Record<string, string>).TMUX_PANE_ID;
-        if (paneId) {
-          terminalToPaneId.set(terminal, paneId);
-          paneIdToTerminal.set(paneId, terminal);
-          return;
-        }
-      }
-
-      // Terminal not created by us — assign a pane ID retroactively.
-      // We can inject env via sendText, but the shell already started
-      // without TMUX_PANE_ID, so it created an unmapped tmux session.
-      // Track it but don't try to map it.
+      // Dedup against existing terminals on the same session.
+      disposeIfDuplicate(terminal);
     }),
   );
 
@@ -546,9 +539,14 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(
       "tmuxSessionManager.reconnectAll",
       () => {
-        const { adopted, disposed } = reconcile();
+        // Manual full pass: dedup existing + adopt orphans.
+        let disposed = 0;
+        for (const t of vscode.window.terminals) {
+          if (disposeIfDuplicate(t)) disposed++;
+        }
+        const adopted = adoptOrphans();
         vscode.window.showInformationMessage(
-          `tmux: reconcile — ${adopted} adopted, ${disposed} disposed`,
+          `tmux: ${adopted} adopted, ${disposed} duplicates disposed`,
         );
       },
     ),
@@ -581,48 +579,33 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
   );
 
-  // Debounced reconcile driven by terminal activity. We can't rely
-  // on a single fixed-delay initial reconcile because code-server
-  // may surface restored terminals over a longer and variable time
-  // window. Every onDidOpenTerminal resets a 1.5s timer; once no
-  // new terminal has appeared for that long, we reconcile. This
-  // lets all restored terminals settle into
-  // vscode.window.terminals before reconcile groups by session.
-  let reconcileTimer: NodeJS.Timeout | null = null;
-  const scheduleReconcile = (delay: number): void => {
-    if (reconcileTimer) clearTimeout(reconcileTimer);
-    reconcileTimer = setTimeout(() => {
-      reconcileTimer = null;
-      try {
-        reconcile();
-      } catch (err) {
-        console.error("[tmux-session-manager] reconcile failed:", err);
+  // Initial scan: terminals already in vscode.window.terminals at
+  // activation time never fire onDidOpenTerminal, so dedup them
+  // synchronously here.
+  for (const terminal of vscode.window.terminals) {
+    const opts = terminal.creationOptions;
+    if ("env" in opts && opts.env && typeof opts.env === "object") {
+      const env = opts.env as Record<string, string>;
+      if (env.TMUX_PANE_ID && !terminalToPaneId.has(terminal)) {
+        terminalToPaneId.set(terminal, env.TMUX_PANE_ID);
+        paneIdToTerminal.set(env.TMUX_PANE_ID, terminal);
       }
-    }, delay);
-  };
+    }
+    disposeIfDuplicate(terminal);
+  }
 
-  context.subscriptions.push(
-    vscode.window.onDidOpenTerminal(() => scheduleReconcile(1500)),
-  );
-
-  // Kick off an initial reconcile; also safety-net even if no
-  // onDidOpenTerminal fires (no restored terminals).
-  scheduleReconcile(1500);
-
-  // Periodic reconcile: dispose duplicates, adopt orphans.
-  const reconcileInterval = setInterval(() => {
+  // Periodic adoption of orphan sessions (sessions with no VS Code
+  // viewer). Independent of terminal events; 30s is fine.
+  const adoptInterval = setInterval(() => {
     try {
-      reconcile();
+      adoptOrphans();
     } catch {
       // Ignore errors in periodic check
     }
   }, 30000);
 
   context.subscriptions.push({
-    dispose: () => {
-      if (reconcileTimer) clearTimeout(reconcileTimer);
-      clearInterval(reconcileInterval);
-    },
+    dispose: () => clearInterval(adoptInterval),
   });
 }
 
