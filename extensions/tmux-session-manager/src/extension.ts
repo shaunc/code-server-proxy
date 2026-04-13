@@ -245,16 +245,61 @@ function sessionFromProcEnv(pid: number): string | null {
 }
 
 /**
+ * Walk /proc to find host-bash's ssh child and extract the tmux
+ * session name from its command line. Needed because host-bash
+ * sets TMUX_SESSION internally at runtime (after cs-tmux-window
+ * grab/attach-or-create), which does NOT appear in
+ * /proc/<pid>/environ — that only shows the initial exec env.
+ * The ssh child's cmdline is `ssh ... tmux attach-session -t
+ * cs-<iid>-<N>`, which is our best runtime source of truth.
+ */
+function sessionFromSshChild(hostBashPid: number): string | null {
+  try {
+    const childrenRaw = fs.readFileSync(
+      `/proc/${hostBashPid}/task/${hostBashPid}/children`,
+      "utf-8",
+    );
+    const childPids = childrenRaw.trim().split(/\s+/).filter(Boolean);
+    for (const childPid of childPids) {
+      try {
+        const cmd = fs.readFileSync(
+          `/proc/${childPid}/cmdline`,
+          "utf-8",
+        );
+        // cmdline is null-separated; look for
+        // "tmux\0attach-session\0-t\0<session>\0"
+        const parts = cmd.split("\0");
+        const tIdx = parts.indexOf("-t");
+        if (tIdx > 0 && parts[tIdx - 1] === "attach-session") {
+          const sess = parts[tIdx + 1];
+          if (sess && sess.startsWith("cs-")) return sess;
+        }
+      } catch {
+        // child may have exited between listing and reading
+      }
+    }
+  } catch {
+    // hostBashPid may have exited, or /children not accessible
+  }
+  return null;
+}
+
+/**
  * Identify a terminal's tmux session. Cached per-terminal.
  * Order of attempts:
  *   1. sessionCache (fast path)
  *   2. terminal.creationOptions.env — works for terminals created
  *      in this extension-host lifetime (env preserved in-memory)
- *   3. /proc/<terminal.processId>/environ — required for terminals
- *      preserved across extension-host restart (code-server strips
- *      creationOptions.env but the live process env survives).
+ *   3. /proc/<pid>/environ — works for restored terminals whose
+ *      initial exec env was set via VS Code's createTerminal env.
+ *   4. ssh child cmdline — required for terminals whose initial env
+ *      was NOT set (e.g. spawned by another extension or external
+ *      mechanism). host-bash determines session via grab at runtime
+ *      and runs `ssh ... tmux attach-session -t <session>`; the
+ *      ssh process's cmdline is our runtime source of truth.
  * Returns null for terminals that are not running host-bash or
- * whose session can't be identified (e.g. container bash shells).
+ * whose session can't be identified (e.g. container bash shells,
+ * or host-bash that hasn't yet spawned its ssh child).
  */
 async function identifySession(
   terminal: vscode.Terminal,
@@ -275,6 +320,11 @@ async function identifySession(
       if (fromProc) {
         sessionCache.set(terminal, fromProc);
         return fromProc;
+      }
+      const fromSsh = sessionFromSshChild(pid);
+      if (fromSsh) {
+        sessionCache.set(terminal, fromSsh);
+        return fromSsh;
       }
     }
   } catch {
@@ -544,10 +594,12 @@ export function activate(context: vscode.ExtensionContext): void {
       const envPaneId = env.TMUX_PANE_ID;
       const envSession = env.TMUX_SESSION;
 
+      const shellPath =
+        "shellPath" in opts ? (opts.shellPath ?? "-") : "-";
       debugChannel.appendLine(
         `[${new Date().toISOString()}] onDidOpenTerminal ` +
-          `name=${terminal.name} paneId=${envPaneId ?? "-"} ` +
-          `session=${envSession ?? "-"}`,
+          `name="${terminal.name}" shell="${shellPath}" ` +
+          `paneId=${envPaneId ?? "-"} session=${envSession ?? "-"}`,
       );
 
       if (envPaneId && !terminalToPaneId.has(terminal)) {
