@@ -214,10 +214,79 @@ function terminalSession(terminal: vscode.Terminal): string | null {
   return null;
 }
 
+// Cache of identified sessions per terminal. Once we know which tmux
+// session a terminal is viewing, it doesn't change for that terminal's
+// lifetime. WeakMap so closed terminals drop out automatically.
+const sessionCache = new WeakMap<vscode.Terminal, string>();
+
 /**
- * Count how many live VS Code terminals are viewing a given tmux
- * session, excluding an optional terminal (used in close handlers
- * to count the remaining terminals after this one closes).
+ * Read TMUX_SESSION or resolve TMUX_PANE_ID from /proc/<pid>/environ
+ * for a preserved host-bash process. Needed because code-server
+ * does NOT preserve creationOptions.env across extension host
+ * restart — the only surviving place with that env is the process
+ * itself.
+ */
+function sessionFromProcEnv(pid: number): string | null {
+  try {
+    const raw = fs.readFileSync(`/proc/${pid}/environ`, "utf-8");
+    const entries = raw.split("\0");
+    for (const e of entries) {
+      if (e.startsWith("TMUX_SESSION=")) return e.slice(13);
+    }
+    for (const e of entries) {
+      if (e.startsWith("TMUX_PANE_ID=")) {
+        return resolveSession(e.slice(13));
+      }
+    }
+  } catch {
+    // /proc/<pid> may be gone or inaccessible
+  }
+  return null;
+}
+
+/**
+ * Identify a terminal's tmux session. Cached per-terminal.
+ * Order of attempts:
+ *   1. sessionCache (fast path)
+ *   2. terminal.creationOptions.env — works for terminals created
+ *      in this extension-host lifetime (env preserved in-memory)
+ *   3. /proc/<terminal.processId>/environ — required for terminals
+ *      preserved across extension-host restart (code-server strips
+ *      creationOptions.env but the live process env survives).
+ * Returns null for terminals that are not running host-bash or
+ * whose session can't be identified (e.g. container bash shells).
+ */
+async function identifySession(
+  terminal: vscode.Terminal,
+): Promise<string | null> {
+  const cached = sessionCache.get(terminal);
+  if (cached) return cached;
+
+  const fromOpts = terminalSession(terminal);
+  if (fromOpts) {
+    sessionCache.set(terminal, fromOpts);
+    return fromOpts;
+  }
+
+  try {
+    const pid = await terminal.processId;
+    if (pid) {
+      const fromProc = sessionFromProcEnv(pid);
+      if (fromProc) {
+        sessionCache.set(terminal, fromProc);
+        return fromProc;
+      }
+    }
+  } catch {
+    // ignored — processId can throw if terminal exited
+  }
+  return null;
+}
+
+/**
+ * Count live VS Code terminals on a given session, excluding one.
+ * Uses the sessionCache populated by identifySession; un-identified
+ * terminals (no cache entry and no env) are conservatively excluded.
  */
 function countTerminalsOnSession(
   session: string,
@@ -226,7 +295,8 @@ function countTerminalsOnSession(
   let count = 0;
   for (const terminal of vscode.window.terminals) {
     if (terminal === exclude) continue;
-    if (terminalSession(terminal) === session) count++;
+    const s = sessionCache.get(terminal) || terminalSession(terminal);
+    if (s === session) count++;
   }
   return count;
 }
@@ -282,20 +352,21 @@ function createTerminalForSession(tmuxSession: string): vscode.Terminal {
  * Dispose the given terminal if another terminal is already viewing
  * the same tmux session. Returns true if disposed.
  *
- * Called per-terminal from onDidOpenTerminal and from the initial
- * activate() scan for already-restored terminals. Enforces the
- * invariant "at most one VS Code terminal per live tmux session"
- * without needing batch reconciliation or debouncing.
+ * Identifies the terminal's session via identifySession (which
+ * falls back to /proc when creationOptions.env is stripped).
  */
-function disposeIfDuplicate(terminal: vscode.Terminal): boolean {
-  const session = terminalSession(terminal);
+async function disposeIfDuplicate(
+  terminal: vscode.Terminal,
+): Promise<boolean> {
+  const session = await identifySession(terminal);
   if (!session) return false;
   for (const other of vscode.window.terminals) {
     if (other === terminal) continue;
-    if (terminalSession(other) === session) {
+    const otherSession = await identifySession(other);
+    if (otherSession === session) {
       debugChannel.appendLine(
         `[${new Date().toISOString()}] dispose duplicate terminal for ` +
-          `session ${session} (another terminal already viewing it)`,
+          `session ${session}`,
       );
       terminal.dispose();
       return true;
@@ -308,15 +379,21 @@ function disposeIfDuplicate(terminal: vscode.Terminal): boolean {
  * Adopt tmux sessions that are live but have no VS Code terminal
  * viewing them. Called periodically (every 30s) to surface orphans.
  */
-function adoptOrphans(): number {
+async function adoptOrphans(): Promise<number> {
   const liveSessions = listTmuxSessions(instanceId);
   const terminals = vscode.window.terminals;
 
   const covered = new Set<string>();
   for (const t of terminals) {
-    const s = terminalSession(t);
+    const s = await identifySession(t);
     if (s) covered.add(s);
   }
+
+  debugChannel.appendLine(
+    `[${new Date().toISOString()}] adoptOrphans: ` +
+      `${liveSessions.length} live sessions, ${terminals.length} terminals, ` +
+      `${covered.size} sessions covered`,
+  );
 
   let adopted = 0;
   for (const session of liveSessions) {
@@ -451,8 +528,9 @@ export function activate(context: vscode.ExtensionContext): void {
         paneIdToTerminal.set(envPaneId, terminal);
       }
 
-      // Dedup against existing terminals on the same session.
-      disposeIfDuplicate(terminal);
+      // Dedup against existing terminals on the same session. Async
+      // because we may need to read /proc for restored terminals.
+      void disposeIfDuplicate(terminal);
     }),
   );
 
@@ -474,10 +552,11 @@ export function activate(context: vscode.ExtensionContext): void {
                   ? "Extension"
                   : `raw(${String(reason)})`;
 
-      // Identify the session this terminal was viewing before we
-      // unlink bookkeeping (terminalSession may fall back to
-      // resolveSession via TMUX_PANE_ID in creationOptions).
-      const session = terminalSession(terminal);
+      // Use cached session if identified earlier; otherwise fall
+      // back to creationOptions.env. We cannot read /proc here
+      // because the process is gone by this point.
+      const session =
+        sessionCache.get(terminal) ?? terminalSession(terminal);
 
       const msg =
         `[${new Date().toISOString()}] onDidCloseTerminal ` +
@@ -538,13 +617,13 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand(
       "tmuxSessionManager.reconnectAll",
-      () => {
+      async () => {
         // Manual full pass: dedup existing + adopt orphans.
         let disposed = 0;
         for (const t of vscode.window.terminals) {
-          if (disposeIfDuplicate(t)) disposed++;
+          if (await disposeIfDuplicate(t)) disposed++;
         }
-        const adopted = adoptOrphans();
+        const adopted = await adoptOrphans();
         vscode.window.showInformationMessage(
           `tmux: ${adopted} adopted, ${disposed} duplicates disposed`,
         );
@@ -579,29 +658,40 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
   );
 
-  // Initial scan: terminals already in vscode.window.terminals at
-  // activation time never fire onDidOpenTerminal, so dedup them
-  // synchronously here.
-  for (const terminal of vscode.window.terminals) {
-    const opts = terminal.creationOptions;
-    if ("env" in opts && opts.env && typeof opts.env === "object") {
-      const env = opts.env as Record<string, string>;
-      if (env.TMUX_PANE_ID && !terminalToPaneId.has(terminal)) {
-        terminalToPaneId.set(terminal, env.TMUX_PANE_ID);
-        paneIdToTerminal.set(env.TMUX_PANE_ID, terminal);
-      }
-    }
-    disposeIfDuplicate(terminal);
-  }
-
-  // Periodic adoption of orphan sessions (sessions with no VS Code
-  // viewer). Independent of terminal events; 30s is fine.
-  const adoptInterval = setInterval(() => {
+  // Initial pass: identify sessions for all already-present terminals
+  // (code-server may have surfaced them before activation),
+  // populate sessionCache, dedup, then adopt orphans. Sequencing
+  // matters: we must identify BEFORE adoptOrphans so it sees them
+  // as covered and doesn't create duplicates.
+  (async () => {
     try {
-      adoptOrphans();
-    } catch {
-      // Ignore errors in periodic check
+      for (const terminal of vscode.window.terminals) {
+        const opts = terminal.creationOptions;
+        if ("env" in opts && opts.env && typeof opts.env === "object") {
+          const env = opts.env as Record<string, string>;
+          if (env.TMUX_PANE_ID && !terminalToPaneId.has(terminal)) {
+            terminalToPaneId.set(terminal, env.TMUX_PANE_ID);
+            paneIdToTerminal.set(env.TMUX_PANE_ID, terminal);
+          }
+        }
+        // Prime the cache; this is where /proc fallback happens for
+        // restored terminals whose creationOptions.env was stripped.
+        await identifySession(terminal);
+      }
+      // Dedup based on identified sessions.
+      for (const terminal of vscode.window.terminals) {
+        await disposeIfDuplicate(terminal);
+      }
+      // Now adopt anything still uncovered.
+      await adoptOrphans();
+    } catch (err) {
+      console.error("[tmux-session-manager] initial pass failed:", err);
     }
+  })();
+
+  // Periodic adoption of orphan sessions.
+  const adoptInterval = setInterval(() => {
+    void adoptOrphans();
   }, 30000);
 
   context.subscriptions.push({
