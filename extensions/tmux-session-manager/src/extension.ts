@@ -234,14 +234,29 @@ function removePaneFromMapping(paneId: string): void {
   // created via the profile provider, where host-bash chose the
   // session via cs-tmux-window without informing the extension).
   const session = paneInfo?.tmuxSession || resolveSession(paneId);
-  if (session) {
-    killTmuxSession(session);
-  } else {
+  if (!session) {
     debugChannel.appendLine(
       `[${new Date().toISOString()}] removePaneFromMapping: ` +
         `no host-side session for pane ${paneId}`,
     );
+    return;
   }
+
+  // Defensive: if another tracked terminal is also attached to this
+  // session (duplicate-terminal edge case), do not kill — that would
+  // terminate the other terminal too and lose its state irretrievably.
+  const otherPaneOnSameSession = Object.entries(mapping.panes).find(
+    ([, info]) => info.tmuxSession === session,
+  );
+  if (otherPaneOnSameSession) {
+    debugChannel.appendLine(
+      `[${new Date().toISOString()}] not killing ${session}: ` +
+        `another pane ${otherPaneOnSameSession[0]} still references it`,
+    );
+    return;
+  }
+
+  killTmuxSession(session);
 }
 
 function killTmuxSession(tmuxSession: string): void {
@@ -309,12 +324,48 @@ async function reconnectMapped(): Promise<number> {
       `${liveTerminals.length} VS Code terminals`,
   );
 
-  // Index existing terminals by their TMUX_PANE_ID
+  // Index existing terminals by their TMUX_PANE_ID. At activation
+  // time, code-server may surface restored terminals BEFORE firing
+  // onDidOpenTerminal for them, so the Map is empty for restored
+  // ones. Extract paneId from creationOptions.env as a fallback,
+  // register the terminal, and cache its session in paneInfo so
+  // adoptUnmappedSessions doesn't treat it as orphaned.
   const existingPaneIds = new Set<string>();
   for (const terminal of liveTerminals) {
-    const paneId = terminalToPaneId.get(terminal);
+    let paneId = terminalToPaneId.get(terminal);
+    if (!paneId) {
+      const opts = terminal.creationOptions;
+      if (
+        "env" in opts &&
+        opts.env &&
+        typeof opts.env === "object" &&
+        "TMUX_PANE_ID" in opts.env
+      ) {
+        const envPaneId = (opts.env as Record<string, string>).TMUX_PANE_ID;
+        if (envPaneId) {
+          paneId = envPaneId;
+          terminalToPaneId.set(terminal, paneId);
+          paneIdToTerminal.set(paneId, terminal);
+          debugChannel.appendLine(
+            `[${new Date().toISOString()}] registered restored ` +
+              `terminal: pane=${paneId} name=${terminal.name}`,
+          );
+        }
+      }
+    }
     if (paneId) {
       existingPaneIds.add(paneId);
+      // Ensure paneInfo.tmuxSession is populated for restored
+      // terminals so they show up in mappedSessions and avoid being
+      // "adopted" as duplicates.
+      const paneInfo = mapping.panes[paneId];
+      if (paneInfo && !paneInfo.tmuxSession) {
+        const resolved = resolveSession(paneId);
+        if (resolved && liveSessionNames.has(resolved)) {
+          paneInfo.tmuxSession = resolved;
+          persistMapping(mapping, mappingFilePath);
+        }
+      }
     }
   }
 
