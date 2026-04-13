@@ -300,9 +300,13 @@ function reconcile(): { adopted: number; disposed: number } {
   // Group terminals by session name. Terminals not on any of our
   // sessions are ignored (plain bash, other extensions' terminals).
   const bySession = new Map<string, vscode.Terminal[]>();
+  let untracked = 0;
   for (const terminal of terminals) {
     const session = terminalSession(terminal);
-    if (!session) continue;
+    if (!session) {
+      untracked++;
+      continue;
+    }
     // Only care about sessions for THIS instance's live list —
     // terminals pointing to dead sessions will exit naturally.
     if (!liveSessionNames.has(session)) continue;
@@ -313,9 +317,14 @@ function reconcile(): { adopted: number; disposed: number } {
 
   debugChannel.appendLine(
     `[${new Date().toISOString()}] reconcile: ` +
-      `${liveSessions.length} live sessions, ${terminals.length} terminals, ` +
-      `${bySession.size} sessions with terminal(s)`,
+      `${liveSessions.length} live sessions, ${terminals.length} terminals ` +
+      `(${untracked} not host-shell), ${bySession.size} sessions covered`,
   );
+  for (const [session, list] of bySession) {
+    debugChannel.appendLine(
+      `  session ${session}: ${list.length} terminal(s)`,
+    );
+  }
 
   // Dispose duplicates. Prefer keeping a terminal that is tracked
   // in the current mapping (if any); otherwise keep the first.
@@ -572,17 +581,33 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
   );
 
-  // Delay initial reconcile so code-server has time to surface
-  // restored terminals via vscode.window.terminals. If we reconcile
-  // immediately the scan misses restored terminals and we'd adopt
-  // sessions that are about to re-appear as restored tabs.
-  setTimeout(() => {
-    try {
-      reconcile();
-    } catch (err) {
-      console.error("[tmux-session-manager] initial reconcile failed:", err);
-    }
-  }, 500);
+  // Debounced reconcile driven by terminal activity. We can't rely
+  // on a single fixed-delay initial reconcile because code-server
+  // may surface restored terminals over a longer and variable time
+  // window. Every onDidOpenTerminal resets a 1.5s timer; once no
+  // new terminal has appeared for that long, we reconcile. This
+  // lets all restored terminals settle into
+  // vscode.window.terminals before reconcile groups by session.
+  let reconcileTimer: NodeJS.Timeout | null = null;
+  const scheduleReconcile = (delay: number): void => {
+    if (reconcileTimer) clearTimeout(reconcileTimer);
+    reconcileTimer = setTimeout(() => {
+      reconcileTimer = null;
+      try {
+        reconcile();
+      } catch (err) {
+        console.error("[tmux-session-manager] reconcile failed:", err);
+      }
+    }, delay);
+  };
+
+  context.subscriptions.push(
+    vscode.window.onDidOpenTerminal(() => scheduleReconcile(1500)),
+  );
+
+  // Kick off an initial reconcile; also safety-net even if no
+  // onDidOpenTerminal fires (no restored terminals).
+  scheduleReconcile(1500);
 
   // Periodic reconcile: dispose duplicates, adopt orphans.
   const reconcileInterval = setInterval(() => {
@@ -594,7 +619,10 @@ export function activate(context: vscode.ExtensionContext): void {
   }, 30000);
 
   context.subscriptions.push({
-    dispose: () => clearInterval(reconcileInterval),
+    dispose: () => {
+      if (reconcileTimer) clearTimeout(reconcileTimer);
+      clearInterval(reconcileInterval);
+    },
   });
 }
 
