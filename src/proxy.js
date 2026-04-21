@@ -64,6 +64,19 @@ const BACKEND_READY_POLL_INTERVAL = config.instances.backendReadyPollInterval;
 // Maps instance ID to promise that resolves when operation completes
 const instanceLocks = new Map();
 
+// Serializes port-registry mutations across ALL workspaces.
+// instanceLocks is keyed by instance, so it doesn't prevent two
+// different workspaces from racing through load→allocate→save and
+// both claiming the same port. This mutex is the only writer path.
+let registryMutex = Promise.resolve();
+function withRegistryMutex(fn) {
+  const next = registryMutex.then(() => fn());
+  // Swallow errors from the chain so one failure doesn't poison
+  // subsequent operations — each caller awaits its own `next`.
+  registryMutex = next.catch(() => {});
+  return next;
+}
+
 // Create HTTP proxy with selfHandleResponse for HTML injection
 // Extended timeouts to survive network pauses (5 minutes)
 const proxy = httpProxy.createProxyServer({
@@ -263,52 +276,76 @@ async function cleanupStaleEntries(registry) {
       // Registry port is listening, keep the entry unchanged
       cleaned.workspaces[workspacePath] = entry;
       cleaned.ports[registryPort] = registry.ports[registryPort];
-    } else {
-      // Registry port not listening - check if container exists with different port
-      // This happens when port collision occurred and container was created on next
-      // available port, but registry wasn't updated (or got stale and re-allocated)
-      const actualPort = await containerManager.getContainerPort(instanceId);
+      continue;
+    }
 
-      if (actualPort && actualPort !== registryPort) {
-        // Container exists on different port - update registry with actual port
-        console.log(
-          `Registry port mismatch for ${workspacePath}: ` +
-            `registry=${registryPort}, container=${actualPort}. Updating registry.`
+    // Registry port not listening. Determine if container exists and
+    // on what port. Distinguish "container explicitly gone (docker 404)"
+    // from "docker error" — the latter must NOT destroy the entry.
+    let actualPort;
+    try {
+      actualPort = await containerManager.getContainerPort(instanceId);
+    } catch (err) {
+      console.warn(
+        `cleanupStaleEntries: transient docker error for ` +
+          `${workspacePath} (${instanceId.substring(0, 8)}): ` +
+          `${err.message}. Keeping entry defensively.`
+      );
+      cleaned.workspaces[workspacePath] = entry;
+      cleaned.ports[registryPort] = registry.ports[registryPort];
+      continue;
+    }
+
+    if (actualPort === null) {
+      // Container genuinely doesn't exist (docker 404). Remove stale entry.
+      console.log(
+        `Removing stale registry entry for ${workspacePath} ` +
+          `(port ${registryPort} not listening, no container found)`
+      );
+      modified = true;
+      continue;
+    }
+
+    if (actualPort !== registryPort) {
+      // Container exists on a different port — update registry. But
+      // if another workspace already claims actualPort in the cleaned
+      // view, don't clobber its reverse mapping. Keep the old entry
+      // and log; the allocation layer will handle the inconsistency.
+      const existingReverse = cleaned.ports[actualPort];
+      if (
+        existingReverse &&
+        existingReverse.workspacePath !== workspacePath
+      ) {
+        console.warn(
+          `cleanupStaleEntries: would update ${workspacePath} to port ` +
+            `${actualPort} but it's already claimed by ` +
+            `${existingReverse.workspacePath}. Keeping stale entry; ` +
+            `operator intervention may be needed.`
         );
-        modified = true;
-
-        // Update entry with correct port (whether listening or not)
-        const updatedEntry = { ...entry, currentPort: actualPort };
-        cleaned.workspaces[workspacePath] = updatedEntry;
-        cleaned.ports[actualPort] = {
-          workspacePath,
-          instanceId,
-        };
-
-        if (!(await validatePortAvailability(actualPort))) {
-          console.log(
-            `Container ${instanceId.substring(0, 8)} exists on port ${actualPort} ` +
-              `but not listening (stopped?). Registry updated.`
-          );
-        }
-      } else if (actualPort === null) {
-        // No container exists, safe to remove stale entry
-        console.log(
-          `Removing stale registry entry for ${workspacePath} ` +
-            `(port ${registryPort} not listening, no container found)`
-        );
-        modified = true;
-        // Don't add to cleaned - entry is removed
-      } else {
-        // actualPort === registryPort but not listening (container stopped)
-        // Keep the entry so container can be restarted
         cleaned.workspaces[workspacePath] = entry;
         cleaned.ports[registryPort] = registry.ports[registryPort];
-        console.log(
-          `Keeping registry entry for ${workspacePath} ` +
-            `(port ${registryPort} not listening, container may be stopped)`
-        );
+        continue;
       }
+      console.log(
+        `Registry port mismatch for ${workspacePath}: ` +
+          `registry=${registryPort}, container=${actualPort}. ` +
+          `Updating registry.`
+      );
+      modified = true;
+      cleaned.workspaces[workspacePath] = {
+        ...entry,
+        currentPort: actualPort,
+      };
+      cleaned.ports[actualPort] = { workspacePath, instanceId };
+    } else {
+      // Container exists on the same port but isn't listening
+      // (stopped). Keep the entry so it can be restarted.
+      cleaned.workspaces[workspacePath] = entry;
+      cleaned.ports[registryPort] = registry.ports[registryPort];
+      console.log(
+        `Keeping registry entry for ${workspacePath} ` +
+          `(port ${registryPort} not listening, container may be stopped)`
+      );
     }
   }
 
@@ -354,41 +391,66 @@ function allocatePort(workspacePath, registry) {
  * @returns {Promise<{port: number, instanceId: string}>} Port and instance ID
  */
 async function getOrAllocatePort(workspacePath) {
-  const originalRegistry = loadRegistry();
+  // Serialize allocation across all workspaces. Previously
+  // concurrent requests for different workspaces could both load
+  // the same registry snapshot, pick the same free port, and both
+  // save — producing duplicate port claims and docker port-bind
+  // failures (see bead 5ga for smoking-gun logs).
+  return withRegistryMutex(async () => {
+    const originalRegistry = loadRegistry();
 
-  // Cleanup may update ports if containers exist on different ports than registry
-  const { registry, modified } = await cleanupStaleEntries(originalRegistry);
+    // Cleanup may update ports if containers exist on different
+    // ports than registry.
+    const { registry, modified } = await cleanupStaleEntries(
+      originalRegistry
+    );
 
-  // Save registry after cleanup only if it was modified (port corrections, removals)
-  if (modified) {
-    saveRegistry(registry);
-  }
+    if (modified) {
+      saveRegistry(registry);
+    }
 
-  if (registry.workspaces[workspacePath]) {
-    const entry = registry.workspaces[workspacePath];
-    return {
-      port: entry.currentPort,
-      instanceId: entry.instanceId,
+    if (registry.workspaces[workspacePath]) {
+      const entry = registry.workspaces[workspacePath];
+      return {
+        port: entry.currentPort,
+        instanceId: entry.instanceId,
+      };
+    }
+
+    const instanceId = computeInstanceId(workspacePath);
+    const port = allocatePort(workspacePath, registry);
+
+    // Defensive: allocatePort must never hand back a port that's
+    // already assigned to a different workspace. If it does (stale
+    // in-memory registry, bug, whatever), bail loudly rather than
+    // silently overwriting the reverse mapping.
+    const existingReverse = registry.ports[port];
+    if (
+      existingReverse &&
+      existingReverse.workspacePath !== workspacePath
+    ) {
+      throw new Error(
+        `Port registry invariant violation: allocatePort returned ` +
+          `${port} for ${workspacePath} but ports[${port}] is ` +
+          `already assigned to ${existingReverse.workspacePath}`
+      );
+    }
+
+    registry.workspaces[workspacePath] = {
+      instanceId,
+      currentPort: port,
+      allocatedAt: new Date().toISOString(),
     };
-  }
 
-  const instanceId = computeInstanceId(workspacePath);
-  const port = allocatePort(workspacePath, registry);
+    registry.ports[port] = {
+      workspacePath,
+      instanceId,
+    };
 
-  registry.workspaces[workspacePath] = {
-    instanceId,
-    currentPort: port,
-    allocatedAt: new Date().toISOString(),
-  };
+    saveRegistry(registry);
 
-  registry.ports[port] = {
-    workspacePath,
-    instanceId,
-  };
-
-  saveRegistry(registry);
-
-  return { port, instanceId };
+    return { port, instanceId };
+  });
 }
 
 /**
@@ -472,11 +534,19 @@ async function evictLeastActiveInstance() {
       await execAsync(`systemctl --user stop ${serviceName}`);
     }
 
-    // Remove from registry
-    const registry = loadRegistry();
-    delete registry.workspaces[target.workspacePath];
-    delete registry.ports[target.port];
-    saveRegistry(registry);
+    // Remove from registry (serialized — concurrent getOrAllocatePort
+    // must not see the port as free mid-eviction).
+    await withRegistryMutex(() => {
+      const registry = loadRegistry();
+      delete registry.workspaces[target.workspacePath];
+      // Only delete the reverse mapping if it still points at this
+      // evictee — defensive against bidirectional drift.
+      const rev = registry.ports[target.port];
+      if (rev && rev.workspacePath === target.workspacePath) {
+        delete registry.ports[target.port];
+      }
+      saveRegistry(registry);
+    });
 
     // Remove from activity tracker
     activityTracker.removeWorkspace(target.instanceId);
@@ -606,24 +676,38 @@ const recreatingInstances = new Set();
  * @param {number} newPort - New port number
  */
 function updatePortInRegistry(workspacePath, newPort) {
-  const registry = loadRegistry();
-  const entry = registry.workspaces[workspacePath];
-  if (!entry) return;
+  return withRegistryMutex(() => {
+    const registry = loadRegistry();
+    const entry = registry.workspaces[workspacePath];
+    if (!entry) return;
 
-  // Remove old port mapping
-  delete registry.ports[String(entry.currentPort)];
+    // Defensive: new port must not be claimed by a different workspace.
+    const existingReverse = registry.ports[String(newPort)];
+    if (
+      existingReverse &&
+      existingReverse.workspacePath !== workspacePath
+    ) {
+      throw new Error(
+        `updatePortInRegistry: cannot move ${workspacePath} to port ` +
+          `${newPort}, already claimed by ${existingReverse.workspacePath}`
+      );
+    }
 
-  // Update to new port
-  entry.currentPort = newPort;
-  registry.ports[String(newPort)] = {
-    workspacePath,
-    instanceId: entry.instanceId,
-  };
+    // Remove old port mapping
+    delete registry.ports[String(entry.currentPort)];
 
-  saveRegistry(registry);
-  console.log(
-    `[BLUE-GREEN] Updated registry: ${workspacePath} → port ${newPort}`
-  );
+    // Update to new port
+    entry.currentPort = newPort;
+    registry.ports[String(newPort)] = {
+      workspacePath,
+      instanceId: entry.instanceId,
+    };
+
+    saveRegistry(registry);
+    console.log(
+      `[BLUE-GREEN] Updated registry: ${workspacePath} → port ${newPort}`
+    );
+  });
 }
 
 /**
@@ -687,7 +771,7 @@ async function blueGreenRecreate(instanceId, workspacePath, currentPort) {
 
     // 4. Swap port in registry (new requests go to new container)
     console.log(`[BLUE-GREEN] New container ready, swapping...`);
-    updatePortInRegistry(workspacePath, tempPort);
+    await updatePortInRegistry(workspacePath, tempPort);
 
     // 5. Rename containers (works on running containers)
     await containerManager.renameContainer(instanceId, `${instanceId}-old`);

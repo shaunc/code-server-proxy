@@ -1831,13 +1831,13 @@ async function getContainerPort(instanceId) {
     return null;
   } catch (error) {
     if (error.statusCode === 404) {
+      // Container genuinely doesn't exist. null is the "not found" sentinel.
       return null;
     }
-    console.error(
-      `Error getting container port for ${containerName}:`,
-      error.message
-    );
-    return null;
+    // Rethrow on any other error so callers don't mistake "docker
+    // daemon hiccup" for "container doesn't exist" — that confusion
+    // was implicated in destructive cleanup of valid registry entries.
+    throw error;
   }
 }
 
