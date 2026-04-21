@@ -865,6 +865,31 @@ async function launchInstanceUnsafe(instanceId, workspacePath, port) {
       // Check if container exists
       let containerExists = await containerManager.inspectContainer(instanceId);
 
+      // If container exists but its Docker PortBindings don't match
+      // the port we've been assigned (e.g. after a prior port
+      // collision that left the container configured for a port now
+      // owned by a different workspace), remove it and recreate.
+      // Otherwise the proxy would route to `port` while the container
+      // is pinned to another port → infinite loop of failed connects.
+      if (containerExists) {
+        const actualPort = await containerManager.getContainerPort(instanceId);
+        if (actualPort !== null && actualPort !== port) {
+          console.log(
+            `Container ${instanceId.substring(0, 8)} port mismatch: ` +
+              `configured=${actualPort}, assigned=${port}. ` +
+              `Recreating container.`
+          );
+          // Stop if running, then remove. Container volumes persist.
+          const wasRunning =
+            await containerManager.isContainerRunning(instanceId);
+          if (wasRunning) {
+            await containerManager.stopContainer(instanceId);
+          }
+          await containerManager.removeContainer(instanceId, true);
+          containerExists = false;
+        }
+      }
+
       // If container is outdated, DON'T recreate in the request path —
       // that drops active connections for 15-30s. Background check
       // handles idle containers. Active ones update at 6am or on
