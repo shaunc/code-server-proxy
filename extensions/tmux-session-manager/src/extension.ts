@@ -405,6 +405,13 @@ function createTerminalForSession(tmuxSession: string): vscode.Terminal {
 // same session are disposed rather than added here.
 const sessionKeeper = new Map<string, vscode.Terminal>();
 
+// Terminals created with hideFromUser:true are ephemeral — typically
+// ms-python.python's env-discovery shells. host-bash still creates
+// a tmux session for them, which then orphans when they exit. We
+// unconditionally kill their tmux session on close so adoptOrphans
+// doesn't surface them as visible tabs.
+const ephemeralTerminals = new WeakSet<vscode.Terminal>();
+
 /**
  * Claim a session for the given terminal, or dispose the terminal
  * if another already holds the session. This is the core dedup
@@ -598,9 +605,13 @@ export function activate(context: vscode.ExtensionContext): void {
 
       const shellPath =
         "shellPath" in opts ? (opts.shellPath ?? "-") : "-";
+      const hidden =
+        "hideFromUser" in opts && opts.hideFromUser === true;
+      if (hidden) ephemeralTerminals.add(terminal);
       debugChannel.appendLine(
         `[${new Date().toISOString()}] onDidOpenTerminal ` +
           `name="${terminal.name}" shell="${shellPath}" ` +
+          `hidden=${hidden} ` +
           `paneId=${envPaneId ?? "-"} session=${envSession ?? "-"}`,
       );
 
@@ -611,6 +622,10 @@ export function activate(context: vscode.ExtensionContext): void {
 
       // Claim the session for this terminal, or dispose if another
       // terminal is already registered as the keeper for it.
+      // Ephemeral (hideFromUser) terminals — typically from the
+      // Python extension's env-discovery — still claim their session
+      // so our adopt loop doesn't create a duplicate visible tab
+      // for them. Their session is killed when they close (below).
       void claimOrDispose(terminal);
     }),
   );
@@ -667,6 +682,18 @@ export function activate(context: vscode.ExtensionContext): void {
       if (paneId) removePaneFromMapping(paneId);
 
       if (!session) return;
+
+      // Ephemeral (hideFromUser) terminals always kill their
+      // session on close — no refcount check. They're one-shot
+      // discovery shells whose tmux session has no user value.
+      if (ephemeralTerminals.has(terminal)) {
+        debugChannel.appendLine(
+          `[${new Date().toISOString()}] killing ephemeral ` +
+            `session ${session}`,
+        );
+        killTmuxSession(session);
+        return;
+      }
 
       const remaining = countTerminalsOnSession(session, terminal);
       if (remaining > 0) {
