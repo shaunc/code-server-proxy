@@ -373,6 +373,38 @@ function killTmuxSession(tmuxSession: string): void {
   }
 }
 
+const DEFAULT_SESSION_NAME = "Host Shell (tmux)";
+
+// Default tmux window names that carry no teammate identity — they are
+// just the shell tmux picked when the session was created without an
+// explicit rename. cs-tab renames teammate windows to the teammate
+// name (and automatic-rename is off in our tmux.conf, so it sticks);
+// plain host-shell sessions keep one of these. Treat them as unnamed
+// so adopted plain shells stay "Host Shell (tmux)" rather than "bash".
+const UNNAMED_WINDOWS = new Set(["", "bash", "host-bash", "sh"]);
+
+/**
+ * Fetch the tmux window name for a session via the same host-bash/SSH
+ * path resolveSession uses. launch-teammate -> cs-tab renames the
+ * window to the teammate name at creation, so the window name is the
+ * friendly label to show on the tab. Returns DEFAULT_SESSION_NAME when
+ * the window has no meaningful name or on any SSH/tmux failure.
+ */
+function resolveWindowName(tmuxSession: string): string {
+  try {
+    const sshDest = `${process.env.HOST_USER}@host.docker.internal`;
+    const shrc = ". ~/.shrc 2>/dev/null || true; ";
+    const out = execSync(
+      `ssh -o ConnectTimeout=5 -o BatchMode=yes ${sshDest} ` +
+        `"${shrc}tmux display-message -p -t '${tmuxSession}' '#W'"`,
+      { encoding: "utf-8", timeout: 10000 },
+    ).trim();
+    return UNNAMED_WINDOWS.has(out) ? DEFAULT_SESSION_NAME : out;
+  } catch {
+    return DEFAULT_SESSION_NAME;
+  }
+}
+
 /**
  * Create a terminal that attaches to an existing tmux session.
  * Passes TMUX_SESSION directly to host-bash (bypasses cs-tmux-window).
@@ -380,9 +412,10 @@ function killTmuxSession(tmuxSession: string): void {
  */
 function createTerminalForSession(tmuxSession: string): vscode.Terminal {
   const paneId = generatePaneId();
+  const name = resolveWindowName(tmuxSession);
   const paneInfo: PaneMapping = {
     tmuxSession,
-    name: "Host Shell (tmux)",
+    name,
     viewColumn: 1,
     cwd: "",
   };
@@ -390,7 +423,7 @@ function createTerminalForSession(tmuxSession: string): vscode.Terminal {
   persistMapping(mapping, mappingFilePath);
 
   const terminal = vscode.window.createTerminal({
-    name: "Host Shell (tmux)",
+    name,
     shellPath: "/usr/local/bin/host-bash",
     env: { TMUX_SESSION: tmuxSession, TMUX_PANE_ID: paneId },
     location: vscode.TerminalLocation.Editor,
