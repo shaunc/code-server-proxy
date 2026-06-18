@@ -144,7 +144,12 @@ const config = {
 };
 
 // Derived: mounts config path (depends on configDir)
-config.paths.mountsConfig = path.join(config.paths.configDir, 'mounts.json');
+// Host-specific layouts (e.g. rayon, which lacks /data/sda and mambaforge)
+// select an alternate file via MOUNTS_CONFIG; defaults to the silk layout.
+config.paths.mountsConfig = envStr(
+  'MOUNTS_CONFIG',
+  path.join(config.paths.configDir, 'mounts.json')
+);
 
 // Freeze to prevent accidental mutation
 Object.freeze(config.proxy);

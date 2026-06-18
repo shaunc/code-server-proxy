@@ -1,0 +1,17 @@
+{
+  "description": "Container mount configuration for code-server-proxy on rayon",
+  "binds": [
+    {
+      "source": "/home/shauncutts",
+      "target": "/home/shauncutts",
+      "mode": "rw",
+      "comment": "User home directory (~/src is a real dir here, not a /data/sda symlink as on silk)"
+    },
+    {
+      "source": "/tmp/kilocode-shared",
+      "target": "/tmp/kilocode-shared",
+      "mode": "rw",
+      "comment": "Shared temp for Kilo Code system prompts (avoids SSH copy)"
+    }
+  ]
+}

@@ -615,16 +615,21 @@ async function createWorkspaceSymlink(instanceId, workspacePath) {
     const container = docker.getContainer(containerName);
 
     // Create symlink via exec
-    // For workspace file symlinks in /workspace, run as user 1001 (not root)
+    // For workspace file symlinks in /workspace, run as the host user (not
+    // root) so the symlink is owned correctly.
     const execOptions = {
       Cmd: ['ln', '-sf', target, symlinkPath],
       AttachStdout: true,
       AttachStderr: true,
     };
 
-    // If symlink is in /workspace dir, run as user  (not root) for permissions
+    // If symlink is in /workspace dir, run as the host user (not root) for
+    // permissions. Derive the UID/GID dynamically to match PUID/PGID rather
+    // than hardcoding 1001 (which only happens to match on silk).
     if (symlinkPath.startsWith('/workspace/')) {
-      execOptions.User = '1001:1001';
+      const uid = process.getuid ? process.getuid() : 1000;
+      const gid = process.getgid ? process.getgid() : 1000;
+      execOptions.User = `${uid}:${gid}`;
     }
 
     const exec = await container.exec(execOptions);
