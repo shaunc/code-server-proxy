@@ -384,13 +384,44 @@ const DEFAULT_SESSION_NAME = "Host Shell (tmux)";
 const UNNAMED_WINDOWS = new Set(["", "bash", "host-bash", "sh"]);
 
 /**
- * Fetch the tmux window name for a session via the same host-bash/SSH
- * path resolveSession uses. launch-teammate -> cs-tab renames the
- * window to the teammate name at creation, so the window name is the
- * friendly label to show on the tab. Returns DEFAULT_SESSION_NAME when
- * the window has no meaningful name or on any SSH/tmux failure.
+ * Fetch the tmux window name for a session.
+ *
+ * Two paths, tried in order:
+ *  1. Sidecar file at ~/.cs-tab-names/<session> (written by cs-tab on
+ *     `new` / `adopt` — see ~/bin/cs-tab). This is the canonical
+ *     mechanism: written once at session creation by the host script
+ *     that knows the teammate name, persists across browser
+ *     disconnects + container restarts, no SSH required. The host
+ *     home dir is bind-mounted into the container at the same path so
+ *     the extension can read it directly.
+ *  2. SSH fallback (legacy path): query `tmux display-message #W`
+ *     over SSH to host.docker.internal. Kept for backwards-compat
+ *     with sessions created before the sidecar mechanism existed —
+ *     and as a graceful fallback if the sidecar file is missing.
+ *
+ * Returns DEFAULT_SESSION_NAME when both paths fail or the resolved
+ * name is in UNNAMED_WINDOWS.
  */
 function resolveWindowName(tmuxSession: string): string {
+  // Path 1: sidecar file. The container's HOME is /config (user "abc"),
+  // not the host's /home/<HOST_USER>. The host home dir is visible
+  // inside the container at /home/<HOST_USER>/ via the bind-mount, so
+  // we construct the path from HOST_USER (already used for the SSH
+  // fallback below) instead of HOME.
+  try {
+    const hostUser = process.env.HOST_USER ?? "shauncutts";
+    const sidecarPath = `/home/${hostUser}/.cs-tab-names/${tmuxSession}`;
+    if (fs.existsSync(sidecarPath)) {
+      const name = fs.readFileSync(sidecarPath, "utf-8").trim();
+      if (name && !UNNAMED_WINDOWS.has(name)) {
+        return name;
+      }
+    }
+  } catch {
+    // Fall through to SSH path.
+  }
+
+  // Path 2: SSH fallback.
   try {
     const sshDest = `${process.env.HOST_USER}@host.docker.internal`;
     const shrc = ". ~/.shrc 2>/dev/null || true; ";
