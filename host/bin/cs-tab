@@ -1,0 +1,162 @@
+#!/bin/bash
+# cs-tab — put work in its own code-server editor TAB via the host tmux server.
+#
+# Model (see ~/src/other/code-server-proxy):
+#   * Each code-server terminal tab is ONE host tmux session `cs-<iid>-<N>`.
+#   * The `tmux-session-manager` VS Code extension runs adoptOrphans() every
+#     ~30s: any `cs-<iid>-<N>` session with no VS Code terminal gets a fresh
+#     editor tab attached to it. So creating such a session IS how you open a
+#     tab programmatically — no frontend API needed.
+#
+# This script just creates/relocates those sessions; the extension tabs them.
+#
+# Subcommands:
+#   cs-tab iid                          Print the instance-id for this workspace.
+#   cs-tab list                         List this workspace's cs-<iid>-N sessions.
+#   cs-tab new [-n NAME] [-d DIR] [-- CMD...]
+#                                       Create a fresh session -> tab. With CMD,
+#                                       run it as the tab's process (e.g. a
+#                                       `claude` teammate); without, a login
+#                                       shell. Prints the session name.
+#   cs-tab adopt SRC:WIN [-n NAME]      Move an existing window (e.g. a teammate
+#                                       pane you broke out) into its OWN session
+#                                       so it gets its own tab. Non-destructive
+#                                       to the running process. Prints the name.
+#
+# Options:
+#   -i IID    instance-id (default: derived from the current tmux session).
+#
+# Env: CS_TMUX_CONF (default ~/.config/code-server-proxy/tmux.conf)
+
+set -euo pipefail
+
+TMUX_CONF="${CS_TMUX_CONF:-$HOME/.config/code-server-proxy/tmux.conf}"
+TARGS=(); [ -f "$TMUX_CONF" ] && TARGS=(-f "$TMUX_CONF")
+ulimit -n 65536 2>/dev/null || true
+
+die() { echo "cs-tab: $*" >&2; exit 1; }
+tm()  { tmux "${TARGS[@]}" "$@"; }
+
+# Derive the instance-id: explicit -i wins; else strip the cs-<iid>-<N> of the
+# tmux session this shell is in; else fail (ambiguous).
+derive_iid() {
+    if [ -n "${IID:-}" ]; then echo "$IID"; return 0; fi
+    local s
+    s=$(tm display-message -p '#S' 2>/dev/null || true)
+    if [[ "$s" =~ ^cs-([0-9a-f]{64})-[0-9]+$ ]]; then
+        echo "${BASH_REMATCH[1]}"; return 0
+    fi
+    die "could not derive instance-id (not in a cs-<iid>-N session); pass -i IID"
+}
+
+next_index() {
+    local iid="$1" prefix max=-1 n
+    prefix="cs-${iid}-"
+    while IFS= read -r name; do
+        n="${name#"$prefix"}"
+        [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt "$max" ] && max="$n"
+    done < <(tm list-sessions -F '#{session_name}' 2>/dev/null | grep "^${prefix}" || true)
+    echo $((max + 1))
+}
+
+# Create an empty session at the next free index, retrying on race. Echoes name.
+make_session() {
+    local iid="$1" dir="$2" attempts=0 idx session
+    while [ "$attempts" -lt 20 ]; do
+        idx=$(next_index "$iid"); session="cs-${iid}-${idx}"
+        if tm new-session -d -s "$session" -c "$dir" 2>/dev/null; then
+            echo "$session"; return 0
+        fi
+        attempts=$((attempts + 1))
+    done
+    die "make_session: failed after $attempts attempts (name races)"
+}
+
+cmd_iid()  { derive_iid; }
+
+cmd_list() {
+    local iid; iid=$(derive_iid)
+    tm list-sessions -F '#{session_name} attached=#{session_attached} windows=#{session_windows}' \
+        2>/dev/null | grep "^cs-${iid}-" | sort -t- -k6 -n || true
+}
+
+cmd_new() {
+    local name="" dir="$PWD" iid; local -a cmd=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -n) name="$2"; shift 2;;
+            -d) dir="$2"; shift 2;;
+            -i) IID="$2"; shift 2;;
+            --) shift; cmd=("$@"); break;;
+            *) die "new: unknown arg '$1'";;
+        esac
+    done
+    iid=$(derive_iid)
+    local idx session; idx=$(next_index "$iid"); session="cs-${iid}-${idx}"
+    # If a command is given, it becomes the window's process: when it exits the
+    # session ends and the extension drops the tab. No command -> default shell.
+    if [ "${#cmd[@]}" -gt 0 ]; then
+        tm new-session -d -s "$session" -c "$dir" "${cmd[@]}" \
+            || die "failed to create session $session"
+    else
+        tm new-session -d -s "$session" -c "$dir" \
+            || die "failed to create session $session"
+    fi
+    [ -n "$name" ] && tm rename-window -t "$session" "$name" 2>/dev/null || true
+    # Sidecar name file — the extension reads this without SSH so the tab
+    # label is correct even when ssh from container -> host.docker.internal
+    # is broken / not configured. Bind-mounted via /home/shauncutts -> same
+    # path inside the code-server container.
+    if [ -n "$name" ]; then
+        mkdir -p "$HOME/.cs-tab-names"
+        printf '%s\n' "$name" > "$HOME/.cs-tab-names/$session"
+    fi
+    echo "$session"
+    echo "tab will appear within ~30s (extension adoptOrphans tick)" >&2
+}
+
+cmd_adopt() {
+    local src="" name="" iid
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -n) name="$2"; shift 2;;
+            -i) IID="$2"; shift 2;;
+            -*) die "adopt: unknown arg '$1'";;
+            *)  src="$1"; shift;;
+        esac
+    done
+    [ -n "$src" ] || die "adopt: need SRC_SESSION:WINDOW"
+    tm list-windows -t "$src" >/dev/null 2>&1 || die "adopt: no such window '$src'"
+    iid=$(derive_iid)
+    local dir session
+    dir=$(tm display-message -t "$src" -p '#{pane_current_path}' 2>/dev/null || echo "$HOME")
+    session=$(make_session "$iid" "$dir")   # placeholder window 0 lives here
+    # Relocate the live window (process+pty intact) into the new session at a
+    # temp high index, then drop the placeholder.
+    tm move-window -s "$src" -t "${session}:99" || die "adopt: move-window failed"
+    tm kill-window -t "${session}:0" 2>/dev/null || true
+    [ -n "$name" ] && tm rename-window -t "${session}:99" "$name" 2>/dev/null || true
+    # Sidecar name file (see cmd_new for rationale).
+    if [ -n "$name" ]; then
+        mkdir -p "$HOME/.cs-tab-names"
+        printf '%s\n' "$name" > "$HOME/.cs-tab-names/$session"
+    fi
+    echo "$session"
+    echo "moved '$src' -> $session (tab within ~30s)" >&2
+}
+
+sub="${1:-}"; shift || true
+case "$sub" in
+    iid)   cmd_iid "$@";;
+    list)  cmd_list "$@";;
+    new)   cmd_new "$@";;
+    adopt) cmd_adopt "$@";;
+    *) cat >&2 <<EOF
+Usage: cs-tab {iid|list|new|adopt} ...
+  cs-tab iid
+  cs-tab list
+  cs-tab new   [-n NAME] [-d DIR] [-i IID] [-- CMD...]
+  cs-tab adopt SRC_SESSION:WINDOW [-n NAME] [-i IID]
+EOF
+       exit 1;;
+esac
