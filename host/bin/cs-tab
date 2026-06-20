@@ -22,6 +22,14 @@
 #                                       pane you broke out) into its OWN session
 #                                       so it gets its own tab. Non-destructive
 #                                       to the running process. Prints the name.
+#   cs-tab rename -n NAME [-s SESSION]  Rename a running teammate's tab. Rehomes
+#                                       the session's active window into a fresh
+#                                       session labelled NAME so the extension
+#                                       re-tabs it (tabs can't be renamed in
+#                                       place). Defaults to the CURRENT session,
+#                                       so a teammate can rename ITSELF by
+#                                       running `cs-tab rename -n NAME`.
+#                                       Non-destructive to the running process.
 #
 # Options:
 #   -i IID    instance-id (default: derived from the current tmux session).
@@ -115,8 +123,30 @@ cmd_new() {
     echo "tab will appear within ~30s (extension adoptOrphans tick)" >&2
 }
 
+# Relocate a live window (process+pty intact) into its OWN fresh session so the
+# extension tabs it with NAME. Shared by `adopt` and `rename`. Echoes the new
+# session name. Safe to call on the caller's own window — tmux reparents the
+# pane without signalling the process.
+rehome_window() {
+    local src="$1" name="$2" iid dir session
+    tm list-windows -t "$src" >/dev/null 2>&1 || die "no such window '$src'"
+    iid=$(derive_iid)
+    dir=$(tm display-message -t "$src" -p '#{pane_current_path}' 2>/dev/null || echo "$HOME")
+    session=$(make_session "$iid" "$dir")   # placeholder window 0 lives here
+    # Move into the new session at a temp high index, then drop the placeholder.
+    tm move-window -s "$src" -t "${session}:99" || die "move-window failed"
+    tm kill-window -t "${session}:0" 2>/dev/null || true
+    [ -n "$name" ] && tm rename-window -t "${session}:99" "$name" 2>/dev/null || true
+    # Sidecar name file (see cmd_new for rationale).
+    if [ -n "$name" ]; then
+        mkdir -p "$HOME/.cs-tab-names"
+        printf '%s\n' "$name" > "$HOME/.cs-tab-names/$session"
+    fi
+    echo "$session"
+}
+
 cmd_adopt() {
-    local src="" name="" iid
+    local src="" name=""
     while [ $# -gt 0 ]; do
         case "$1" in
             -n) name="$2"; shift 2;;
@@ -126,37 +156,50 @@ cmd_adopt() {
         esac
     done
     [ -n "$src" ] || die "adopt: need SRC_SESSION:WINDOW"
-    tm list-windows -t "$src" >/dev/null 2>&1 || die "adopt: no such window '$src'"
-    iid=$(derive_iid)
-    local dir session
-    dir=$(tm display-message -t "$src" -p '#{pane_current_path}' 2>/dev/null || echo "$HOME")
-    session=$(make_session "$iid" "$dir")   # placeholder window 0 lives here
-    # Relocate the live window (process+pty intact) into the new session at a
-    # temp high index, then drop the placeholder.
-    tm move-window -s "$src" -t "${session}:99" || die "adopt: move-window failed"
-    tm kill-window -t "${session}:0" 2>/dev/null || true
-    [ -n "$name" ] && tm rename-window -t "${session}:99" "$name" 2>/dev/null || true
-    # Sidecar name file (see cmd_new for rationale).
-    if [ -n "$name" ]; then
-        mkdir -p "$HOME/.cs-tab-names"
-        printf '%s\n' "$name" > "$HOME/.cs-tab-names/$session"
-    fi
+    local session; session=$(rehome_window "$src" "$name")
     echo "$session"
     echo "moved '$src' -> $session (tab within ~30s)" >&2
 }
 
+cmd_rename() {
+    local name="" sess=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -n) name="$2"; shift 2;;
+            -s) sess="$2"; shift 2;;
+            -i) IID="$2"; shift 2;;
+            *)  die "rename: unknown arg '$1'";;
+        esac
+    done
+    [ -n "$name" ] || die "rename: need -n NAME"
+    # Default to the session this shell is in — lets a teammate rename itself.
+    if [ -z "$sess" ]; then
+        sess=$(tm display-message -p '#S' 2>/dev/null || true)
+        [ -n "$sess" ] || die "rename: not in a tmux session; pass -s SESSION"
+    fi
+    [[ "$sess" =~ ^cs-[0-9a-f]{64}-[0-9]+$ ]] \
+        || die "rename: '$sess' is not a cs-<iid>-N session"
+    local win session
+    win=$(tm display-message -t "$sess" -p '#I' 2>/dev/null || echo 0)
+    session=$(rehome_window "${sess}:${win}" "$name")
+    echo "$session"
+    echo "renamed '$sess' -> $session (#W=$name; tab within ~30s)" >&2
+}
+
 sub="${1:-}"; shift || true
 case "$sub" in
-    iid)   cmd_iid "$@";;
-    list)  cmd_list "$@";;
-    new)   cmd_new "$@";;
-    adopt) cmd_adopt "$@";;
+    iid)    cmd_iid "$@";;
+    list)   cmd_list "$@";;
+    new)    cmd_new "$@";;
+    adopt)  cmd_adopt "$@";;
+    rename) cmd_rename "$@";;
     *) cat >&2 <<EOF
-Usage: cs-tab {iid|list|new|adopt} ...
+Usage: cs-tab {iid|list|new|adopt|rename} ...
   cs-tab iid
   cs-tab list
-  cs-tab new   [-n NAME] [-d DIR] [-i IID] [-- CMD...]
-  cs-tab adopt SRC_SESSION:WINDOW [-n NAME] [-i IID]
+  cs-tab new    [-n NAME] [-d DIR] [-i IID] [-- CMD...]
+  cs-tab adopt  SRC_SESSION:WINDOW [-n NAME] [-i IID]
+  cs-tab rename -n NAME [-s SESSION] [-i IID]
 EOF
        exit 1;;
 esac
