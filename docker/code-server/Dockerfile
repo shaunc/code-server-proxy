@@ -1,4 +1,10 @@
-FROM lscr.io/linuxserver/code-server:latest
+# Pinned by digest so every host rebuilds the IDENTICAL base, instead of
+# whatever `:latest` happens to resolve to at build time (which silently
+# diverged silk -> 1.126 vs rayon -> 1.125). This digest is Code 1.126.0.
+# To bump: pull the new :latest, confirm the version, replace the digest
+# here, and rebuild ALL hosts (scripts/deploy-all.sh) in one go so they
+# stay in lockstep. See bead code-server-proxy-gfo.
+FROM lscr.io/linuxserver/code-server:latest@sha256:26dfecc1cd4c0e4c47dceb913b4eb8afd97af9f2311eb449d04b59126e6e5483
 
 # Set ENV for POSIX shells to source .shrc (used for tool environments like CUDA)
 ENV ENV=/config/.shrc
