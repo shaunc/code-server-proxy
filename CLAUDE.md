@@ -5,6 +5,27 @@
 **Project**: {{PROJECT_NAME}}
 **Status**: Development
 
+## Deployment Scope
+
+**All fixes must work on, and be deployed to, every installation
+(currently `silk` and `rayon`) unless explicitly scoped otherwise.**
+The installations are kept in sync so they behave identically.
+
+What this means in practice:
+
+- Code must stay **host-agnostic** — no host-specific paths, tailnet
+  IPs, or hostnames baked into source. Use `localhost` /
+  `host.docker.internal` and config, never a single host's address.
+- Git-tracked changes propagate by `git pull` on each host, but
+  **side effects do not**: Docker images (rebuild per host),
+  marketplace/custom extensions installed into the host-local
+  `code-server-extensions` volume (re-run the install scripts per
+  host), and running instances (restart per host). Docker volumes are
+  per-daemon, so a volume install on one host never reaches another.
+- A fix is not "deployed" until it is live on **both** hosts. When a
+  change is intentionally host-scoped, say so explicitly and record
+  why on the bead.
+
 ## Active Tasks
 
 Track current work using beads (`bd list --status=in_progress`).
