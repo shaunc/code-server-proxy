@@ -18,3 +18,6 @@ yarn-error.log*
 # Dolt database files (added by bd init)
 .dolt/
 *.db
+
+# Beads JSONL export (regenerated from Dolt; durable state lives in Dolt)
+.beads/issues.jsonl
