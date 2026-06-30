@@ -890,6 +890,117 @@ async function removeContainer(instanceId, force = false) {
 }
 
 /**
+ * Decide which blue-green transient containers (-old/-new) are leaked
+ * and safe to reap. Pure helper so the reap policy is unit-testable.
+ *
+ * A transient is leaked when its base instance is NOT mid-swap and it is
+ * older than minAgeMs. The age guard is essential: during steps 2-5 of a
+ * blue-green swap the `-new` half exists before the base id is added to
+ * recreatingInstances, so age is the only signal that protects an
+ * in-flight swap whose base id is not yet registered.
+ *
+ * @param {Array<{instanceId: string, createdMs: number}>} transients -
+ *   containers whose instanceId (name minus the `code-server-` prefix)
+ *   ends in `-old` or `-new`.
+ * @param {Set<string>} recreatingInstances - base ids currently swapping
+ * @param {number} nowMs - current time in ms
+ * @param {number} minAgeMs - skip transients younger than this
+ * @returns {string[]} instanceIds (with -old/-new suffix) to reap
+ */
+function selectLeakedBlueGreenContainers(
+  transients,
+  recreatingInstances,
+  nowMs,
+  minAgeMs
+) {
+  const leaked = [];
+  for (const { instanceId, createdMs } of transients) {
+    const baseId = instanceId.replace(/-(?:old|new)$/, '');
+    if (recreatingInstances.has(baseId)) {
+      continue;
+    }
+    if (nowMs - createdMs < minAgeMs) {
+      continue;
+    }
+    leaked.push(instanceId);
+  }
+  return leaked;
+}
+
+/**
+ * Backstop reaper for leaked blue-green transient containers (-old/-new).
+ *
+ * The only path that normally removes a transient half is step 6 of the
+ * blue-green swap (proxy.js blueGreenRecreate), whose stop/remove is
+ * best-effort — if it throws, the `-old` (or `-new`) half is orphaned and
+ * NO other sweep reaps it: checkAllContainersForOutdatedImages skips
+ * `-old`/`-new` names, and findOrphanedContainers keys off
+ * Labels.instanceId which for a transient is the wrong name (the temp half
+ * is created with the `-new` instanceId so its label never matches its
+ * actual `-old` name). This sweep finds them by name and removes the
+ * container only (never the shared config volume).
+ *
+ * @param {Set<string>} recreatingInstances - base ids currently swapping
+ * @param {number} minAgeMs - skip transients younger than this
+ * @returns {Promise<string[]>} reaped instanceIds
+ */
+async function cleanLeakedBlueGreenContainers(
+  recreatingInstances = new Set(),
+  minAgeMs = 10 * 60 * 1000
+) {
+  const reaped = [];
+  try {
+    const containers = await docker.listContainers({
+      all: true,
+      filters: { name: ['code-server-'] },
+    });
+
+    const transients = containers
+      .map((containerInfo) => ({
+        instanceId: containerInfo.Names[0].replace('/code-server-', ''),
+        createdMs: containerInfo.Created * 1000,
+      }))
+      .filter(
+        (c) => c.instanceId.endsWith('-old') || c.instanceId.endsWith('-new')
+      );
+
+    const leaked = selectLeakedBlueGreenContainers(
+      transients,
+      recreatingInstances,
+      Date.now(),
+      minAgeMs
+    );
+
+    for (const instanceId of leaked) {
+      console.log(
+        `[BLUE-GREEN-REAP] Removing leaked transient container: ${instanceId}`
+      );
+      try {
+        await stopContainer(instanceId, 10);
+      } catch (error) {
+        console.error(
+          `[BLUE-GREEN-REAP] Stop failed for ${instanceId}: ${error.message}`
+        );
+      }
+      try {
+        await removeContainer(instanceId, true);
+        reaped.push(instanceId);
+      } catch (error) {
+        console.error(
+          `[BLUE-GREEN-REAP] Remove failed for ${instanceId}: ${error.message}`
+        );
+      }
+    }
+  } catch (error) {
+    console.error(
+      '[BLUE-GREEN-REAP] Error reaping leaked transients:',
+      error.message
+    );
+  }
+  return reaped;
+}
+
+/**
  * Check if container is running
  * @param {string} instanceId - Instance ID
  * @returns {Promise<boolean>} True if container is running
@@ -1891,6 +2002,8 @@ module.exports = {
   cleanupIdleContainers,
   findOrphanedContainers,
   cleanupOrphanedContainers,
+  selectLeakedBlueGreenContainers,
+  cleanLeakedBlueGreenContainers,
   getActivityTracker,
   cleanOrphanedTmuxSessions,
   reloadConfig,
