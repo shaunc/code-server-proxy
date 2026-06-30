@@ -777,12 +777,18 @@ async function blueGreenRecreate(instanceId, workspacePath, currentPort) {
     await containerManager.renameContainer(instanceId, `${instanceId}-old`);
     await containerManager.renameContainer(tempInstanceId, instanceId);
 
-    // 6. Stop and remove old container (frees canonical port)
+    // 6. Stop and remove old container (frees canonical port).
+    //    Best-effort: if this throws the old half leaks, but the periodic
+    //    cleanLeakedBlueGreenContainers sweep is the backstop that reaps
+    //    it. Log rather than swallow silently so leaks are diagnosable.
     try {
       await containerManager.stopContainer(`${instanceId}-old`, 10);
       await containerManager.removeContainer(`${instanceId}-old`, true);
-    } catch {
-      // Old container may already be gone
+    } catch (oldErr) {
+      console.error(
+        `[BLUE-GREEN] Failed to remove old half ${instanceId}-old ` +
+          `(will be reaped by backstop sweep): ${oldErr.message}`
+      );
     }
 
     // 7. Move new container from temp port to canonical port.
@@ -2038,6 +2044,26 @@ server.listen(PROXY_PORT, PROXY_HOST, async () => {
             }
             recreatingInstances.delete(iid);
           }
+        }
+
+        // Backstop: reap blue-green transient halves (-old/-new) that a
+        // failed swap left behind. blueGreenRecreate's step-6 removal is
+        // best-effort, and no other sweep reaps a leaked transient.
+        try {
+          const reaped =
+            await containerManager.cleanLeakedBlueGreenContainers(
+              recreatingInstances
+            );
+          if (reaped.length > 0) {
+            console.log(
+              `[IMAGE-CHECK] Reaped ${reaped.length} leaked blue-green ` +
+                `container(s): ${reaped.join(', ')}`
+            );
+          }
+        } catch (err) {
+          console.error(
+            `[IMAGE-CHECK] Blue-green reaper failed: ${err.message}`
+          );
         }
       },
       2 * 60 * 1000
