@@ -35,6 +35,21 @@ done
 
 echo "==> Deploying on $(hostname) from $REPO_DIR"
 
+# --- 0. Refuse to deploy from anywhere but main -------------------------
+# Deploys must come from the tracked main branch. Beads .githooks have
+# been observed flipping the working tree onto chore/untrack-beads-jsonl,
+# which has no upstream — there `git pull --ff-only` fails and the deploy
+# silently does nothing (this is what made silk's first deploy no-op while
+# rayon succeeded). Fail loudly here instead of half-deploying. See bead
+# code-server-proxy-4ag.
+branch="$(git rev-parse --abbrev-ref HEAD)"
+if [ "$branch" != "main" ]; then
+    echo "!! REFUSING TO DEPLOY: on branch '$branch', not 'main'." >&2
+    echo "   Deploys must run from main. Switch with: git checkout main" >&2
+    echo "   (If beads hooks moved you off main, that is bead 4ag.)" >&2
+    exit 1
+fi
+
 # --- 1. Sync code -------------------------------------------------------
 before=""
 after=""
