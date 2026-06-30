@@ -60,14 +60,17 @@ changed_since_pull() {
     git diff --name-only "$before" "$after" | grep -q "^$1"
 }
 
-# --- 2. Rebuild Docker image if docker/ changed or image missing --------
-if ! docker image inspect code-server-proxy:latest >/dev/null 2>&1 \
-        || changed_since_pull "docker/"; then
-    echo "==> Rebuilding Docker image (docker/ changed or image missing)"
-    scripts/build-docker-image.sh
-else
-    echo "==> Docker image up to date; skipping rebuild"
-fi
+# --- 2. Rebuild Docker image -------------------------------------------
+# Always build. Docker's layer cache makes this a near-instant no-op when
+# docker/ is unchanged (and an unchanged build yields the SAME image id,
+# so containers are not needlessly recreated). Gating on the pull diff is
+# wrong: the image can be stale relative to HEAD with no pull this run
+# (e.g. it was built long before the current commit), and only an
+# unconditional build guarantees the running image matches the source.
+# build-docker-image.sh does not --pull, so the linuxserver base does not
+# drift underneath us.
+echo "==> Building Docker image (cache makes this a no-op if unchanged)"
+scripts/build-docker-image.sh
 
 # --- 3. Custom extension (tmux-session-manager) -------------------------
 # Rebuild+install only when its source changed (the build runs npm).
