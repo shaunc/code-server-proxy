@@ -28,7 +28,7 @@ EXTENSIONS=(
 )
 
 VOLUME="${SHARED_EXTENSIONS_VOLUME:-code-server-extensions}"
-IMAGE="${DOCKER_IMAGE:-code-server-workspace:latest}"
+IMAGE="${DOCKER_IMAGE:-code-server-proxy:latest}"
 
 echo "==> Installing ${#EXTENSIONS[@]} marketplace extension(s) into" \
      "volume '$VOLUME' via $IMAGE"
