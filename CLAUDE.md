@@ -26,6 +26,25 @@ What this means in practice:
   change is intentionally host-scoped, say so explicitly and record
   why on the bead.
 
+### How to deploy
+
+After pushing a change to `main`, deploy it everywhere with:
+
+```bash
+scripts/deploy-all.sh            # deploy to all hosts (no restart)
+scripts/deploy-all.sh --restart  # also restart proxy + instances
+```
+
+`deploy-all.sh` runs `scripts/deploy.sh` on each host (locally for the
+current host, over SSH for the rest). `deploy.sh` is the idempotent
+per-host unit: it pulls, rebuilds the image if `docker/` changed,
+reinstalls the custom extension if `extensions/` changed, and installs
+the marketplace extensions from `scripts/install-marketplace-extensions.sh`.
+Restart is opt-in (`--restart`) because it interrupts active sessions;
+without it, reload code-server windows to pick up new extensions. To add
+a marketplace extension to every install, add its Open VSX id to the
+`EXTENSIONS` list in `install-marketplace-extensions.sh`, then deploy.
+
 ## Active Tasks
 
 Track current work using beads (`bd list --status=in_progress`).
