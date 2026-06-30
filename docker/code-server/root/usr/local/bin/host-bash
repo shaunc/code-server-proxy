@@ -33,15 +33,6 @@ fi
 
 # --- Interactive: tmux-backed terminal with reconnection loop ---
 
-# Check SSH mux health before session creation
-CONTROL_SOCKET="/run/user/1001/ssh-control-host.docker.internal"
-if [ -S "$CONTROL_SOCKET" ]; then
-    if ! timeout 3 ssh -o BatchMode=yes \
-        "$SSH_DEST" true >/dev/null 2>&1; then
-        rm -f "$CONTROL_SOCKET"
-    fi
-fi
-
 # Determine tmux session to attach to.
 # Priority: TMUX_SESSION (direct, from extension)
 #         > TMUX_PANE_ID (mapped, from extension profile)
@@ -87,7 +78,15 @@ RETRY_DELAY=2
 retries=0
 
 while true; do
+    # ControlMaster=no: each interactive attach is long-lived, so it
+    # gains nothing from multiplexing but would hold a session slot on
+    # the shared master for its whole lifetime. On reattach every
+    # terminal reconnects at once; multiplexed they exhaust sshd's
+    # per-connection MaxSessions (default 10) -> "Session open refused
+    # by peer". A dedicated connection per terminal has no such ceiling.
+    # The shared master stays for the short control commands above.
     ssh -t \
+        -o ControlMaster=no \
         -o ServerAliveInterval=10 \
         -o ServerAliveCountMax=3 \
         "$SSH_DEST" \
