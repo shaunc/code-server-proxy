@@ -481,7 +481,12 @@ async function createContainer(
     HostConfig: {
       Binds: binds,
       PortBindings: {
-        '8443/tcp': [{ HostPort: String(port) }],
+        // Bind to loopback only. Tabs are reached via SSH tunnel →
+        // proxy (127.0.0.1:8083) → here on 127.0.0.1, so 0.0.0.0
+        // would only add LAN/WAN surface that carries no traffic.
+        // localhost is host-agnostic (works on silk, rayon, etc.) —
+        // never hardcode a host-specific tailnet IP here.
+        '8443/tcp': [{ HostIp: '127.0.0.1', HostPort: String(port) }],
       },
       Memory: memoryBytes,
       NanoCpus: nanoCpus,
