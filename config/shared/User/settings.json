@@ -7,6 +7,14 @@
     "workbench.action.previousEditor"
   ],
   "editor.minimap.enabled": false,
+  // Open markdown in the built-in text editor, not the Office Viewer
+  // custom editor (cweijan.vscode-office), whose webview steals focus
+  // and disrupts other panes. "default" overrides the extension's
+  // editor claim for *.md only; office docs (.docx/.xlsx/.pdf) still
+  // use the viewer.
+  "workbench.editorAssociations": {
+    "*.md": "default"
+  },
   "kilo-code.allowedCommands": [
     "git log",
     "git diff",
