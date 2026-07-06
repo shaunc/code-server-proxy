@@ -25,6 +25,11 @@ EXTENSIONS=(
     # the existing preview without stealing focus. Needed because this
     # code-server build predates native mermaid (VS Code >= 1.121).
     bierner.markdown-mermaid
+
+    # Default color theme referenced by config/shared/User/settings.json
+    # ("Dark Minimalist"). Must be installed on every host or instances
+    # fall back to the code-server default theme.
+    leonn534.dark-minimalist-theme
 )
 
 VOLUME="${SHARED_EXTENSIONS_VOLUME:-code-server-extensions}"
