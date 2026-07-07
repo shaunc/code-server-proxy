@@ -65,6 +65,14 @@ if [ "$DO_PULL" -eq 1 ]; then
     fi
 fi
 
+# --- 1a. Seed live user settings/keybindings if missing -----------------
+# These are gitignored (code-server rewrites them at runtime); team defaults
+# come from the ff-code-server-defaults extension. A fresh checkout won't have
+# them, so seed empty — never overwrite an existing (override-bearing) file.
+mkdir -p config/shared/User
+[ -f config/shared/User/settings.json ] || printf '{}\n' > config/shared/User/settings.json
+[ -f config/shared/User/keybindings.json ] || printf '[]\n' > config/shared/User/keybindings.json
+
 # changed_since_pull <pathspec>: true if the pulled diff touched it, or if
 # we did not pull (so we cannot tell — rebuild to be safe).
 changed_since_pull() {

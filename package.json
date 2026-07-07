@@ -1,6 +1,6 @@
 {
   "name": "code-server-proxy",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Reverse proxy for workspace-isolated code-server instances",
   "main": "src/proxy.js",
   "scripts": {

@@ -1,0 +1,252 @@
+{
+  "name": "ff-code-server-defaults",
+  "displayName": "FactFiber code-server Defaults",
+  "description": "Team default settings and keybindings for code-server, contributed at the Default layer so user settings override them and 'Reset Setting' reverts to the team default. Single source of truth for shared defaults (see tmp/issues/settings-defaults/v2/plan.md).",
+  "version": "0.1.0",
+  "publisher": "code-server-proxy",
+  "private": true,
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shaunc/code-server-proxy.git",
+    "directory": "extensions/ff-code-server-defaults"
+  },
+  "engines": {
+    "vscode": "^1.93.0"
+  },
+  "extensionKind": [
+    "ui",
+    "workspace"
+  ],
+  "categories": [
+    "Other"
+  ],
+  "scripts": {
+    "package": "npx @vscode/vsce package --no-dependencies"
+  },
+  "contributes": {
+    "configurationDefaults": {
+      "workbench.colorTheme": "Dark Minimalist",
+      "editor.minimap.enabled": false,
+      "explorer.confirmDragAndDrop": false,
+      "window.newWindowProfile": "Default",
+      "workbench.editorAssociations": {
+        "*.md": "default"
+      },
+      "diffEditor.hideUnchangedRegions.enabled": true,
+      "security.workspace.trust.untrustedFiles": "open",
+      "search.followSymlinks": false,
+      "terminal.integrated.defaultLocation": "editor",
+      "terminal.integrated.shellIntegration.enabled": false,
+      "terminal.integrated.enableMultiLinePasteWarning": "never",
+      "terminal.integrated.defaultProfile.linux": "Host Shell (tmux)",
+      "terminal.integrated.commandsToSkipShell": [
+        "workbench.action.pinEditor",
+        "workbench.action.nextEditor",
+        "workbench.action.previousEditor"
+      ],
+      "terminal.integrated.profiles.linux": {
+        "Host Shell (SSH)": {
+          "path": "/usr/local/bin/host-bash",
+          "icon": "server"
+        },
+        "Container Shell": {
+          "path": "bash",
+          "args": ["--rcfile", "/etc/profile.d/container-env.sh"],
+          "icon": "terminal-bash"
+        }
+      },
+      "python.analysis.typeCheckingMode": "strict",
+      "python.analysis.autoImportCompletions": true,
+      "python.analysis.autoSearchPaths": true,
+      "python.analysis.useLibraryCodeForTypes": true,
+      "python.terminal.activateEnvironment": false,
+      "python.analysis.exclude": [
+        "**/.venv/**",
+        "**/venv/**",
+        "**/__pycache__/**",
+        "**/node_modules/**",
+        "**/tmp/**"
+      ],
+      "[python]": {
+        "editor.defaultFormatter": "charliermarsh.ruff",
+        "editor.codeActionsOnSave": {
+          "source.fixAll.ruff": "explicit",
+          "source.organizeImports.ruff": "explicit"
+        }
+      },
+      "files.exclude": {
+        "**/tmp": true
+      },
+      "search.exclude": {
+        "**/.git": true,
+        "**/node_modules": true,
+        "**/.cache": true,
+        "**/backups": true,
+        "**/.venv": true,
+        "**/__pycache__": true,
+        "**/.pytest_cache": true,
+        "**/.mypy_cache": true,
+        "**/.ruff_cache": true,
+        "**/build": true,
+        "**/dist": true,
+        "**/*.egg-info": true,
+        "**/tmp": true
+      },
+      "files.watcherExclude": {
+        "**/.git/objects/**": true,
+        "**/.git/subtree-cache/**": true,
+        "**/node_modules/*/**": true,
+        "**/.hg/store/**": true,
+        "**/.cache/**": true,
+        "**/backups/**": true,
+        "**/.venv/**": true,
+        "**/__pycache__/**": true,
+        "**/.pytest_cache/**": true,
+        "**/.mypy_cache/**": true,
+        "**/.ruff_cache/**": true,
+        "**/build/**": true,
+        "**/dist/**": true,
+        "**/*.egg-info/**": true,
+        "**/tmp/**": true
+      },
+      "kilo-code.deniedCommands": [],
+      "kilo-code.allowedCommands": [
+        "git log",
+        "git diff",
+        "git show",
+        "mkdir",
+        "mv",
+        "cd",
+        "poetry run",
+        "ls",
+        "head",
+        "PYTHONPATH=src",
+        "PYTHONPATH=src poetry run",
+        "chmod +x",
+        "grep",
+        "git status",
+        "git add",
+        "find",
+        "sed",
+        "wc",
+        "git branch -a",
+        "git branch",
+        "echo",
+        "cmake",
+        "git fetch",
+        "export",
+        "poetry lock --check",
+        "poetry show",
+        "tail",
+        "cuobjdump",
+        "nm",
+        "nvidia-smi",
+        "timeout 30 poetry",
+        "timeout 60 poetry",
+        "touch",
+        "timeout 120 poetry",
+        "cut",
+        "awk",
+        "cp",
+        "uniq",
+        "sort",
+        "cat",
+        "tee",
+        "xargs",
+        "OVID_DEBUG_KEEP_TEMP=1",
+        "nvlink",
+        "ar",
+        "make",
+        "ptxas",
+        "xxd",
+        "file",
+        "OVID_USE_LTOIR_WORKFLOW=true poetry run",
+        "rg",
+        "OVID_USE_LTOIR=1 poetry run",
+        "timeout 5 poetry",
+        "git merge-base",
+        "date",
+        "du",
+        "NUMBA_DISABLE_JIT=1 poetry run",
+        "rm -rf tmp/test-project-fixed",
+        "mkdir -p tmp/test-project-fixed",
+        "EOF",
+        "rm -rf tmp/test-verification",
+        "rsync",
+        "{ echo",
+        "tail -5",
+        "{",
+        "}",
+        "tree",
+        "pwd",
+        "strings",
+        "rm -rf build",
+        "nvcc",
+        "poetry poe clean",
+        "rm -rf /tmp/ovid_binaries",
+        "poetry poe rebuild",
+        "CUDA_LAUNCH_BLOCKING=1 poetry run",
+        "sleep 5",
+        "PGPASSWORD= pg_dump",
+        "PGHOST=localhost PGPORT=3307 PGDATABASE=crane_live_5",
+        "ln",
+        "hexdump",
+        "stat",
+        "readlink",
+        "aws lambda invoke",
+        "true",
+        "test",
+        "ulimit",
+        "PGDATABASE=testpg",
+        "DATABASE_URL=postgresql://crane_test:crane_test_password@localhost:5433/crane_test poetry",
+        "clang-format",
+        "ps",
+        "crontab -l 2 > /dev/null",
+        "npm install",
+        "node",
+        "curl -v \"http://127.0.0.1:8083/\" 2>&1",
+        "head -20",
+        "which",
+        "systemd-analyze",
+        "journalctl",
+        "ss",
+        "systemctl --user status code-server-proxy.service",
+        "curl",
+        "systemctl --user status code-server-workspace@workspace-32a592e8.service",
+        "systemctl --user list-unit-files",
+        "systemctl --user status code-server.service",
+        "systemctl --user restart code-server-proxy.service",
+        "systemctl --user restart code-server-workspace@main.service",
+        "sleep",
+        "free",
+        "poetry poe build-c",
+        "docker exec",
+        "npx eslint",
+        "npm run lint",
+        "docker ps",
+        "docker logs",
+        "tail -20"
+      ]
+    },
+    "keybindings": [
+      {
+        "key": "cmd+k cmd+p",
+        "command": "workbench.action.pinEditor",
+        "when": "!activeEditorIsPinned"
+      },
+      {
+        "key": "shift+alt+]",
+        "command": "workbench.action.nextEditorInGroup"
+      },
+      {
+        "key": "shift+alt+[",
+        "command": "workbench.action.previousEditorInGroup"
+      },
+      {
+        "key": "ctrl+alt+o",
+        "command": "workbench.action.files.openFolder"
+      }
+    ]
+  }
+}

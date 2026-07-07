@@ -21,3 +21,15 @@ yarn-error.log*
 
 # Beads JSONL export (regenerated from Dolt; durable state lives in Dolt)
 .beads/issues.jsonl
+
+# Live user settings/keybindings — code-server rewrites these at runtime when a
+# user changes a setting in the UI, so tracking them dirties the working tree
+# and blocks git pull. Team DEFAULTS live in the ff-code-server-defaults
+# extension (contributes.configurationDefaults/keybindings); these files hold
+# only per-user/per-machine overrides. Seeded empty on provision. Same DRY move
+# as the beads JSONL untrack. See tmp/issues/settings-defaults/v2/plan.md.
+config/shared/User/settings.json
+config/shared/User/keybindings.json
+
+# Built VS Code extension packages (rebuilt by scripts/install-extension.sh)
+extensions/**/*.vsix
