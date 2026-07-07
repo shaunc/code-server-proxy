@@ -186,6 +186,16 @@
     "**/*.egg-info": true,
     "**/tmp": true
   },
+  // Explorer exclusions. Hide tmp/ (planning/scratch) from the file tree
+  // in every workspace. Besides decluttering, tmp/ often holds symlinks
+  // pointing outside the repo; the built-in git extension runs
+  // check-ignore to decorate visible files and throws "pathspec ... is
+  // beyond a symbolic link" (exit 128) on any path traversing such a
+  // symlink, which breaks the Explorer context menu for that workspace.
+  // Hiding tmp/ stops the extension from ever traversing it. See bead 54a.
+  "files.exclude": {
+    "**/tmp": true
+  },
   // Python-specific: Don't watch virtualenvs
   "python.analysis.exclude": [
     "**/.venv/**",
