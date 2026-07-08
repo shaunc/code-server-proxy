@@ -2,7 +2,67 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
-import { execSync } from "child_process";
+import { execFile, execFileSync } from "child_process";
+import { promisify } from "util";
+
+const execFileAsync = promisify(execFile);
+
+// --- SSH-to-host helpers ---
+//
+// The container's /bin/sh is an auto-SSH forwarding wrapper
+// (docker/code-server/root/bin/sh-host-wrapper). Any command node runs
+// via a *shell string* (execSync / execFile with a shell) is seen by
+// that wrapper — and when VSCODE_CWD is set (ext-host context) the
+// wrapper FORWARDS the whole command to the host. So a shell-string
+// `ssh host.docker.internal ...` would itself run on the host, where
+// host.docker.internal does not resolve. We therefore invoke ssh
+// *directly* via execFile/execFileSync (argv, no shell) so no wrapper
+// is involved. Only the LOCAL invocation must avoid /bin/sh; the
+// remote-command string (last argv element) still runs under a remote
+// shell, which is fine.
+
+const SSH_TIMEOUT_MS = 10000;
+
+/** Fixed ssh options shared by every host call. */
+function sshArgs(remoteCommand: string): string[] {
+  const sshDest = `${process.env.HOST_USER}@host.docker.internal`;
+  return [
+    "-o",
+    "ConnectTimeout=5",
+    "-o",
+    "BatchMode=yes",
+    sshDest,
+    remoteCommand,
+  ];
+}
+
+/**
+ * Run a command on the host over ssh, shell-free (argv), async.
+ * `remoteCommand` is the single remote-shell command string (it may
+ * contain the `${shrc}` prefix and pipes — it runs under the remote
+ * login shell that ssh spawns). Rejects on ssh/command failure.
+ */
+async function sshHost(remoteCommand: string): Promise<string> {
+  const { stdout } = await execFileAsync("ssh", sshArgs(remoteCommand), {
+    encoding: "utf-8",
+    timeout: SSH_TIMEOUT_MS,
+  });
+  return stdout;
+}
+
+/**
+ * Synchronous variant of sshHost for the few call sites that run in
+ * genuinely synchronous contexts. Still shell-free (execFileSync), so
+ * it also bypasses the /bin/sh forwarding wrapper (fixes 96b). Callers
+ * are off the periodic timer path (see resolveSession / killTmuxSession
+ * notes), so blocking here does not jank the ext-host adopt loop.
+ */
+function sshHostSync(remoteCommand: string): string {
+  return execFileSync("ssh", sshArgs(remoteCommand), {
+    encoding: "utf-8",
+    timeout: SSH_TIMEOUT_MS,
+  });
+}
 
 // --- Types ---
 
@@ -79,16 +139,16 @@ interface TmuxSessionInfo {
   attached: boolean;
 }
 
-function listTmuxSessions(instanceId: string): TmuxSessionInfo[] {
+async function listTmuxSessions(
+  instanceId: string,
+): Promise<TmuxSessionInfo[]> {
   try {
-    const sshDest = `${process.env.HOST_USER}@host.docker.internal`;
     const shrc = ". ~/.shrc 2>/dev/null || true; ";
     const prefix = `cs-${instanceId}-`;
-    const output = execSync(
-      `ssh -o ConnectTimeout=5 -o BatchMode=yes ${sshDest} ` +
-        `"${shrc}tmux list-sessions -F '#{session_name} #{session_attached}' 2>/dev/null` +
-        ` | grep '^${prefix}'"`,
-      { encoding: "utf-8", timeout: 10000 },
+    const output = await sshHost(
+      `${shrc}tmux list-sessions -F ` +
+        `'#{session_name} #{session_attached}' 2>/dev/null` +
+        ` | grep '^${prefix}'`,
     );
     return output
       .trim()
@@ -172,15 +232,22 @@ function savePaneToMapping(
  * The extension's own mapping file does not know the session name
  * (host-bash chooses it); cs-tmux-window maintains the pane→session
  * mapping on the host. Returns null if no mapping or SSH failure.
+ *
+ * Kept SYNCHRONOUS (shell-free execFileSync, fixes 96b). Making it
+ * async would ripple through its sync callers terminalSession /
+ * sessionFromProcEnv and in turn countTerminalsOnSession and the
+ * onDidClose/showSessions handlers — a large change for little gain:
+ * on the periodic adopt path this is reached only via identifySession,
+ * which memoizes results in sessionCache, so it runs at most once per
+ * terminal lifetime (not once per 30s cycle). The recurring per-cycle
+ * cost that 5ol targets lives in listTmuxSessions / resolveWindowName,
+ * which ARE async.
  */
 function resolveSession(paneId: string): string | null {
   try {
-    const sshDest = `${process.env.HOST_USER}@host.docker.internal`;
     const shrc = ". ~/.shrc 2>/dev/null || true; ";
-    const out = execSync(
-      `ssh -o ConnectTimeout=5 -o BatchMode=yes ${sshDest} ` +
-        `"${shrc}cs-tmux-window resolve '${instanceId}' '${paneId}'"`,
-      { encoding: "utf-8", timeout: 10000 },
+    const out = sshHostSync(
+      `${shrc}cs-tmux-window resolve '${instanceId}' '${paneId}'`,
     ).trim();
     return out.length > 0 ? out : null;
   } catch {
@@ -353,15 +420,14 @@ function countTerminalsOnSession(
   return count;
 }
 
+// Kept SYNCHRONOUS (shell-free execFileSync, fixes 96b). Called only
+// from the onDidCloseTerminal event handler (one-shot on user/process
+// close), never from the periodic adopt timer, so it is off the path
+// 5ol targets.
 function killTmuxSession(tmuxSession: string): void {
   try {
-    const sshDest = `${process.env.HOST_USER}@host.docker.internal`;
     const shrc = ". ~/.shrc 2>/dev/null || true; ";
-    execSync(
-      `ssh -o ConnectTimeout=5 -o BatchMode=yes ${sshDest} ` +
-        `"${shrc}tmux kill-session -t '${tmuxSession}'"`,
-      { encoding: "utf-8", timeout: 10000 },
-    );
+    sshHostSync(`${shrc}tmux kill-session -t '${tmuxSession}'`);
     debugChannel.appendLine(
       `[${new Date().toISOString()}] killed tmux session: ${tmuxSession}`,
     );
@@ -402,7 +468,7 @@ const UNNAMED_WINDOWS = new Set(["", "bash", "host-bash", "sh"]);
  * Returns DEFAULT_SESSION_NAME when both paths fail or the resolved
  * name is in UNNAMED_WINDOWS.
  */
-function resolveWindowName(tmuxSession: string): string {
+async function resolveWindowName(tmuxSession: string): Promise<string> {
   // Path 1: sidecar file. The container's HOME is /config (user "abc"),
   // not the host's /home/<HOST_USER>. The host home dir is visible
   // inside the container at /home/<HOST_USER>/ via the bind-mount, so
@@ -423,12 +489,11 @@ function resolveWindowName(tmuxSession: string): string {
 
   // Path 2: SSH fallback.
   try {
-    const sshDest = `${process.env.HOST_USER}@host.docker.internal`;
     const shrc = ". ~/.shrc 2>/dev/null || true; ";
-    const out = execSync(
-      `ssh -o ConnectTimeout=5 -o BatchMode=yes ${sshDest} ` +
-        `"${shrc}tmux display-message -p -t '${tmuxSession}' '#W'"`,
-      { encoding: "utf-8", timeout: 10000 },
+    const out = (
+      await sshHost(
+        `${shrc}tmux display-message -p -t '${tmuxSession}' '#W'`,
+      )
     ).trim();
     return UNNAMED_WINDOWS.has(out) ? DEFAULT_SESSION_NAME : out;
   } catch {
@@ -441,9 +506,11 @@ function resolveWindowName(tmuxSession: string): string {
  * Passes TMUX_SESSION directly to host-bash (bypasses cs-tmux-window).
  * Used for adopting unmapped sessions during reconciliation.
  */
-function createTerminalForSession(tmuxSession: string): vscode.Terminal {
+async function createTerminalForSession(
+  tmuxSession: string,
+): Promise<vscode.Terminal> {
   const paneId = generatePaneId();
-  const name = resolveWindowName(tmuxSession);
+  const name = await resolveWindowName(tmuxSession);
   const paneInfo: PaneMapping = {
     tmuxSession,
     name,
@@ -532,7 +599,7 @@ async function adoptOrphans(): Promise<number> {
     if (s && !sessionKeeper.has(s)) sessionKeeper.set(s, t);
   }
 
-  const liveSessions = listTmuxSessions(instanceId);
+  const liveSessions = await listTmuxSessions(instanceId);
   debugChannel.appendLine(
     `[${new Date().toISOString()}] adoptOrphans: ` +
       `${liveSessions.length} live sessions, ` +
@@ -546,7 +613,7 @@ async function adoptOrphans(): Promise<number> {
     debugChannel.appendLine(
       `[${new Date().toISOString()}] adopting orphan session: ${session.name}`,
     );
-    const terminal = createTerminalForSession(session.name);
+    const terminal = await createTerminalForSession(session.name);
     // Eagerly register as keeper so subsequent adoptOrphans in the
     // same tick don't double-adopt while onDidOpenTerminal is
     // still pending.
@@ -562,8 +629,8 @@ async function adoptOrphans(): Promise<number> {
  * the profile provider during a restore to reattach rather than
  * create a new session. Returns null if all are attached.
  */
-function findUnattachedSession(): string | null {
-  const live = listTmuxSessions(instanceId);
+async function findUnattachedSession(): Promise<string | null> {
+  const live = await listTmuxSessions(instanceId);
   for (const s of live) {
     if (!s.attached) return s.name;
   }
@@ -611,8 +678,8 @@ export function activate(context: vscode.ExtensionContext): void {
   // creates a NEW tmux session on every restore. Intercept by
   // reusing unattached sessions when available.
   const profileProvider: vscode.TerminalProfileProvider = {
-    provideTerminalProfile(): vscode.ProviderResult<vscode.TerminalProfile> {
-      const reusable = findUnattachedSession();
+    async provideTerminalProfile(): Promise<vscode.TerminalProfile> {
+      const reusable = await findUnattachedSession();
       if (reusable) {
         debugChannel.appendLine(
           `[${new Date().toISOString()}] profile provider: reusing ` +
@@ -812,8 +879,8 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand(
       "tmuxSessionManager.showSessions",
-      () => {
-        const sessions = listTmuxSessions(instanceId);
+      async () => {
+        const sessions = await listTmuxSessions(instanceId);
         const terminals = vscode.window.terminals;
         const sessionToCount = new Map<string, number>();
         for (const t of terminals) {
