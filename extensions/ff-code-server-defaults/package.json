@@ -2,7 +2,7 @@
   "name": "ff-code-server-defaults",
   "displayName": "FactFiber code-server Defaults",
   "description": "Team default settings and keybindings for code-server, contributed at the Default layer so user settings override them and 'Reset Setting' reverts to the team default. Single source of truth for shared defaults (see tmp/issues/settings-defaults/v2/plan.md).",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "publisher": "code-server-proxy",
   "private": true,
   "license": "UNLICENSED",
@@ -34,7 +34,6 @@
         "*.md": "default"
       },
       "diffEditor.hideUnchangedRegions.enabled": true,
-      "security.workspace.trust.untrustedFiles": "open",
       "search.followSymlinks": false,
       "terminal.integrated.defaultLocation": "editor",
       "terminal.integrated.shellIntegration.enabled": false,
@@ -74,9 +73,6 @@
           "source.fixAll.ruff": "explicit",
           "source.organizeImports.ruff": "explicit"
         }
-      },
-      "files.exclude": {
-        "**/tmp": true
       },
       "search.exclude": {
         "**/.git": true,
