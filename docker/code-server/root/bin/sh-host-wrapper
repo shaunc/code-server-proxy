@@ -35,6 +35,16 @@ if [ "$1" = "-c" ] && [ -n "$2" ]; then
             # Commands referencing /config paths must run in container
             exec /bin/dash.real "$@"
             ;;
+        ssh\ *host.docker.internal*)
+            # Host-directed ssh (e.g. tmux-session-manager) must run
+            # LOCALLY in the container — host.docker.internal only
+            # resolves inside the container. Forwarding it to the host
+            # would break name resolution. Defense-in-depth: the
+            # extension now invokes ssh shell-free (execFile), which
+            # already bypasses this wrapper; this arm covers any other
+            # shell-string ssh-to-host caller.
+            exec /bin/dash.real "$@"
+            ;;
     esac
 
     # Forward command to host via login shell (for full PATH including ~/.local/bin)
