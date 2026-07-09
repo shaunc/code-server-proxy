@@ -561,6 +561,40 @@ async function createContainer(
  * @param {string} instanceId - Instance ID
  * @returns {Promise<void>}
  */
+/**
+ * Recreate a container WITHOUT GPU passthrough and start it. Used when a
+ * container was created with GPU DeviceRequests but the host GPU/CDI is broken,
+ * so OCI task creation fails at START time (e.g. "unresolvable CDI devices
+ * runtime.nvidia.com/gpu=all"). The create-time GPU retry can't catch this
+ * because the failure happens on start, not create. Rebuilds from the existing
+ * container's own config minus the nvidia runtime/device requests.
+ * @param {string} instanceId - Instance ID
+ * @returns {Promise<void>}
+ */
+async function recreateContainerWithoutGpu(instanceId) {
+  const containerName = `code-server-${instanceId}`;
+  const existing = docker.getContainer(containerName);
+  const info = await existing.inspect();
+  const hostConfig = { ...info.HostConfig };
+  delete hostConfig.Runtime;
+  delete hostConfig.DeviceRequests;
+  await existing.remove({ force: true });
+  const created = await docker.createContainer({
+    name: containerName,
+    Image: info.Config.Image,
+    Env: info.Config.Env,
+    Cmd: info.Config.Cmd,
+    Entrypoint: info.Config.Entrypoint,
+    WorkingDir: info.Config.WorkingDir,
+    Labels: info.Config.Labels,
+    Hostname: info.Config.Hostname,
+    ExposedPorts: info.Config.ExposedPorts,
+    HostConfig: hostConfig,
+  });
+  await created.start();
+  console.log(`Recreated + started without GPU: ${containerName}`);
+}
+
 async function startContainer(instanceId) {
   const containerName = `code-server-${instanceId}`;
   console.log(`Starting container: ${containerName}`);
@@ -573,6 +607,25 @@ async function startContainer(instanceId) {
     // Clear outdated cache to prevent recreation loops
     clearOutdatedCache(instanceId);
   } catch (error) {
+    // Graceful GPU degradation at START time: a faulted GPU or missing CDI
+    // spec makes OCI task creation fail here, which the create-time retry
+    // never sees. Recreate the container without GPU and start it, so a
+    // workspace that doesn't need GPU still comes up when the host GPU is
+    // broken. See bead code-server-proxy-zs9.
+    if (/cdi|nvidia|gpu|device request|inject|OCI runtime/i.test(error.message)) {
+      console.warn(
+        `Container start failed (GPU?), retrying without GPU: ${error.message}`
+      );
+      try {
+        await recreateContainerWithoutGpu(instanceId);
+        clearOutdatedCache(instanceId);
+        return;
+      } catch (retryError) {
+        console.error(
+          `Retry-without-GPU failed for ${containerName}: ${retryError.message}`
+        );
+      }
+    }
     console.error(`Failed to start container ${containerName}:`, error.message);
     throw new Error(`Container start failed: ${error.message}`);
   }
