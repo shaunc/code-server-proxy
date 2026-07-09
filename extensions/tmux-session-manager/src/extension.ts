@@ -441,6 +441,20 @@ function killTmuxSession(tmuxSession: string): void {
 
 const DEFAULT_SESSION_NAME = "Host Shell (tmux)";
 
+// Placement for every terminal we open in the editor area. We use an
+// explicit TerminalEditorLocationOptions targeting ViewColumn.Active
+// rather than the bare TerminalLocation.Editor enum. The bare enum lets
+// code-server open the terminal *beside* the active editor (a split) when
+// a non-terminal editor is focused — the operator saw new terminals land
+// to the RIGHT of an open markdown file. ViewColumn.Active places the
+// terminal in the currently active editor group instead of splitting.
+// preserveFocus:true additionally stops timer-adopted terminals from
+// stealing focus/scroll from whatever the user is reading.
+const EDITOR_LOCATION: vscode.TerminalEditorLocationOptions = {
+  viewColumn: vscode.ViewColumn.Active,
+  preserveFocus: true,
+};
+
 // Default tmux window names that carry no teammate identity — they are
 // just the shell tmux picked when the session was created without an
 // explicit rename. cs-tab renames teammate windows to the teammate
@@ -524,7 +538,7 @@ async function createTerminalForSession(
     name,
     shellPath: "/usr/local/bin/host-bash",
     env: { TMUX_SESSION: tmuxSession, TMUX_PANE_ID: paneId },
-    location: vscode.TerminalLocation.Editor,
+    location: EDITOR_LOCATION,
   });
   terminalToPaneId.set(terminal, paneId);
   paneIdToTerminal.set(paneId, terminal);
@@ -583,45 +597,90 @@ function releaseSessionClaim(terminal: vscode.Terminal): void {
 }
 
 /**
+ * True if some live VS Code terminal is already viewing `session`.
+ * Scans vscode.window.terminals directly (via the identifySession
+ * cache / creation env) so adoption cannot create a second terminal
+ * for a session that already has one. This is the authoritative
+ * "already covered" check — sessionKeeper alone is insufficient
+ * because a keeper entry can be missing (identifySession returned
+ * null when the terminal first opened, before its ssh child spawned)
+ * even though the terminal is plainly present in window.terminals.
+ */
+function terminalExistsForSession(session: string): boolean {
+  for (const terminal of vscode.window.terminals) {
+    const s = sessionCache.get(terminal) ?? terminalSession(terminal);
+    if (s === session) return true;
+  }
+  return false;
+}
+
+// Re-entrancy guard for adoptOrphans. The function awaits (ssh to the
+// host, terminal.processId), so a second invocation — from the 30s
+// interval overlapping a manual reconnectAll, or two rapid triggers —
+// can start while the first is mid-flight. Without this guard, both
+// runs read the same "uncovered" snapshot and each createTerminalForSession
+// for the same orphan, producing duplicate editor tabs that then flash
+// open and get disposed (observed live: session -28 adopted 3x in 15ms).
+let adoptInFlight = false;
+
+/**
  * Adopt tmux sessions that are live but have no VS Code terminal
  * viewing them. Called periodically (every 30s) to surface orphans.
  *
- * Uses sessionKeeper (authoritative "this session is covered") as
- * the coverage source, not a re-scan of vscode.window.terminals —
- * this avoids races where a just-created terminal is in
- * window.terminals but hasn't fired onDidOpenTerminal yet.
+ * Idempotent and re-entrancy-safe: a session is adopted only if NO
+ * live terminal is already viewing it (checked against
+ * vscode.window.terminals, not just sessionKeeper), and concurrent
+ * invocations are serialized via adoptInFlight so two runs cannot
+ * both create a terminal for the same orphan.
  */
 async function adoptOrphans(): Promise<number> {
-  // First prime keepers for any terminal that arrived without
-  // firing onDidOpenTerminal (rare but possible). This is idempotent.
-  for (const t of vscode.window.terminals) {
-    const s = await identifySession(t);
-    if (s && !sessionKeeper.has(s)) sessionKeeper.set(s, t);
-  }
-
-  const liveSessions = await listTmuxSessions(instanceId);
-  debugChannel.appendLine(
-    `[${new Date().toISOString()}] adoptOrphans: ` +
-      `${liveSessions.length} live sessions, ` +
-      `${vscode.window.terminals.length} terminals, ` +
-      `${sessionKeeper.size} sessions covered`,
-  );
-
-  let adopted = 0;
-  for (const session of liveSessions) {
-    if (sessionKeeper.has(session.name)) continue;
+  if (adoptInFlight) {
     debugChannel.appendLine(
-      `[${new Date().toISOString()}] adopting orphan session: ${session.name}`,
+      `[${new Date().toISOString()}] adoptOrphans: skipped (already running)`,
     );
-    const terminal = await createTerminalForSession(session.name);
-    // Eagerly register as keeper so subsequent adoptOrphans in the
-    // same tick don't double-adopt while onDidOpenTerminal is
-    // still pending.
-    sessionCache.set(terminal, session.name);
-    sessionKeeper.set(session.name, terminal);
-    adopted++;
+    return 0;
   }
-  return adopted;
+  adoptInFlight = true;
+  try {
+    // First prime keepers for any terminal that arrived without
+    // firing onDidOpenTerminal (rare but possible). This is idempotent.
+    for (const t of vscode.window.terminals) {
+      const s = await identifySession(t);
+      if (s && !sessionKeeper.has(s)) sessionKeeper.set(s, t);
+    }
+
+    const liveSessions = await listTmuxSessions(instanceId);
+    debugChannel.appendLine(
+      `[${new Date().toISOString()}] adoptOrphans: ` +
+        `${liveSessions.length} live sessions, ` +
+        `${vscode.window.terminals.length} terminals, ` +
+        `${sessionKeeper.size} sessions covered`,
+    );
+
+    let adopted = 0;
+    for (const session of liveSessions) {
+      // Skip if a keeper is registered OR any open terminal is already
+      // viewing this session. The window.terminals scan catches the
+      // case where identifySession could not yet resolve the session
+      // (so no keeper exists) but the terminal is plainly present —
+      // preventing perpetual re-adoption of an already-open session.
+      if (sessionKeeper.has(session.name)) continue;
+      if (terminalExistsForSession(session.name)) continue;
+      debugChannel.appendLine(
+        `[${new Date().toISOString()}] adopting orphan session: ${session.name}`,
+      );
+      const terminal = await createTerminalForSession(session.name);
+      // Eagerly register as keeper so subsequent adoptOrphans in the
+      // same tick don't double-adopt while onDidOpenTerminal is
+      // still pending.
+      sessionCache.set(terminal, session.name);
+      sessionKeeper.set(session.name, terminal);
+      adopted++;
+    }
+    return adopted;
+  } finally {
+    adoptInFlight = false;
+  }
 }
 
 /**
@@ -691,7 +750,7 @@ export function activate(context: vscode.ExtensionContext): void {
           name: "Host Shell (tmux)",
           shellPath: "/usr/local/bin/host-bash",
           env: { TMUX_PANE_ID: paneId, TMUX_SESSION: reusable },
-          location: vscode.TerminalLocation.Editor,
+          location: EDITOR_LOCATION,
         });
       }
 
@@ -707,7 +766,7 @@ export function activate(context: vscode.ExtensionContext): void {
         name: "Host Shell (tmux)",
         shellPath: "/usr/local/bin/host-bash",
         env: { TMUX_PANE_ID: paneId },
-        location: vscode.TerminalLocation.Editor,
+        location: EDITOR_LOCATION,
       });
     },
   };
