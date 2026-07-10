@@ -104,6 +104,21 @@ else
     echo "==> Custom extension up to date; skipping"
 fi
 
+# --- 3a. Host helper scripts (host/bin) --------------------------------
+# The tmux-session-manager extension and the proxy shell out to helpers
+# in host/bin (cs-tmux-window, cs-tab, ...) — they must be on the host
+# user's PATH. Symlink them into ~/.local/bin so `git pull` keeps them
+# current. silk already had this; rayon had a STALE COPY that git pull
+# never updated (missing the owned/record/reap subcommands), which would
+# make the extension's owned-gating fail. ln -sfn replaces a stale copy
+# or old symlink. See bead code-server-proxy-8cc.
+mkdir -p "$HOME/.local/bin"
+for f in "$REPO_DIR"/host/bin/*; do
+    [ -f "$f" ] && [ -x "$f" ] || continue
+    ln -sfn "$f" "$HOME/.local/bin/$(basename "$f")"
+done
+echo "==> Linked host/bin helpers into ~/.local/bin"
+
 # --- 4. Marketplace extensions (idempotent, cheap) ----------------------
 echo "==> Installing marketplace extensions"
 scripts/install-marketplace-extensions.sh
