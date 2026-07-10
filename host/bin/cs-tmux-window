@@ -99,6 +99,51 @@ except Exception:
 " "$map_file" "$pane_id"
 }
 
+# Print the set of "owned" session names for an instance, one per line.
+# A session is owned (a real, wanted session — a user terminal or a
+# teammate tab) if it appears in EITHER source:
+#   1. a value in the host pane→session mapping cs-<iid>.json (written by
+#      attach-or-create and by the extension via `record`); or
+#   2. a cs-tab sidecar ~/.cs-tab-names/<session> (teammate tabs, which
+#      cs-tab creates directly via tmux new-session, bypassing this tool).
+# Everything else that is a live cs-<iid>-* session is an unowned leak
+# (bare-`grab` sessions from hidden env-discovery terminals, etc.).
+owned_sessions() {
+    local iid="$1"
+    local map_file="$MAPPING_DIR/cs-${iid}.json"
+    if [ -f "$map_file" ]; then
+        python3 -c "
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    for v in d.values():
+        if v:
+            print(v)
+except Exception:
+    pass
+" "$map_file"
+    fi
+    if [ -d "$HOME/.cs-tab-names" ]; then
+        ls -1 "$HOME/.cs-tab-names" 2>/dev/null | grep "^cs-${iid}-" || true
+    fi
+}
+
+# True if the session's foreground command is an idle login shell (safe
+# to reap) rather than a real program (claude/node/python/vim/…). Any
+# pane running a non-shell command keeps the whole session. This is the
+# defense-in-depth guard: even if ownership tracking has a gap, a session
+# doing real work is never killed.
+IDLE_SHELLS='^(-?bash|-?sh|-?zsh|-?fish|-?dash|login|tmux)$'
+session_is_idle_shell() {
+    local session="$1" cmd
+    while IFS= read -r cmd; do
+        [ -z "$cmd" ] && continue
+        [[ "$cmd" =~ $IDLE_SHELLS ]] || return 1
+    done < <(tmux "${TMUX_ARGS[@]}" list-panes -t "$session" \
+        -F '#{pane_current_command}' 2>/dev/null)
+    return 0
+}
+
 # Write pane-id → session mapping (atomic).
 write_mapping() {
     local map_file="$1" pane_id="$2" session="$3"
@@ -229,8 +274,69 @@ case "${1:-}" in
         rm -f "$MAPPING_DIR/cs-${2}.json"
         ;;
 
+    owned)
+        # Print the owned session names for an instance (see owned_sessions).
+        # Used by the extension to gate adoption and by the reaper.
+        [ $# -lt 2 ] && { echo "Usage: cs-tmux-window owned <instance-id>" >&2; exit 1; }
+        owned_sessions "$2" | sort -u
+        ;;
+
+    record)
+        # Record a pane-id → session mapping the extension already knows
+        # (reuse and adoption paths, where host-bash bypasses
+        # attach-or-create). Makes those sessions owned.
+        [ $# -lt 4 ] && { echo "Usage: cs-tmux-window record <instance-id> <pane-id> <session>" >&2; exit 1; }
+        write_mapping "$MAPPING_DIR/cs-${2}.json" "$3" "$4"
+        ;;
+
+    reap)
+        # Kill unowned, unattached, aged, idle-shell leak sessions for an
+        # instance. Never touches attached, owned, or real-work sessions.
+        #   cs-tmux-window reap <instance-id> [--dry-run] [--age-min N]
+        # Prints one line per session considered: "KILL <s>" / "keep <s> <why>".
+        shift
+        [ $# -lt 1 ] && { echo "Usage: cs-tmux-window reap <instance-id> [--dry-run] [--age-min N]" >&2; exit 1; }
+        iid="$1"; shift
+        dry=0; age_min=5
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --dry-run) dry=1; shift;;
+                --age-min) age_min="$2"; shift 2;;
+                *) echo "reap: unknown arg '$1'" >&2; exit 1;;
+            esac
+        done
+        now=$(date +%s)
+        owned_tmp=$(mktemp)
+        owned_sessions "$iid" | sort -u > "$owned_tmp"
+        while IFS=' ' read -r name attached created; do
+            [ -z "$name" ] && continue
+            if [ "$attached" != "0" ]; then
+                echo "keep $name attached"; continue
+            fi
+            if grep -qxF "$name" "$owned_tmp"; then
+                echo "keep $name owned"; continue
+            fi
+            age=$(( now - created ))
+            if [ "$age" -lt $(( age_min * 60 )) ]; then
+                echo "keep $name too-young(${age}s)"; continue
+            fi
+            if ! session_is_idle_shell "$name"; then
+                echo "keep $name running-work"; continue
+            fi
+            if [ "$dry" -eq 1 ]; then
+                echo "KILL $name (dry-run)"
+            else
+                tmux "${TMUX_ARGS[@]}" kill-session -t "$name" 2>/dev/null \
+                    && echo "KILL $name" || echo "keep $name kill-failed"
+            fi
+        done < <(tmux "${TMUX_ARGS[@]}" list-sessions \
+            -F '#{session_name} #{session_attached} #{session_created}' \
+            2>/dev/null | grep "^cs-${iid}-")
+        rm -f "$owned_tmp"
+        ;;
+
     *)
-        echo "Usage: cs-tmux-window {create|attach-or-create|list|cleanup} ..." >&2
+        echo "Usage: cs-tmux-window {create|attach-or-create|grab|list|resolve|owned|record|reap|cleanup} ..." >&2
         exit 1
         ;;
 esac

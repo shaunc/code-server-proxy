@@ -891,6 +891,38 @@ function cleanOrphanedTmuxSessions(recreatingInstances = new Set()) {
       // Session may have been killed between list and kill
     }
   }
+
+  // Reap leaked sessions on KNOWN instances. The loop above only kills
+  // sessions of instances absent from the registry; leaks (unowned
+  // `grab` sessions from hidden env-discovery terminals) accumulate on
+  // LIVE instances — worst case a closed window whose extension host,
+  // and thus its adopt loop, is not even running. cs-tmux-window reap
+  // applies the owned-set + idle-shell + age guards, so it never
+  // touches attached, owned, or real-work sessions. See bead
+  // code-server-proxy-8cc.
+  for (const iid of perInstance.keys()) {
+    if (recreatingInstances.has(iid)) continue;
+    if (!knownInstances.has(iid)) continue; // unknown already handled
+    try {
+      const out = execSync(`cs-tmux-window reap '${iid}' --age-min 15`, {
+        encoding: 'utf-8',
+        timeout: 20000,
+      });
+      const killed = out.split('\n').filter((l) => l.startsWith('KILL'));
+      if (killed.length > 0) {
+        console.log(
+          `[TMUX-CLEANUP] Reaped ${killed.length} leaked session(s) on ` +
+            `instance ${iid === 'main' ? 'main' : iid.slice(0, 12) + '…'}`
+        );
+      }
+    } catch (err) {
+      // cs-tmux-window absent, or reap timed out — non-fatal.
+      console.error(
+        `[TMUX-CLEANUP] reap failed for ` +
+          `${iid === 'main' ? 'main' : iid.slice(0, 12) + '…'}: ${err.message}`
+      );
+    }
+  }
 }
 
 /**

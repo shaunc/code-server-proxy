@@ -163,6 +163,65 @@ async function listTmuxSessions(
   }
 }
 
+/**
+ * Fetch the set of "owned" session names for this instance from the
+ * host (`cs-tmux-window owned`): sessions that have a host pane→session
+ * mapping (real user terminals) or a cs-tab sidecar (teammate tabs).
+ * Adoption is gated on this so leaked, unowned `grab` sessions (from
+ * hidden env-discovery terminals) are never surfaced as tabs.
+ *
+ * Fail-safe: on SSH failure returns an empty set, so adoptOrphans
+ * surfaces nothing that cycle (reattach is retried next tick) rather
+ * than falling back to surfacing leaks.
+ */
+async function fetchOwnedSessions(iid: string): Promise<Set<string>> {
+  try {
+    const shrc = ". ~/.shrc 2>/dev/null || true; ";
+    const out = await sshHost(`${shrc}cs-tmux-window owned '${iid}'`);
+    return new Set(
+      out
+        .trim()
+        .split("\n")
+        .filter((s) => s.length > 0),
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * Record a pane→session mapping on the host so a session the extension
+ * created (adoption) or reused (provider reuse path) counts as owned.
+ * These paths pass TMUX_SESSION directly, so host-bash bypasses
+ * cs-tmux-window and no host mapping would otherwise be written — which
+ * would let the reaper later kill a real user's session (Finding 2/4).
+ * Fire-and-forget.
+ */
+function recordSessionOwnership(paneId: string, session: string): void {
+  const shrc = ". ~/.shrc 2>/dev/null || true; ";
+  void sshHost(
+    `${shrc}cs-tmux-window record '${instanceId}' '${paneId}' '${session}'`,
+  ).catch(() => {
+    // best-effort; the session may still be owned via other sources
+  });
+}
+
+/**
+ * Synchronous ownership check for a single session (used by the close
+ * handler, which kills synchronously). Fail-SAFE: if ownership cannot
+ * be determined (SSH error), returns true (treat as owned → do NOT
+ * kill) so we never risk destroying a real session.
+ */
+function isSessionOwnedSync(session: string): boolean {
+  try {
+    const shrc = ". ~/.shrc 2>/dev/null || true; ";
+    const out = sshHostSync(`${shrc}cs-tmux-window owned '${instanceId}'`);
+    return out.split("\n").some((line) => line.trim() === session);
+  } catch {
+    return true;
+  }
+}
+
 // --- Terminal Tracking ---
 
 /** Map from Terminal to pane UUID */
@@ -542,6 +601,10 @@ async function createTerminalForSession(
   });
   terminalToPaneId.set(terminal, paneId);
   paneIdToTerminal.set(paneId, terminal);
+  // TMUX_SESSION bypasses cs-tmux-window, so no host mapping is written.
+  // Record it so this session counts as owned (else the reaper could
+  // later kill a real user's detached session — Finding 2/4).
+  recordSessionOwnership(paneId, tmuxSession);
   return terminal;
 }
 
@@ -650,14 +713,17 @@ async function adoptOrphans(): Promise<number> {
     }
 
     const liveSessions = await listTmuxSessions(instanceId);
+    const owned = await fetchOwnedSessions(instanceId);
     debugChannel.appendLine(
       `[${new Date().toISOString()}] adoptOrphans: ` +
         `${liveSessions.length} live sessions, ` +
+        `${owned.size} owned, ` +
         `${vscode.window.terminals.length} terminals, ` +
         `${sessionKeeper.size} sessions covered`,
     );
 
     let adopted = 0;
+    let skippedUnowned = 0;
     for (const session of liveSessions) {
       // Skip if a keeper is registered OR any open terminal is already
       // viewing this session. The window.terminals scan catches the
@@ -666,6 +732,15 @@ async function adoptOrphans(): Promise<number> {
       // preventing perpetual re-adoption of an already-open session.
       if (sessionKeeper.has(session.name)) continue;
       if (terminalExistsForSession(session.name)) continue;
+      // Only surface OWNED sessions — real user terminals (host
+      // pane→session mapping) or teammate tabs (cs-tab sidecar).
+      // Unowned sessions are leaked `grab` sessions from hidden
+      // env-discovery terminals; surfacing them is the "extra terminal
+      // every 30s" bug. They are reaped host-side, never surfaced.
+      if (!owned.has(session.name)) {
+        skippedUnowned++;
+        continue;
+      }
       debugChannel.appendLine(
         `[${new Date().toISOString()}] adopting orphan session: ${session.name}`,
       );
@@ -677,21 +752,43 @@ async function adoptOrphans(): Promise<number> {
       sessionKeeper.set(session.name, terminal);
       adopted++;
     }
+    if (skippedUnowned > 0) {
+      debugChannel.appendLine(
+        `[${new Date().toISOString()}] adoptOrphans: skipped ` +
+          `${skippedUnowned} unowned (leaked) session(s)`,
+      );
+    }
     return adopted;
   } finally {
     adoptInFlight = false;
   }
 }
 
+// Sessions handed out by findUnattachedSession in the last few seconds.
+// tmux does not report a session as "attached" until the actual attach
+// runs (well after the provider returns), so without this N concurrently
+// restored terminals would all reuse the same first unattached session
+// and then dedup-churn. Short TTL mirrors cs-tmux-window's grab claims.
+const promisedSessions = new Map<string, number>();
+const PROMISE_TTL_MS = 10_000;
+
 /**
  * Find an unattached tmux session for this instance, to be used by
  * the profile provider during a restore to reattach rather than
- * create a new session. Returns null if all are attached.
+ * create a new session. Skips sessions promised in the last
+ * PROMISE_TTL_MS. Returns null if none available.
  */
 async function findUnattachedSession(): Promise<string | null> {
   const live = await listTmuxSessions(instanceId);
+  const now = Date.now();
   for (const s of live) {
-    if (!s.attached) return s.name;
+    if (s.attached) continue;
+    const promisedAt = promisedSessions.get(s.name);
+    if (promisedAt !== undefined && now - promisedAt < PROMISE_TTL_MS) {
+      continue;
+    }
+    promisedSessions.set(s.name, now);
+    return s.name;
   }
   return null;
 }
@@ -746,6 +843,11 @@ export function activate(context: vscode.ExtensionContext): void {
         );
         const paneId = generatePaneId();
         savePaneToMapping(paneId, "Host Shell (tmux)", 1);
+        // TMUX_SESSION bypasses cs-tmux-window (host-bash's "extension
+        // told us the session" branch), so no host mapping is written.
+        // Record it so a reused (originally grab-created, unmapped)
+        // session becomes owned and is not later reaped (Finding 2).
+        recordSessionOwnership(paneId, reusable);
         return new vscode.TerminalProfile({
           name: "Host Shell (tmux)",
           shellPath: "/usr/local/bin/host-bash",
@@ -859,9 +961,37 @@ export function activate(context: vscode.ExtensionContext): void {
       // (e.g. adoption) can become the new keeper.
       releaseSessionClaim(terminal);
 
-      // Extension disposal (dedup) is NOT user-driven; never kill
-      // the session in that case. Real user close paths use User
-      // or Process.
+      // Ephemeral (hideFromUser) discovery shells (ms-python etc.):
+      // reap their leaked tmux session on ANY close reason — the
+      // Shutdown/Extension early return below is exactly why these used
+      // to leak. Guarded so we never kill a session still in use: only
+      // when no other terminal views it (a dedup-disposed duplicate
+      // closes as Extension while the keeper is still attached —
+      // Finding 3) AND the session is not owned (a hidden terminal can
+      // `grab` a real user's detached session; killing it would lose the
+      // user's work — Finding 4).
+      if (session && ephemeralTerminals.has(terminal)) {
+        if (
+          countTerminalsOnSession(session, terminal) === 0 &&
+          !isSessionOwnedSync(session)
+        ) {
+          debugChannel.appendLine(
+            `[${new Date().toISOString()}] killing ephemeral ` +
+              `session ${session}`,
+          );
+          killTmuxSession(session);
+        } else {
+          debugChannel.appendLine(
+            `[${new Date().toISOString()}] not killing ephemeral ` +
+              `${session}: still viewed or owned`,
+          );
+        }
+        return;
+      }
+
+      // Extension disposal (dedup) and shutdown are NOT user-driven;
+      // never kill a real session in those cases. Real user close paths
+      // use User or Process.
       if (
         reason === vscode.TerminalExitReason.Shutdown ||
         reason === vscode.TerminalExitReason.Extension
@@ -872,18 +1002,6 @@ export function activate(context: vscode.ExtensionContext): void {
       if (paneId) removePaneFromMapping(paneId);
 
       if (!session) return;
-
-      // Ephemeral (hideFromUser) terminals always kill their
-      // session on close — no refcount check. They're one-shot
-      // discovery shells whose tmux session has no user value.
-      if (ephemeralTerminals.has(terminal)) {
-        debugChannel.appendLine(
-          `[${new Date().toISOString()}] killing ephemeral ` +
-            `session ${session}`,
-        );
-        killTmuxSession(session);
-        return;
-      }
 
       const remaining = countTerminalsOnSession(session, terminal);
       if (remaining > 0) {
@@ -976,6 +1094,12 @@ export function activate(context: vscode.ExtensionContext): void {
     try {
       for (const terminal of vscode.window.terminals) {
         const opts = terminal.creationOptions;
+        // Tag hidden terminals that opened before activation (so we
+        // missed their onDidOpenTerminal) as ephemeral, so their leaked
+        // session is reaped on close like any other discovery shell.
+        if ("hideFromUser" in opts && opts.hideFromUser === true) {
+          ephemeralTerminals.add(terminal);
+        }
         if ("env" in opts && opts.env && typeof opts.env === "object") {
           const env = opts.env as Record<string, string>;
           if (env.TMUX_PANE_ID && !terminalToPaneId.has(terminal)) {

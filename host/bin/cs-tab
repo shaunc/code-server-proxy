@@ -114,11 +114,12 @@ cmd_new() {
     # Sidecar name file — the extension reads this without SSH so the tab
     # label is correct even when ssh from container -> host.docker.internal
     # is broken / not configured. Bind-mounted via /home/shauncutts -> same
-    # path inside the code-server container.
-    if [ -n "$name" ]; then
-        mkdir -p "$HOME/.cs-tab-names"
-        printf '%s\n' "$name" > "$HOME/.cs-tab-names/$session"
-    fi
+    # path inside the code-server container. Always written (even unnamed):
+    # its existence marks this session as an OWNED (intentional) tab so the
+    # host reaper never treats a teammate tab as a leak. Empty content ->
+    # the extension falls back to tmux #W for the label.
+    mkdir -p "$HOME/.cs-tab-names"
+    printf '%s\n' "$name" > "$HOME/.cs-tab-names/$session"
     echo "$session"
     echo "tab will appear within ~30s (extension adoptOrphans tick)" >&2
 }
@@ -137,11 +138,10 @@ rehome_window() {
     tm move-window -s "$src" -t "${session}:99" || die "move-window failed"
     tm kill-window -t "${session}:0" 2>/dev/null || true
     [ -n "$name" ] && tm rename-window -t "${session}:99" "$name" 2>/dev/null || true
-    # Sidecar name file (see cmd_new for rationale).
-    if [ -n "$name" ]; then
-        mkdir -p "$HOME/.cs-tab-names"
-        printf '%s\n' "$name" > "$HOME/.cs-tab-names/$session"
-    fi
+    # Sidecar name file — always written; existence marks an owned tab
+    # (see cmd_new for full rationale).
+    mkdir -p "$HOME/.cs-tab-names"
+    printf '%s\n' "$name" > "$HOME/.cs-tab-names/$session"
     echo "$session"
 }
 

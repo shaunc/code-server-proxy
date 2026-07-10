@@ -2,7 +2,7 @@
   "name": "tmux-session-manager",
   "displayName": "tmux Session Manager",
   "description": "Maps VS Code terminal panes to tmux sessions for persistence across disconnects",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "publisher": "code-server-proxy",
   "engines": {
     "vscode": "^1.93.0"
