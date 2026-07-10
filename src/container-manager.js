@@ -906,7 +906,7 @@ function cleanOrphanedTmuxSessions(recreatingInstances = new Set()) {
     try {
       const out = execSync(`cs-tmux-window reap '${iid}' --age-min 15`, {
         encoding: 'utf-8',
-        timeout: 20000,
+        timeout: 30000,
       });
       const killed = out.split('\n').filter((l) => l.startsWith('KILL'));
       if (killed.length > 0) {

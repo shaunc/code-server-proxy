@@ -128,21 +128,14 @@ except Exception:
     fi
 }
 
-# True if the session's foreground command is an idle login shell (safe
-# to reap) rather than a real program (claude/node/python/vim/…). Any
-# pane running a non-shell command keeps the whole session. This is the
-# defense-in-depth guard: even if ownership tracking has a gap, a session
-# doing real work is never killed.
-IDLE_SHELLS='^(-?bash|-?sh|-?zsh|-?fish|-?dash|login|tmux)$'
-session_is_idle_shell() {
-    local session="$1" cmd
-    while IFS= read -r cmd; do
-        [ -z "$cmd" ] && continue
-        [[ "$cmd" =~ $IDLE_SHELLS ]] || return 1
-    done < <(tmux "${TMUX_ARGS[@]}" list-panes -t "$session" \
-        -F '#{pane_current_command}' 2>/dev/null)
-    return 0
-}
+# A pane command matching this is an idle login shell (safe to reap). A
+# session with ANY pane running a non-shell command (claude/node/python/
+# vim/…) is kept — the defense-in-depth guard, so even if ownership
+# tracking has a gap a session doing real work is never killed. Used via
+# `grep -vE` against a single prefetched `list-panes -a` snapshot (below)
+# rather than one tmux call per session, which was slow enough on
+# many-session instances to hit the caller's timeout.
+IDLE_SHELL_RE='^(-?bash|-?sh|-?zsh|-?fish|-?dash|login|tmux)$'
 
 # Write pane-id → session mapping (atomic).
 write_mapping() {
@@ -314,6 +307,14 @@ case "${1:-}" in
         now=$(date +%s)
         owned_tmp=$(mktemp)
         owned_sessions "$iid" | sort -u > "$owned_tmp"
+        # Prefetch every pane's foreground command in ONE tmux call
+        # (session_name -> pane_current_command lines). Per-session
+        # tmux calls were slow enough on many-session instances to blow
+        # the caller's timeout ("reap failed" every tick).
+        panes_tmp=$(mktemp)
+        tmux "${TMUX_ARGS[@]}" list-panes -a \
+            -F '#{session_name} #{pane_current_command}' 2>/dev/null \
+            > "$panes_tmp"
         while IFS=' ' read -r name attached created; do
             [ -z "$name" ] && continue
             # Guard against a malformed/racing list line (empty fields).
@@ -328,7 +329,10 @@ case "${1:-}" in
             if [ "$age" -lt $(( age_min * 60 )) ]; then
                 echo "keep $name too-young(${age}s)"; continue
             fi
-            if ! session_is_idle_shell "$name"; then
+            # Keep if any pane runs real work (non idle-shell command).
+            nonidle=$(awk -v s="$name" '$1==s{print $2}' "$panes_tmp" \
+                | grep -vE "$IDLE_SHELL_RE" | head -1)
+            if [ -n "$nonidle" ]; then
                 echo "keep $name running-work"; continue
             fi
             if [ "$dry" -eq 1 ]; then
@@ -340,7 +344,7 @@ case "${1:-}" in
         done < <(tmux "${TMUX_ARGS[@]}" list-sessions \
             -F '#{session_name} #{session_attached} #{session_created}' \
             2>/dev/null | grep "^cs-${iid}-")
-        rm -f "$owned_tmp"
+        rm -f "$owned_tmp" "$panes_tmp"
         ;;
 
     *)
