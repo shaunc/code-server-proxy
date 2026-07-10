@@ -305,11 +305,19 @@ case "${1:-}" in
                 *) echo "reap: unknown arg '$1'" >&2; exit 1;;
             esac
         done
+        # The loop does its own explicit error handling (if-guards,
+        # `|| echo`). Relax errexit/pipefail so a transient per-session
+        # hiccup — a session vanishing between list-sessions and
+        # list-panes during a reload, or a momentarily empty
+        # session_created field — does not abort the whole reap.
+        set +e +o pipefail
         now=$(date +%s)
         owned_tmp=$(mktemp)
         owned_sessions "$iid" | sort -u > "$owned_tmp"
         while IFS=' ' read -r name attached created; do
             [ -z "$name" ] && continue
+            # Guard against a malformed/racing list line (empty fields).
+            [[ "$created" =~ ^[0-9]+$ ]] || { echo "keep $name no-age"; continue; }
             if [ "$attached" != "0" ]; then
                 echo "keep $name attached"; continue
             fi
