@@ -17,6 +17,19 @@ const { execSync } = require('child_process');
 const config = require('./config');
 const activityTracker = require('./activity-tracker');
 
+// Absolute path to the host tmux helper. The proxy's PATH (systemd
+// user service) does NOT include ~/.local/bin, so a bare `cs-tmux-window`
+// fails with 127 — which silently broke the eviction cleanup for a long
+// time and every reap tick. Use the repo copy so it is always the
+// current version and PATH-independent. See bead code-server-proxy-8cc.
+const CS_TMUX_WINDOW = path.join(
+  __dirname,
+  '..',
+  'host',
+  'bin',
+  'cs-tmux-window'
+);
+
 // Config file path
 const MOUNTS_CONFIG_PATH = config.paths.mountsConfig;
 
@@ -724,7 +737,7 @@ async function stopContainer(instanceId, timeout = 10) {
 
   // Kill all tmux sessions for this instance (one per terminal pane)
   try {
-    execSync(`cs-tmux-window cleanup ${instanceId}`, {
+    execSync(`${CS_TMUX_WINDOW} cleanup ${instanceId}`, {
       timeout: 5000,
     });
     console.log(`Cleaned up tmux sessions for: ${instanceId}`);
@@ -904,10 +917,13 @@ function cleanOrphanedTmuxSessions(recreatingInstances = new Set()) {
     if (recreatingInstances.has(iid)) continue;
     if (!knownInstances.has(iid)) continue; // unknown already handled
     try {
-      const out = execSync(`cs-tmux-window reap '${iid}' --age-min 15`, {
-        encoding: 'utf-8',
-        timeout: 30000,
-      });
+      const out = execSync(
+        `${CS_TMUX_WINDOW} reap '${iid}' --age-min 15`,
+        {
+          encoding: 'utf-8',
+          timeout: 30000,
+        }
+      );
       const killed = out.split('\n').filter((l) => l.startsWith('KILL'));
       if (killed.length > 0) {
         console.log(
