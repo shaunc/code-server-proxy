@@ -9,6 +9,19 @@ if [ -z "$HOST_USER" ]; then
     exec /bin/bash "$@"
 fi
 
+# VS Code / code-server resolves the shell environment by running
+# `$SHELL -lic '<code-server node binary> ...'`. Both the pty host and the
+# extension host mark that spawn with VSCODE_RESOLVING_ENVIRONMENT=1. Those
+# binaries exist only inside THIS container, so forwarding the resolver to
+# the host (below) makes the host shell exit 127 ("command not found"),
+# which code-server retries on a ~30s cycle -> pty/ext-host churn -> the
+# workbench blanks to background and redisplays (the "flicker") in every
+# window. Resolve locally instead: the container already has the correct
+# environment, and the resolver never needs the host.
+if [ -n "$VSCODE_RESOLVING_ENVIRONMENT" ]; then
+    exec /bin/bash "$@"
+fi
+
 SSH_DEST="$HOST_USER@host.docker.internal"
 # INSTANCE_ID from env (container-manager), fallback to file (injected).
 # Strip '-new' suffix left by pre-fix blue-green containers.
