@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# .githooks/prepare-commit-msg — dispatcher (beads only)
+DIR="$(cd "$(dirname "$0")" && pwd)"
+"$DIR/beads-prepare-commit-msg" "$@" || true

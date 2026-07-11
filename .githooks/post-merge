@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# .githooks/post-merge — dispatcher (beads only)
+DIR="$(cd "$(dirname "$0")" && pwd)"
+"$DIR/beads-post-merge" "$@" || true

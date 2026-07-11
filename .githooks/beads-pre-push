@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# .githooks/beads-pre-push
+#
+# Before pushing, ensure central Dolt has this operator's latest
+# state so any other worktree pulling afterward reads the same
+# truth. Same-operator multi-worktree guarantee (see ffmeta-u8ja).
+#
+# 'bd dolt push' is the bd 1.x way; a missing subcommand is
+# tolerated so the hook doesn't block 'git push' on bd version
+# skew.
+if command -v bd >/dev/null 2>&1; then
+    export BD_GIT_HOOK=1
+    bd hooks run pre-push "$@" || true
+    bd dolt push 2>/dev/null || true
+fi

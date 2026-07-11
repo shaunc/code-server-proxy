@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# .githooks/beads-post-merge
+#
+# Same-operator multi-worktree reconciliation: re-export Dolt→JSONL
+# after a successful merge/pull, since Dolt is the authoritative
+# source of truth for this operator's beads. Prevents JSONL-level
+# conflicts on subsequent pulls — the JSONL is a derived cache,
+# not authoritative content (see ffmeta-u8ja).
+#
+# Cross-operator JSONL merge semantics (replacement for the broken
+# 'bd merge' driver) are a separate concern — see ffmeta-5mvl.
+if command -v bd >/dev/null 2>&1; then
+    export BD_GIT_HOOK=1
+    bd hooks run post-merge "$@" || true
+    # Regenerate JSONL from authoritative Dolt. Quiet/best-effort:
+    # a failing export shouldn't block the merge.
+    if [ -f .beads/issues.jsonl ]; then
+        bd export --quiet -o .beads/issues.jsonl 2>/dev/null || true
+    fi
+fi

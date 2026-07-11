@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# .githooks/beads-pre-commit
+if command -v bd >/dev/null 2>&1; then
+    export BD_GIT_HOOK=1
+    bd hooks run pre-commit "$@"
+fi

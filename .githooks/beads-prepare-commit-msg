@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# .githooks/beads-prepare-commit-msg
+if command -v bd >/dev/null 2>&1; then
+    export BD_GIT_HOOK=1
+    bd hooks run prepare-commit-msg "$@"
+fi

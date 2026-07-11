@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# .githooks/commit-msg — dispatcher (pre-commit framework only)
+# Note: beads does not support commit-msg hooks.
+set -euo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# pre-commit framework (commitizen, etc.)
+if [ -x "$DIR/commit-msg-framework/commit-msg" ]; then
+    "$DIR/commit-msg-framework/commit-msg" "$@" || exit $?
+fi

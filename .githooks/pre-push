@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# .githooks/pre-push — dispatcher (beads only)
+DIR="$(cd "$(dirname "$0")" && pwd)"
+"$DIR/beads-pre-push" "$@" || true
