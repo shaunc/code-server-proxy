@@ -69,8 +69,14 @@ create_session() {
         local idx
         idx=$(next_index "$iid")
         local session="cs-${iid}-${idx}"
+        # Close fd 9 (9>&-) so the tmux SERVER this may spawn does not
+        # inherit the caller's grab/map flock (both use fd 9). tmux
+        # daemonizes and keeps inherited fds for its entire life, so a
+        # leaked lock fd is held forever -> every subsequent `grab`
+        # deadlocks on the flock and its terminal hangs (bd 7lc). Safe
+        # no-op when fd 9 is not open.
         if tmux "${TMUX_ARGS[@]}" new-session -d -s "$session" \
-            -c "$workdir" 2>/dev/null; then
+            -c "$workdir" 9>&- 2>/dev/null; then
             echo "$session"
             return 0
         fi
