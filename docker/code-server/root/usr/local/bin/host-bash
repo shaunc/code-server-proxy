@@ -51,11 +51,24 @@ fi
 #         > TMUX_PANE_ID (mapped, from extension profile)
 #         > grab first unattached session (reconnect on reload)
 #         > create new session
+
+# Control-plane calls (grab / attach-or-create) must NOT ride the shared
+# SSH ControlMaster. When that master wedges — its event loop blocked in a
+# write() to a half-dead peer after a network/host blip — every muxed
+# channel, and thus every new terminal, hangs forever; ServerAliveInterval
+# can't rescue it because the loop never returns to its timer, and
+# ConnectTimeout doesn't apply (the control socket connects instantly; the
+# channel is what stalls). Use a dedicated connection with keepalives,
+# exactly as the interactive attach loop and sh-host-wrapper already do
+# (bd code-server-proxy-doh). Unquoted expansion is intentional (opt list).
+CTL_SSH_OPTS="-o ControlMaster=no -o ServerAliveInterval=10 \
+-o ServerAliveCountMax=3 -o ConnectTimeout=10 -o BatchMode=yes"
+
 if [ -n "$TMUX_SESSION" ]; then
     # Extension told us exactly which session — use it directly
     true
 elif [ -n "$TMUX_PANE_ID" ]; then
-    TMUX_SESSION=$(ssh -o ConnectTimeout=10 -o BatchMode=yes \
+    TMUX_SESSION=$(ssh $CTL_SSH_OPTS \
         "$SSH_DEST" \
         "${shrc_source}cs-tmux-window attach-or-create \
             '$IID' '$TMUX_PANE_ID' '$WORKDIR'")
@@ -63,7 +76,7 @@ else
     # Try to grab an unattached session for this instance.
     # On reload, code-server recreates terminals — each host-bash
     # grabs one unattached session instead of creating a new one.
-    TMUX_SESSION=$(ssh -o ConnectTimeout=10 -o BatchMode=yes \
+    TMUX_SESSION=$(ssh $CTL_SSH_OPTS \
         "$SSH_DEST" \
         "${shrc_source}cs-tmux-window grab '$IID' '$WORKDIR'")
 fi
