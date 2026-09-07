@@ -73,10 +73,18 @@
 
   function isReconnectionFailureDialog(element) {
     const text = element.textContent || '';
+    // Reload ONLY on terminal, unrecoverable failure — where VS Code itself
+    // has given up and instructs a reload. Do NOT match "Attempting to
+    // reconnect": that is the TRANSIENT state VS Code shows while it silently
+    // reconnects on its own (via the reconnection token, preserving editor and
+    // terminal state). Reloading on it defeats that graceful recovery and turns
+    // every momentary browser<->proxy blip (tunnel/tailnet jitter — invisible
+    // to the backend, which keeps its leg alive) into a full-page reload: the
+    // "irregular blinking" users see, and it can loop (reload -> still
+    // reconnecting -> reload).
     return (
       text.includes('Cannot reconnect') ||
-      text.includes('Connection to the server was lost') ||
-      text.includes('Attempting to reconnect')
+      text.includes('Connection to the server was lost')
     );
   }
 
