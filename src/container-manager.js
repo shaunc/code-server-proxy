@@ -30,6 +30,14 @@ const CS_TMUX_WINDOW = path.join(
   'cs-tmux-window'
 );
 
+// Detach clients idle beyond this many hours during the cleanup tick, so
+// zombie-attached leak sessions become unattached and the reaper can
+// drain them (bd code-server-proxy-sj5). Conservative default: only
+// long-dead viewers. Non-destructive — a live viewer simply re-attaches.
+const TMUX_STALE_CLIENT_HOURS = Number(
+  process.env.CS_TMUX_STALE_CLIENT_HOURS || 24
+);
+
 // Config file path
 const MOUNTS_CONFIG_PATH = config.paths.mountsConfig;
 
@@ -625,7 +633,9 @@ async function startContainer(instanceId) {
     // never sees. Recreate the container without GPU and start it, so a
     // workspace that doesn't need GPU still comes up when the host GPU is
     // broken. See bead code-server-proxy-zs9.
-    if (/cdi|nvidia|gpu|device request|inject|OCI runtime/i.test(error.message)) {
+    if (
+      /cdi|nvidia|gpu|device request|inject|OCI runtime/i.test(error.message)
+    ) {
       console.warn(
         `Container start failed (GPU?), retrying without GPU: ${error.message}`
       );
@@ -905,6 +915,28 @@ function cleanOrphanedTmuxSessions(recreatingInstances = new Set()) {
     }
   }
 
+  // Detach clients that have been idle past the threshold FIRST, so that
+  // sessions kept "attached" only by a dead/zombie ssh viewer become
+  // unattached and the reap loop below can drain them. Without this the
+  // reaper is structurally blind to zombie-attached leaks — it keeps any
+  // attached session, and a leaked idle-shell session with a stale client
+  // stays attached forever (bd code-server-proxy-sj5). Non-destructive:
+  // only the stale viewer is removed; the session and its processes are
+  // untouched, and a live viewer re-attaches. Runs once per tick (global),
+  // before the per-instance reap loop.
+  try {
+    const out = execSync(
+      `${CS_TMUX_WINDOW} detach-stale --idle-hours ${TMUX_STALE_CLIENT_HOURS}`,
+      { encoding: 'utf-8', timeout: 15000 }
+    );
+    const m = out.match(/detached (\d+)/);
+    if (m && Number(m[1]) > 0) {
+      console.log(`[TMUX-CLEANUP] ${out.trim()}`);
+    }
+  } catch (err) {
+    console.error(`[TMUX-CLEANUP] detach-stale failed: ${err.message}`);
+  }
+
   // Reap leaked sessions on KNOWN instances. The loop above only kills
   // sessions of instances absent from the registry; leaks (unowned
   // `grab` sessions from hidden env-discovery terminals) accumulate on
@@ -917,13 +949,10 @@ function cleanOrphanedTmuxSessions(recreatingInstances = new Set()) {
     if (recreatingInstances.has(iid)) continue;
     if (!knownInstances.has(iid)) continue; // unknown already handled
     try {
-      const out = execSync(
-        `${CS_TMUX_WINDOW} reap '${iid}' --age-min 15`,
-        {
-          encoding: 'utf-8',
-          timeout: 30000,
-        }
-      );
+      const out = execSync(`${CS_TMUX_WINDOW} reap '${iid}' --age-min 15`, {
+        encoding: 'utf-8',
+        timeout: 30000,
+      });
       const killed = out.split('\n').filter((l) => l.startsWith('KILL'));
       if (killed.length > 0) {
         console.log(

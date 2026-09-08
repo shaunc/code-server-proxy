@@ -86,17 +86,22 @@ if [ $? -ne 0 ] || [ -z "$TMUX_SESSION" ]; then
     exit 1
 fi
 
-# On SIGHUP/SIGTERM, just exit. Do NOT kill the tmux session.
-# We cannot reliably distinguish "user closed pane" from "container
-# stopping" — SSH to host works briefly during container stop, so
-# any SSH-based check is a race condition.
+# On SIGHUP/SIGTERM, kill the ssh attach child, THEN exit. Do NOT kill the
+# tmux session — killing the ssh client only DETACHES it (the session and
+# everything running in it are preserved). The kill matters: an orphaned
+# ssh attach client keeps its tmux client "attached" forever, and the
+# reaper never drains an attached session, so the leaked idle-shell
+# session lingers as a zombie (bd code-server-proxy-sj5). We still cannot
+# distinguish "user closed pane" from "container stopping" — but detaching
+# is safe either way, so there is no race to lose.
 #
 # tmux sessions are cleaned up by:
 # - User typing 'exit' (shell exits → tmux auto-destroys session)
 # - Extension's removePaneFromMapping (for tracked terminals)
 # - Container eviction (cs-tmux-window cleanup in stopContainer)
-# - Periodic orphan sweep (5-minute interval)
-trap 'exit 0' HUP TERM
+# - Periodic orphan sweep + stale-client detach + reap (5-min interval)
+ssh_pid=""
+trap 'kill "$ssh_pid" 2>/dev/null; exit 0' HUP TERM
 
 # Attach loop — reconnect to same session on SSH drop
 MAX_RETRIES=60
@@ -111,12 +116,21 @@ while true; do
     # per-connection MaxSessions (default 10) -> "Session open refused
     # by peer". A dedicated connection per terminal has no such ceiling.
     # The shared master stays for the short control commands above.
+    #
+    # Backgrounded (&) + `wait` so the HUP/TERM trap above can kill this
+    # ssh promptly. A foreground ssh would defer the trap until it
+    # returned, which for a live attach is never — leaving the ssh to be
+    # orphaned and its tmux client to zombie. Job control is off in
+    # scripts, so the backgrounded ssh stays in our foreground process
+    # group and reads the pane tty without SIGTTIN (verified).
     ssh -t \
         -o ControlMaster=no \
         -o ServerAliveInterval=10 \
         -o ServerAliveCountMax=3 \
         "$SSH_DEST" \
-        "tmux attach-session -t '$TMUX_SESSION'"
+        "tmux attach-session -t '$TMUX_SESSION'" &
+    ssh_pid=$!
+    wait "$ssh_pid"
     exit_code=$?
 
     case $exit_code in

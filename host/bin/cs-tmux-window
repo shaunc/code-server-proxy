@@ -205,30 +205,67 @@ case "${1:-}" in
         iid="$2"; workdir="${3:-.}"
         claim_dir="$LOCK_DIR/claims-${iid}"
         mkdir -p "$claim_dir"
+        # Backstop reclaim: a session kept "attached" only by a stale
+        # (zombie) client is reusable after this many seconds, so a
+        # reconnect reattaches to it instead of leaking a fresh session
+        # (bd code-server-proxy-sj5). Prefer an unattached session; only
+        # reclaim when none exists. The threshold is high enough never to
+        # steal a recently-active terminal (a live reattach is seconds).
+        reclaim_secs="${CS_TMUX_RECLAIM_STALE_SECS:-600}"
         (
             flock 9
+            now=$(date +%s)
             prefix="cs-${iid}-"
-            # Find first unattached AND unclaimed session
-            grabbed=""
+            # Newest client activity per session, for staleness checks.
+            clients_tmp=$(mktemp)
+            tmux "${TMUX_ARGS[@]}" list-clients \
+                -F '#{client_session} #{client_activity}' 2>/dev/null \
+                > "$clients_tmp"
+            # First unattached+unclaimed session wins; else remember the
+            # first stale-attached session as a reclaim candidate.
+            grabbed=""; reclaim=""
             while IFS=' ' read -r name attached; do
-                [ "$attached" != "0" ] && continue
-                # Check claim file (skip if claimed within last 30s)
+                # Skip if claimed within last 30s (another grab in flight).
                 claim_file="$claim_dir/$name"
                 if [ -f "$claim_file" ]; then
-                    claim_age=$(( $(date +%s) - $(stat -c %Y "$claim_file") ))
+                    claim_age=$(( now - $(stat -c %Y "$claim_file") ))
                     [ "$claim_age" -lt 30 ] && continue
                 fi
-                grabbed="$name"
-                break
+                if [ "$attached" = "0" ]; then
+                    grabbed="$name"
+                    break
+                fi
+                # Attached: reclaimable only if its NEWEST client is stale.
+                if [ -z "$reclaim" ]; then
+                    newest=$(awk -v s="$name" '$1==s{print $2}' \
+                        "$clients_tmp" | sort -n | tail -1)
+                    if [ -n "$newest" ] && [[ "$newest" =~ ^[0-9]+$ ]] \
+                        && [ $(( now - newest )) -gt "$reclaim_secs" ]; then
+                        reclaim="$name"
+                    fi
+                fi
             done < <(tmux "${TMUX_ARGS[@]}" list-sessions \
                 -F '#{session_name} #{session_attached}' 2>/dev/null \
                 | grep "^${prefix}")
+
+            if [ -z "$grabbed" ] && [ -n "$reclaim" ]; then
+                # Detach the stale client(s), then reuse the session.
+                while IFS=' ' read -r cn cs; do
+                    [ "$cs" = "$reclaim" ] && \
+                        tmux "${TMUX_ARGS[@]}" detach-client -t "$cn" \
+                            2>/dev/null
+                done < <(tmux "${TMUX_ARGS[@]}" list-clients \
+                    -F '#{client_name} #{client_session}' 2>/dev/null)
+                grabbed="$reclaim"
+            fi
+
+            rm -f "$clients_tmp"
 
             if [ -n "$grabbed" ]; then
                 touch "$claim_dir/$grabbed"
                 echo "$grabbed"
             else
-                # No unattached sessions — create new
+                # No unattached or reclaimable session — create new
                 session=$(create_session "$iid" "$workdir")
                 touch "$claim_dir/$session"
                 echo "$session"
@@ -286,6 +323,43 @@ case "${1:-}" in
         # attach-or-create). Makes those sessions owned.
         [ $# -lt 4 ] && { echo "Usage: cs-tmux-window record <instance-id> <pane-id> <session>" >&2; exit 1; }
         write_mapping "$MAPPING_DIR/cs-${2}.json" "$3" "$4"
+        ;;
+
+    detach-stale)
+        # Detach clients idle longer than --idle-hours (default 24) so
+        # that ZOMBIE-attached leak sessions become unattached and `reap`
+        # can drain them. This is the precondition the reaper needs: it
+        # never touches an attached session, but a dead ssh attach client
+        # keeps a leaked idle-shell session "attached" forever (bd
+        # code-server-proxy-sj5). Detaching is NON-DESTRUCTIVE — the
+        # session and everything running in it are untouched; only the
+        # stale viewer is removed, and a live viewer simply re-attaches.
+        # Global across all cs-* sessions, so the caller invokes this ONCE
+        # per cleanup cycle, not per instance.
+        #   cs-tmux-window detach-stale [--idle-hours N]
+        shift
+        idle_hours=24
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --idle-hours) idle_hours="$2"; shift 2;;
+                *) echo "detach-stale: unknown arg '$1'" >&2; exit 1;;
+            esac
+        done
+        now=$(date +%s)
+        n=0
+        while IFS=' ' read -r cname cact csess; do
+            [ -z "$cname" ] && continue
+            case "$csess" in cs-*) : ;; *) continue;; esac
+            [[ "$cact" =~ ^[0-9]+$ ]] || continue
+            age=$(( now - cact ))
+            if [ "$age" -gt $(( idle_hours * 3600 )) ]; then
+                tmux "${TMUX_ARGS[@]}" detach-client -t "$cname" \
+                    2>/dev/null && n=$((n+1))
+            fi
+        done < <(tmux "${TMUX_ARGS[@]}" list-clients \
+            -F '#{client_name} #{client_activity} #{client_session}' \
+            2>/dev/null)
+        echo "detached $n stale client(s) (>${idle_hours}h)"
         ;;
 
     reap)
@@ -354,7 +428,7 @@ case "${1:-}" in
         ;;
 
     *)
-        echo "Usage: cs-tmux-window {create|attach-or-create|grab|list|resolve|owned|record|reap|cleanup} ..." >&2
+        echo "Usage: cs-tmux-window {create|attach-or-create|grab|list|resolve|owned|record|reap|detach-stale|cleanup} ..." >&2
         exit 1
         ;;
 esac
