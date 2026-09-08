@@ -217,10 +217,14 @@ case "${1:-}" in
             now=$(date +%s)
             prefix="cs-${iid}-"
             # Newest client activity per session, for staleness checks.
+            # `|| true`: tmux list-clients exits non-zero when there are
+            # NO clients, which under `set -e` would abort this whole grab
+            # subshell and break terminal creation. An empty file just
+            # means "no reclaim candidates", which is correct.
             clients_tmp=$(mktemp)
             tmux "${TMUX_ARGS[@]}" list-clients \
                 -F '#{client_session} #{client_activity}' 2>/dev/null \
-                > "$clients_tmp"
+                > "$clients_tmp" || true
             # First unattached+unclaimed session wins; else remember the
             # first stale-attached session as a reclaim candidate.
             grabbed=""; reclaim=""
