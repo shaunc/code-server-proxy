@@ -120,15 +120,22 @@ while true; do
     # Backgrounded (&) + `wait` so the HUP/TERM trap above can kill this
     # ssh promptly. A foreground ssh would defer the trap until it
     # returned, which for a live attach is never — leaving the ssh to be
-    # orphaned and its tmux client to zombie. Job control is off in
-    # scripts, so the backgrounded ssh stays in our foreground process
-    # group and reads the pane tty without SIGTTIN (verified).
+    # orphaned and its tmux client to zombie.
+    #
+    # `<&0` is REQUIRED, not decoration: with job control off (scripts),
+    # bash redirects a backgrounded command's stdin to /dev/null, so a
+    # bare `ssh -t &` sees a non-tty stdin ("Pseudo-terminal will not be
+    # allocated because stdin is not a terminal" -> "open terminal
+    # failed: not a terminal"). `<&0` restores our inherited stdin (the
+    # pane pty) so `ssh -t` still gets a real terminal. Job control is
+    # off, so the backgrounded ssh also stays in our foreground process
+    # group and reads that tty without SIGTTIN (both verified).
     ssh -t \
         -o ControlMaster=no \
         -o ServerAliveInterval=10 \
         -o ServerAliveCountMax=3 \
         "$SSH_DEST" \
-        "tmux attach-session -t '$TMUX_SESSION'" &
+        "tmux attach-session -t '$TMUX_SESSION'" <&0 &
     ssh_pid=$!
     wait "$ssh_pid"
     exit_code=$?
