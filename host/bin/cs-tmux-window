@@ -306,11 +306,29 @@ case "${1:-}" in
 
     cleanup)
         [ $# -lt 2 ] && { echo "Usage: cs-tmux-window cleanup <instance-id>" >&2; exit 1; }
+        # Kill only IDLE-SHELL leak sessions; SPARE any session running real
+        # work (e.g. claude). A container stop (capacity eviction, idle
+        # cleanup, blue-green/mass recreation) must NOT destroy a live
+        # session — it stays on the host for reattach when the container
+        # returns. The old unconditional kill defeated the whole
+        # tmux-on-host persistence design and lost users' claude sessions
+        # (bd code-server-proxy-23r). Mirrors reap's running-work guard.
+        # `|| true` on the pane lookup: grep -v exits 1 when a session is
+        # ALL idle shell, which under `set -e` would abort the loop.
+        cleanup_panes=$(mktemp)
+        tmux "${TMUX_ARGS[@]}" list-panes -a \
+            -F '#{session_name} #{pane_current_command}' 2>/dev/null \
+            > "$cleanup_panes" || true
         tmux "${TMUX_ARGS[@]}" list-sessions -F '#{session_name}' 2>/dev/null \
             | grep "^cs-${2}-" | while IFS= read -r s; do
+                nonidle=$(awk -v ss="$s" '$1==ss{print $2}' "$cleanup_panes" \
+                    | grep -vE "$IDLE_SHELL_RE" | head -1) || true
+                [ -n "$nonidle" ] && continue   # spare running-work session
                 tmux "${TMUX_ARGS[@]}" kill-session -t "$s" 2>/dev/null || true
             done
-        # Clean mapping file
+        rm -f "$cleanup_panes"
+        # Clean mapping file. Spared running-work sessions become orphans
+        # that grab / the extension's adoptOrphans reattach on reconnect.
         rm -f "$MAPPING_DIR/cs-${2}.json"
         ;;
 
