@@ -2,7 +2,7 @@
   "name": "ff-code-server-defaults",
   "displayName": "FactFiber code-server Defaults",
   "description": "Team default settings and keybindings for code-server, contributed at the Default layer so user settings override them and 'Reset Setting' reverts to the team default. Single source of truth for shared defaults (see tmp/issues/settings-defaults/v2/plan.md).",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "publisher": "code-server-proxy",
   "private": true,
   "license": "UNLICENSED",
@@ -37,6 +37,8 @@
       "search.followSymlinks": false,
       "terminal.integrated.defaultLocation": "editor",
       "terminal.integrated.shellIntegration.enabled": false,
+      "terminal.integrated.gpuAcceleration": "off",
+      "terminal.integrated.smoothScrolling": false,
       "terminal.integrated.enableMultiLinePasteWarning": "never",
       "terminal.integrated.defaultProfile.linux": "Host Shell (tmux)",
       "terminal.integrated.commandsToSkipShell": [
