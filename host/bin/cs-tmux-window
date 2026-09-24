@@ -28,6 +28,10 @@
 # Environment:
 #   CS_TMUX_CONF     — tmux config (default: ~/.config/code-server-proxy/tmux.conf)
 #   CS_TMUX_MAPPINGS — mapping dir (default: ~/.config/code-server-proxy/mappings)
+#   CS_TMUX_REAP_IDLE_HOURS — reap activity-age gate (default 24; 0 disables).
+#                    A session with tmux activity within this many hours is
+#                    spared even if unattached/unowned/idle-shell/aged. Set in
+#                    the PROXY's environment (it invokes reap), not a shell rc.
 
 set -euo pipefail
 
@@ -400,6 +404,16 @@ case "${1:-}" in
                 *) echo "reap: unknown arg '$1'" >&2; exit 1;;
             esac
         done
+        # Activity-age gate: spare any session whose last tmux activity
+        # (#{session_activity}) is within CS_TMUX_REAP_IDLE_HOURS (default
+        # 24h). A terminal created days ago but used last night is idle,
+        # not an abandoned env-discovery leak, so it must survive going
+        # unattached. Fall back to 24 for unset/invalid; 0 disables the
+        # gate (useful for tests). This is IN ADDITION to the existing
+        # attached/owned/too-young/running-work guards.
+        idle_hours="${CS_TMUX_REAP_IDLE_HOURS:-24}"
+        [[ "$idle_hours" =~ ^[0-9]+$ ]] || idle_hours=24
+        idle_secs=$(( idle_hours * 3600 ))
         # The loop does its own explicit error handling (if-guards,
         # `|| echo`). Relax errexit/pipefail so a transient per-session
         # hiccup — a session vanishing between list-sessions and
@@ -417,7 +431,7 @@ case "${1:-}" in
         tmux "${TMUX_ARGS[@]}" list-panes -a \
             -F '#{session_name} #{pane_current_command}' 2>/dev/null \
             > "$panes_tmp"
-        while IFS=' ' read -r name attached created; do
+        while IFS=' ' read -r name attached created activity; do
             [ -z "$name" ] && continue
             # Guard against a malformed/racing list line (empty fields).
             [[ "$created" =~ ^[0-9]+$ ]] || { echo "keep $name no-age"; continue; }
@@ -430,6 +444,22 @@ case "${1:-}" in
             age=$(( now - created ))
             if [ "$age" -lt $(( age_min * 60 )) ]; then
                 echo "keep $name too-young(${age}s)"; continue
+            fi
+            # Activity-age gate (see idle_hours above). A malformed/empty
+            # activity field signals a racing session — spare it, matching
+            # the no-age precedent, rather than letting the old kill path
+            # fire. 0 disables the gate.
+            if [ "$idle_secs" -gt 0 ]; then
+                if [[ "$activity" =~ ^[0-9]+$ ]]; then
+                    idle=$(( now - activity ))
+                    if [ "$idle" -lt "$idle_secs" ]; then
+                        idle_h=$(( idle / 3600 ))
+                        echo "keep $name recently-active(${idle_h}h<${idle_hours}h)"
+                        continue
+                    fi
+                else
+                    echo "keep $name no-activity"; continue
+                fi
             fi
             # Keep if any pane runs real work (non idle-shell command).
             nonidle=$(awk -v s="$name" '$1==s{print $2}' "$panes_tmp" \
@@ -444,7 +474,7 @@ case "${1:-}" in
                     && echo "KILL $name" || echo "keep $name kill-failed"
             fi
         done < <(tmux "${TMUX_ARGS[@]}" list-sessions \
-            -F '#{session_name} #{session_attached} #{session_created}' \
+            -F '#{session_name} #{session_attached} #{session_created} #{session_activity}' \
             2>/dev/null | grep "^cs-${iid}-")
         rm -f "$owned_tmp" "$panes_tmp"
         ;;
