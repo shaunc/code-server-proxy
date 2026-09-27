@@ -33,3 +33,13 @@ config/shared/User/keybindings.json
 
 # Built VS Code extension packages (rebuilt by scripts/install-extension.sh)
 extensions/**/*.vsix
+# --- BEGIN install-skills (managed by ffmeta) ---
+.claude/skills/beads-dolt-reconcile/
+.claude/skills/ff-plans/
+.claude/skills/handoffs/
+.claude/skills/plan-activate/
+.claude/skills/plan-craft/
+.claude/skills/plan-hydrate/
+.claude/skills/plan-run/
+.claude/skills/plan-status/
+# --- END install-skills (managed by ffmeta) ---
