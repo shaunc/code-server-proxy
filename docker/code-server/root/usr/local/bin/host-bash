@@ -142,7 +142,26 @@ while true; do
 
     case $exit_code in
         0)
-            # Clean exit: user typed 'exit' or session destroyed
+            # tmux attach returned cleanly. This is EITHER the user exiting
+            # (shell exits -> session destroyed) OR the client being detached
+            # externally while the session is still alive -- notably the
+            # periodic stale-client sweep (cs-tmux-window detach-stale)
+            # detaches clients idle >24h, and a long-running-but-idle terminal
+            # (e.g. claude waiting for input, no I/O for a day, browser still
+            # open) is idle-by-activity yet fully alive. Treating that detach
+            # as "exit" would kill the pane and ORPHAN the live session -- the
+            # "losing long-running terminals" bug (bd code-server-proxy-ndw).
+            # So exit only if the session is truly gone; if it still exists we
+            # were detached -> reattach. A reattach resets client_activity, so
+            # detach-stale won't re-detach for another 24h (no tight loop).
+            if ssh -o ConnectTimeout=5 -o BatchMode=yes \
+                "$SSH_DEST" \
+                "tmux has-session -t '$TMUX_SESSION'" 2>/dev/null; then
+                retries=0
+                sleep 1
+                continue
+            fi
+            # Session gone -> real exit
             break
             ;;
         255)
