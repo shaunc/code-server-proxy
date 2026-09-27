@@ -741,16 +741,26 @@ async function createWorkspaceSymlink(instanceId, workspacePath) {
  * @param {number} timeout - Stop timeout in seconds
  * @returns {Promise<void>}
  */
-async function stopContainer(instanceId, timeout = 10) {
+async function stopContainer(instanceId, timeout = 10, permanent = false) {
   const containerName = `code-server-${instanceId}`;
   console.log(`Stopping container: ${containerName}`);
 
-  // Kill all tmux sessions for this instance (one per terminal pane)
+  // Clean up this instance's host tmux sessions. DEFAULT is
+  // session-preserving: the container is coming back (blue-green recreation,
+  // capacity eviction, idle-STOP) so cleanup spares owned + running-work
+  // sessions and keeps the mapping — killing them here is the "lost my
+  // long-running terminal" bug (bd code-server-proxy-ndw). Only genuine
+  // teardown (container REMOVED, volumes gone) passes permanent=true, which
+  // kills every session and drops the mapping so nothing leaks on the host.
+  const cleanupFlag = permanent ? ' --permanent' : '';
   try {
-    execSync(`${CS_TMUX_WINDOW} cleanup ${instanceId}`, {
+    execSync(`${CS_TMUX_WINDOW} cleanup ${instanceId}${cleanupFlag}`, {
       timeout: 5000,
     });
-    console.log(`Cleaned up tmux sessions for: ${instanceId}`);
+    console.log(
+      `Cleaned up tmux sessions for: ${instanceId}` +
+        (permanent ? ' (permanent teardown)' : '')
+    );
   } catch {
     // No sessions or cs-tmux-window not installed — that's fine
   }
@@ -2012,10 +2022,13 @@ async function cleanupOrphanedContainers(thresholdDays = IDLE_THRESHOLD_DAYS) {
           await backupVolume(orphan.instanceId, backupPath);
           console.log(`Volume backed up to: ${backupPath}`);
 
-          // Stop if running
-          if (orphan.state === 'running') {
-            await stopContainer(orphan.instanceId);
-          }
+          // Genuine teardown: the container and its volumes are removed just
+          // below, so the host tmux sessions must go too (permanent=true) —
+          // otherwise reap spares the owned ones forever and they leak. Run
+          // this even for an already-stopped orphan (stopContainer no-ops the
+          // docker stop on a 304); a stopped-then-removed orphan would
+          // otherwise strand its sessions and mapping on the host.
+          await stopContainer(orphan.instanceId, 10, true);
 
           // Remove container and volumes
           await removeContainer(orphan.instanceId, true);
