@@ -732,6 +732,21 @@ async function adoptOrphans(): Promise<number> {
       // preventing perpetual re-adoption of an already-open session.
       if (sessionKeeper.has(session.name)) continue;
       if (terminalExistsForSession(session.name)) continue;
+      // Skip a session just handed to a restoring terminal by
+      // findUnattachedSession: tmux does not report it attached until
+      // its attach actually runs (seconds after the provider returns),
+      // so it still looks unattached+uncovered here. Adopting it creates
+      // a DUPLICATE terminal that claimOrDispose then disposes — the
+      // "first new pane closes, next works" bug (bd code-server-proxy-ndw
+      // issue #2). The same PROMISE_TTL_MS window findUnattachedSession
+      // uses for its own de-dup.
+      const promisedAt = promisedSessions.get(session.name);
+      if (
+        promisedAt !== undefined &&
+        Date.now() - promisedAt < PROMISE_TTL_MS
+      ) {
+        continue;
+      }
       // Only surface OWNED sessions — real user terminals (host
       // pane→session mapping) or teammate tabs (cs-tab sidecar).
       // Unowned sessions are leaked `grab` sessions from hidden
