@@ -30,6 +30,10 @@ EXTENSIONS=(
     # ("Dark Minimalist"). Must be installed on every host or instances
     # fall back to the code-server default theme.
     leonn534.dark-minimalist-theme
+
+    # Rewrap: Alt+Q hard-wraps comments and markdown/prose to the ruler.
+    # Was installed ad hoc on silk only, so Alt+Q did nothing on rayon.
+    stkb.rewrap
 )
 
 VOLUME="${SHARED_EXTENSIONS_VOLUME:-code-server-extensions}"
