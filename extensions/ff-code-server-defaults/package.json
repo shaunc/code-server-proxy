@@ -2,7 +2,7 @@
   "name": "ff-code-server-defaults",
   "displayName": "FactFiber code-server Defaults",
   "description": "Team default settings and keybindings for code-server, contributed at the Default layer so user settings override them and 'Reset Setting' reverts to the team default. Single source of truth for shared defaults (see tmp/issues/settings-defaults/v2/plan.md).",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "publisher": "code-server-proxy",
   "private": true,
   "license": "UNLICENSED",
@@ -35,6 +35,9 @@
       },
       "diffEditor.hideUnchangedRegions.enabled": true,
       "search.followSymlinks": false,
+      "markdown.copyFiles.destination": {
+        "**/*.md": "${documentDirName}/images/${fileName}"
+      },
       "terminal.integrated.defaultLocation": "editor",
       "terminal.integrated.shellIntegration.enabled": false,
       "terminal.integrated.gpuAcceleration": "off",
@@ -232,6 +235,14 @@
       ]
     },
     "keybindings": [
+      {
+        "key": "cmd+v",
+        "command": "-office.markdown.paste"
+      },
+      {
+        "key": "ctrl+v",
+        "command": "-office.markdown.paste"
+      },
       {
         "key": "cmd+k cmd+p",
         "command": "workbench.action.pinEditor",
