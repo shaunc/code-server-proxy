@@ -621,7 +621,7 @@ After=network.target
 Type=simple
 ExecStart=/path/to/node /path/to/proxy.js
 WorkingDirectory=/path/to/code-server-proxy
-Restart=on-failure
+Restart=always
 RestartSec=5s
 Environment=NODE_ENV=production
 Environment=XDG_RUNTIME_DIR=/run/user/UID
