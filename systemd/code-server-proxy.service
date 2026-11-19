@@ -7,7 +7,9 @@ Requires=ssh-agent.service
 Type=simple
 ExecStart=/home/shauncutts/.nvm/versions/node/v22.17.1/bin/node /home/shauncutts/src/other/code-server-proxy/src/proxy.js
 WorkingDirectory=/home/shauncutts/src/other/code-server-proxy
-Restart=on-failure
+# always, not on-failure: the SIGTERM/SIGINT handler exits 0, so a
+# stray signal (anything but systemctl stop) would leave it down.
+Restart=always
 RestartSec=5s
 Environment=NODE_ENV=production
 Environment=XDG_RUNTIME_DIR=/run/user/1001
